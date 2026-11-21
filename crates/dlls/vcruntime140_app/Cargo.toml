@@ -1,0 +1,15 @@
+[package]
+name = "sb-dll-vcruntime140-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "vcruntime140_app"
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(windows)'.dependencies]
+sb-common.workspace = true
+
+[lints]
+workspace = true

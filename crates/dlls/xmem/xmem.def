@@ -1,0 +1,10 @@
+; Exports ScarletBridge pour xmem.dll (Phase 0 / Phase 3)
+LIBRARY "xmem.dll"
+EXPORTS
+    XMemAlloc
+    XMemAllocDefault
+    XMemFree
+    XMemFreeDefault
+    XMemSize
+    XMemSizeDefault
+    XMemSetAllocationHooks

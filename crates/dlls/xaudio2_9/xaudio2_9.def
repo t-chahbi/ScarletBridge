@@ -1,0 +1,4 @@
+; Exports ScarletBridge pour XAudio2_9.dll (Phase 0 / Phase 4)
+LIBRARY "XAudio2_9.dll"
+EXPORTS
+    XAudio2Create @1

@@ -1,0 +1,17 @@
+[package]
+name = "sb-hle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+parking_lot.workspace = true
+sb-common.workspace = true
+sb-gpu.workspace = true
+sb-loader.workspace = true
+sb-runtime.workspace = true
+sb-vfs.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "sb-dll-vccorlib140-app"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "vccorlib140_app"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sb-common.workspace = true
+
+[lints]
+workspace = true

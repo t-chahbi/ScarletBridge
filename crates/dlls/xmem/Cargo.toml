@@ -1,0 +1,16 @@
+[package]
+name = "sb-dll-xmem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "xmem"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+parking_lot.workspace = true
+sb-common.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+; Généré automatiquement par sb-stubgen pour MSVCP140_APP.dll
+LIBRARY "MSVCP140_APP.dll"
+EXPORTS
+    "?GetCurrentThreadId@platform@details@Concurrency@@YAJXZ" = "msvcp140.?GetCurrentThreadId@platform@details@Concurrency@@YAJXZ"
+    "?ReportUnhandledError@_ExceptionHolder@details@Concurrency@@AEAAXXZ" = "msvcp140.?ReportUnhandledError@_ExceptionHolder@details@Concurrency@@AEAAXXZ"
+    "?_CallInContext@_ContextCallback@details@Concurrency@@QEBAXV?$function@$$A6AXXZ@std@@_N@Z" = "msvcp140.?_CallInContext@_ContextCallback@details@Concurrency@@QEBAXV?$function@$$A6AXXZ@std@@_N@Z"
+    "?_Capture@_ContextCallback@details@Concurrency@@AEAAXXZ" = "msvcp140.?_Capture@_ContextCallback@details@Concurrency@@AEAAXXZ"
+    "?_Execute_once@std@@YAHAEAUonce_flag@1@P6AHPEAX1PEAPEAX@Z1@Z" = "msvcp140.?_Execute_once@std@@YAHAEAUonce_flag@1@P6AHPEAX1PEAPEAX@Z1@Z"
+    "?_LogCancelTask@_TaskEventLogger@details@Concurrency@@QEAAXXZ" = "msvcp140.?_LogCancelTask@_TaskEventLogger@details@Concurrency@@QEAAXXZ"
+    "?_LogScheduleTask@_TaskEventLogger@details@Concurrency@@QEAAX_N@Z" = "msvcp140.?_LogScheduleTask@_TaskEventLogger@details@Concurrency@@QEAAX_N@Z"
+    "?_LogTaskCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ" = "msvcp140.?_LogTaskCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ"
+    "?_LogTaskExecutionCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ" = "msvcp140.?_LogTaskExecutionCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ"
+    "?_LogWorkItemCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ" = "msvcp140.?_LogWorkItemCompleted@_TaskEventLogger@details@Concurrency@@QEAAXXZ"
+    "?_LogWorkItemStarted@_TaskEventLogger@details@Concurrency@@QEAAXXZ" = "msvcp140.?_LogWorkItemStarted@_TaskEventLogger@details@Concurrency@@QEAAXXZ"
+    "?_Release_chore@details@Concurrency@@YAXPEAU_Threadpool_chore@12@@Z" = "msvcp140.?_Release_chore@details@Concurrency@@YAXPEAU_Threadpool_chore@12@@Z"
+    "?_ReportUnobservedException@details@Concurrency@@YAXXZ" = "msvcp140.?_ReportUnobservedException@details@Concurrency@@YAXXZ"
+    "?_Reset@_ContextCallback@details@Concurrency@@AEAAXXZ" = "msvcp140.?_Reset@_ContextCallback@details@Concurrency@@AEAAXXZ"
+    "?_Schedule_chore@details@Concurrency@@YAHPEAU_Threadpool_chore@12@@Z" = "msvcp140.?_Schedule_chore@details@Concurrency@@YAHPEAU_Threadpool_chore@12@@Z"
+    "?_Throw_C_error@std@@YAXH@Z" = "msvcp140.?_Throw_C_error@std@@YAXH@Z"
+    "?_XGetLastError@std@@YAXXZ" = "msvcp140.?_XGetLastError@std@@YAXXZ"
+    "?_Xbad_function_call@std@@YAXXZ" = "msvcp140.?_Xbad_function_call@std@@YAXXZ"
+    "?_Xlength_error@std@@YAXPEBD@Z" = "msvcp140.?_Xlength_error@std@@YAXPEBD@Z"
+    "?__ExceptionPtrCopy@@YAXPEAXPEBX@Z" = "msvcp140.?__ExceptionPtrCopy@@YAXPEAXPEBX@Z"
+    "?__ExceptionPtrCreate@@YAXPEAX@Z" = "msvcp140.?__ExceptionPtrCreate@@YAXPEAX@Z"
+    "?__ExceptionPtrCurrentException@@YAXPEAX@Z" = "msvcp140.?__ExceptionPtrCurrentException@@YAXPEAX@Z"
+    "?__ExceptionPtrDestroy@@YAXPEAX@Z" = "msvcp140.?__ExceptionPtrDestroy@@YAXPEAX@Z"
+    "?__ExceptionPtrRethrow@@YAXPEBX@Z" = "msvcp140.?__ExceptionPtrRethrow@@YAXPEBX@Z"
+    "?__ExceptionPtrToBool@@YA_NPEBX@Z" = "msvcp140.?__ExceptionPtrToBool@@YA_NPEBX@Z"
+    _Cnd_broadcast = msvcp140._Cnd_broadcast
+    _Cnd_destroy_in_situ = msvcp140._Cnd_destroy_in_situ
+    _Cnd_init_in_situ = msvcp140._Cnd_init_in_situ
+    _Cnd_wait = msvcp140._Cnd_wait
+    _Mtx_destroy_in_situ = msvcp140._Mtx_destroy_in_situ
+    _Mtx_init_in_situ = msvcp140._Mtx_init_in_situ
+    _Mtx_lock = msvcp140._Mtx_lock
+    _Mtx_unlock = msvcp140._Mtx_unlock

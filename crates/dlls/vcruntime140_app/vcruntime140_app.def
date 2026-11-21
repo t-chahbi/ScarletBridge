@@ -1,0 +1,16 @@
+; Généré automatiquement par sb-stubgen pour VCRUNTIME140_APP.dll
+LIBRARY "VCRUNTIME140_APP.dll"
+EXPORTS
+    _CxxThrowException = vcruntime140._CxxThrowException
+    __C_specific_handler = vcruntime140.__C_specific_handler
+    __CxxFrameHandler3 = vcruntime140.__CxxFrameHandler3
+    __std_exception_copy = vcruntime140.__std_exception_copy
+    __std_exception_destroy = vcruntime140.__std_exception_destroy
+    __std_terminate = vcruntime140.__std_terminate
+    _purecall = vcruntime140._purecall
+    memcmp = vcruntime140.memcmp
+    memcpy = vcruntime140.memcpy
+    memmove = vcruntime140.memmove
+    memset = vcruntime140.memset
+    strstr = vcruntime140.strstr
+    wcsstr = vcruntime140.wcsstr
