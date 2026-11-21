@@ -1,0 +1,15 @@
+[package]
+name = "sb-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+goblin.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+sb-common.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

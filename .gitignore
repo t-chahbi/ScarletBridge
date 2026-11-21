@@ -1,0 +1,11 @@
+/target/
+/.wine-scarletbridge/
+/tmp/
+*.log
+*.dmp
+*.rdc
+*.ppm
+*.tmp
+.DS_Store
+.env
+pipeline_cache.bin

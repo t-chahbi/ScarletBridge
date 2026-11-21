@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sb-common",
+    "crates/sb-vfs",
+    "crates/sb-runtime",
+    "crates/sb-gpu",
+    "crates/sb-loader",
+    "crates/sb-hle",
+    "crates/tools/sb-stubgen",
+    "crates/tools/sb-launcher",
+    "crates/dlls/xmem",
+    "crates/dlls/xaudio2_9",
+    "crates/dlls/vccorlib140_app",
+    "crates/dlls/vcruntime140_app",
+    "crates/dlls/msvcp140_app",
+    "tests/harness/dll-probe",
+    "tests/harness/seriesx-smoke",
+    "tests/harness/d3d12-triangle",
+    "tests/harness/d3d12-cube",
+    "tests/harness/mt-io-stress",
+    "tests/harness/aaa-pipeline-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "100% pure-Rust standalone Linux compatibility layer & HLE runtime for unencrypted Xbox GDK / Series X & UWP PE32+ x86-64 binaries (zero Wine)"
+readme = "README.md"
+keywords = ["xbox", "gdk", "d3d12", "vulkan", "spirv"]
+categories = ["emulators", "graphics", "rendering"]
+
+[workspace.dependencies]
+sb-common = { path = "crates/sb-common" }
+sb-vfs = { path = "crates/sb-vfs" }
+sb-runtime = { path = "crates/sb-runtime" }
+sb-gpu = { path = "crates/sb-gpu" }
+sb-loader = { path = "crates/sb-loader" }
+sb-hle = { path = "crates/sb-hle" }
+anyhow = "1.0"
+ash = "0.38"
+clap = { version = "4.5", features = ["derive"] }
+goblin = "0.9"
+libc = "0.2"
+parking_lot = "0.12"
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = false

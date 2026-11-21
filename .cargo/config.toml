@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-gnu]
+linker = "scripts/win64-linker.sh"
+ar = "scripts/win64-ar.sh"
+rustflags = ["-C", "dlltool=llvm-dlltool"]
