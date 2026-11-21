@@ -1,0 +1,16 @@
+[package]
+name = "sb-harness-dll-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dll_probe"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+sb-common.workspace = true
+windows-sys.workspace = true
+
+[lints]
+workspace = true

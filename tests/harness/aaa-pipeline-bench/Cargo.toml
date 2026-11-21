@@ -1,0 +1,12 @@
+[package]
+name = "sb-harness-aaa-pipeline-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aaa_pipeline_bench"
+path = "src/main.rs"
+
+[lints]
+workspace = true

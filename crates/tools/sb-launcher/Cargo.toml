@@ -1,0 +1,25 @@
+[package]
+name = "sb-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "scarletbridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+sb-common.workspace = true
+sb-hle.workspace = true
+sb-loader.workspace = true
+sb-stubgen = { path = "../sb-stubgen" }
+sb-vfs.workspace = true
+
+[lints]
+workspace = true
