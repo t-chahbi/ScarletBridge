@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt-and-clippy:
+    name: Format & Clippy (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy (native Linux)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-linux:
+    name: Unit & Headless Vulkan Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan (Lavapipe) & SPIR-V Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan1 mesa-vulkan-drivers spirv-tools
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace test suite
+        env:
+          SB_HEADLESS: "1"
+        run: cargo test --workspace
+
+  win64-cross-and-harnesses:
+    name: Win64 Cross-Build & Native PE32+ Harnesses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64, LLVM dlltool & Lavapipe Vulkan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mingw-w64 llvm libvulkan1 mesa-vulkan-drivers
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Cross-target Clippy (PE32+ DLLs & Harnesses)
+        run: |
+          cargo clippy --target x86_64-pc-windows-gnu \
+            -p sb-dll-xmem \
+            -p sb-dll-xaudio2-9 \
+            -p sb-dll-vccorlib140-app \
+            -p sb-dll-vcruntime140-app \
+            -p sb-dll-msvcp140-app \
+            -p sb-harness-dll-probe \
+            -p sb-harness-seriesx-smoke \
+            -p sb-harness-mt-io-stress \
+            -p sb-harness-d3d12-triangle \
+            -p sb-harness-d3d12-cube \
+            -p sb-harness-aaa-pipeline-bench \
+            -- -D warnings
+      - name: Build native launcher & cross-compile PE32+ binaries
+        run: |
+          cargo build -p sb-launcher
+          cargo build --target x86_64-pc-windows-gnu \
+            -p sb-dll-xmem \
+            -p sb-dll-xaudio2-9 \
+            -p sb-dll-vccorlib140-app \
+            -p sb-dll-vcruntime140-app \
+            -p sb-dll-msvcp140-app \
+            -p sb-harness-dll-probe \
+            -p sb-harness-seriesx-smoke \
+            -p sb-harness-mt-io-stress \
+            -p sb-harness-d3d12-triangle \
+            -p sb-harness-d3d12-cube \
+            -p sb-harness-aaa-pipeline-bench
+      - name: Execute PE32+ x86-64 harnesses natively (Zero Wine)
+        env:
+          SB_HEADLESS: "1"
+          SB_LOG: "info"
+        run: |
+          ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/dll_probe.exe -- xmem.dll --self-test-xmem
+          ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/seriesx_smoke.exe
+          ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/mt_io_stress.exe
+          ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/d3d12_triangle.exe
+          ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/d3d12_cube.exe
+          ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/aaa_pipeline_bench.exe

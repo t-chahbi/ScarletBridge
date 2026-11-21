@@ -1,0 +1,31 @@
+name: Feature / Subsystem Proposal
+description: Propose a new shader, Vulkan, loader, audio, or tooling capability.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Subsystem
+      options:
+        - "sb-gpu (Vulkan / DXBC / DXIL / Shaders)"
+        - "sb-hle (D3D12_XS / D3D11 / DXGI)"
+        - "sb-hle (Win32 / Sync / File I/O / UCRT)"
+        - "sb-hle (GDK / WinRT / XAudio2 / GameInput)"
+        - "sb-loader (PE32+ / TEB / TLS / SEH / JIT)"
+        - "sb-vfs / sb-runtime / sb-launcher / sb-stubgen"
+        - "tests/harness / CI / Docs"
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary & Motivation
+      description: What capability should ScarletBridge support and what unencrypted PE32+ workloads benefit from it?
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed Design & Test Plan
+      description: How should it be structured in pure Rust and verified (unit test / PE32+ harness)?

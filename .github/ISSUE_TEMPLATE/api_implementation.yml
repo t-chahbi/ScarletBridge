@@ -1,0 +1,24 @@
+name: Missing Win32 / GDK / D3D12 API or Shader Opcode
+description: Request or claim implementation of a missing DLL export, COM method, or DXBC/DXIL opcode.
+title: "[API]: "
+labels: ["api", "help wanted"]
+body:
+  - type: input
+    id: symbol
+    attributes:
+      label: DLL & Symbol / COM Interface / Opcode
+      placeholder: "e.g. d3d12_xs.dll!ID3D12GraphicsCommandList::ExecuteIndirect or DXBC OP_IF"
+    validations:
+      required: true
+  - type: textarea
+    id: signature
+    attributes:
+      label: Public ABI Signature / Spec Reference
+      description: Link to public Microsoft Learn / Khronos docs and expected x86-64 `extern "win64"` signature.
+    validations:
+      required: true
+  - type: textarea
+    id: test_plan
+    attributes:
+      label: Verification Plan
+      placeholder: "Unit test in `crates/sb-hle` and/or PE32+ assertion in `tests/harness/`"
