@@ -691,9 +691,15 @@ mod win_impl {
             let mut pad = GameInputGamepadState::default();
             assert_eq!(get_pad(reading, &mut pad), 1);
 
-            let mut bvh_info = D3D12RaytracingPrebuildInfo::default();
+            // Sans lancer de rayons côté GPU (`rt=false`, voir `sb-gpu`), le bridge ne prétend plus
+            // réserver de mémoire BVH : tailles nulles, constructions sans effet. L'appel doit
+            // réussir sans planter et laisser la structure de sortie cohérente (zéro).
+            let mut bvh_info = D3D12RaytracingPrebuildInfo {
+                result_data_max_size: u64::MAX,
+                ..Default::default()
+            };
             XboxBvhGetPrebuildInfo(ptr::null(), &mut bvh_info);
-            assert!(bvh_info.result_data_max_size >= 65536);
+            assert_eq!(bvh_info.result_data_max_size, 0);
             assert_eq!(ffxFsr2ContextCreate(ptr::null_mut(), ptr::null()), 0);
             assert_eq!(ffxFsr2ContextDestroy(ptr::null_mut()), 0);
             println!(

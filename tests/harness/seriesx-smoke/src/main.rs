@@ -65,6 +65,13 @@ mod win_impl {
     unsafe extern "win64" {
         fn HCInitialize(args: *mut c_void) -> i32;
         fn HCHttpCallCreate(out_call: *mut usize) -> i32;
+        fn HCHttpCallRequestSetUrl(call: usize, method: *const u8, url: *const u8) -> i32;
+        fn HCHttpCallPerformAsync(call: usize, async_block: *mut u8) -> i32;
+        fn HCHttpCallResponseGetNetworkErrorCode(
+            call: usize,
+            network_error_code: *mut u32,
+            platform_network_error_code: *mut u32,
+        ) -> i32;
         fn HCCleanup();
     }
 
@@ -123,11 +130,43 @@ mod win_impl {
             // 5. Réseau offline strict
             assert_eq!(HCInitialize(ptr::null_mut()), 0);
             let mut call_handle = 0usize;
+            // Comme la vraie libHttpClient : créer l'appel réussit toujours ; c'est l'envoi qui
+            // échoue hors ligne, avec un code d'erreur réseau dans la réponse.
             let hr = HCHttpCallCreate(&mut call_handle);
-            assert!(hr < 0, "le réseau doit être bloqué en mode offline strict");
+            assert!(
+                hr >= 0 && call_handle != 0,
+                "HCHttpCallCreate doit réussir (hr={hr:#x})"
+            );
+            assert!(
+                HCHttpCallRequestSetUrl(
+                    call_handle,
+                    c"GET".as_ptr().cast(),
+                    c"https://example.invalid/".as_ptr().cast()
+                ) >= 0
+            );
+            let mut async_block = [0u8; 56]; // XAsyncBlock zéro-initialisé (file NULL = file process)
+            assert!(HCHttpCallPerformAsync(call_handle, async_block.as_mut_ptr()) >= 0);
+            let (mut net_err, mut platform_err) = (0u32, 0u32);
+            for _ in 0..200 {
+                assert!(
+                    HCHttpCallResponseGetNetworkErrorCode(
+                        call_handle,
+                        &mut net_err,
+                        &mut platform_err
+                    ) >= 0
+                );
+                if net_err != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                net_err != 0,
+                "le réseau doit être bloqué en mode offline strict"
+            );
             HCCleanup();
             println!(
-                "[seriesx_smoke] libHttpClient.GDK.dll OK : mode offline strict vérifié (hr={hr:#x})"
+                "[seriesx_smoke] libHttpClient.GDK.dll OK : mode offline strict vérifié (networkError={net_err:#x})"
             );
 
             XGameRuntimeUninitialize();
