@@ -3107,6 +3107,120 @@ extern "win64" fn device_create_fence(
     S_OK
 }
 
+/// `S_FALSE` : la validation des paramètres réussit sans créer d'objet (`ppv == NULL`).
+const S_FALSE_HR: HResult = 1;
+
+/// `ID3D12Device3::OpenExistingHeapFromAddress(const void* pAddress, REFIID riid, void** ppvHeap)`
+/// (slot 48). Sur console, un titre bâtit ses tas D3D12 sur de la mémoire qu'il a déjà obtenue
+/// (`XMemVirtualAlloc`) : le tas **partage** la mémoire du titre, sans copie.
+///
+/// Validations comme la documentation : adresse non NULL, alignée sur la page, dans une région
+/// committée lisible ; `riid` = `ID3D12Heap` (ou `IUnknown`). La taille du tas est celle de la
+/// région à partir de `pAddress`.
+extern "win64" fn device_open_existing_heap_from_address(
+    _this: *mut D3D12DeviceObject,
+    address: *const c_void,
+    riid: *const Guid,
+    out_heap: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "OpenExistingHeapFromAddress", E_UNEXPECTED, {
+        if !out_heap.is_null() {
+            // SAFETY: `out_heap` non-nul, sortie remise à NULL en cas d'échec.
+            unsafe { *out_heap = ptr::null_mut() };
+        }
+        let addr = address as usize;
+        if addr == 0 || !addr.is_multiple_of(4096) {
+            sb_warn!(
+                CHANNEL,
+                "OpenExistingHeapFromAddress({address:p}) : adresse NULL ou non alignée sur la page -> E_INVALIDARG"
+            );
+            return E_INVALIDARG;
+        }
+        if !riid.is_null() {
+            // SAFETY: `riid` non-nul ; GUID lu sans exigence d'alignement.
+            let wanted = unsafe { ptr::read_unaligned(riid) };
+            if wanted != IID_ID3D12HEAP && wanted != crate::com::IID_IUNKNOWN {
+                sb_warn!(
+                    CHANNEL,
+                    "OpenExistingHeapFromAddress : interface {{{wanted}}} non fournie -> E_NOINTERFACE"
+                );
+                return sb_common::abi::E_NOINTERFACE;
+            }
+        }
+        let Some(info) = crate::kernel_ext::vmem::query(addr) else {
+            return E_INVALIDARG;
+        };
+        // Région committée (MEM_COMMIT = 0x1000) et accessible.
+        if info.state != 0x1000 || info.protect == 0 {
+            sb_warn!(
+                CHANNEL,
+                "OpenExistingHeapFromAddress({address:p}) : mémoire non committée/accessible -> E_INVALIDARG"
+            );
+            return E_INVALIDARG;
+        }
+        let size = (info.base_address + info.region_size).saturating_sub(addr);
+        if size == 0 {
+            return E_INVALIDARG;
+        }
+        if out_heap.is_null() {
+            return S_FALSE_HR; // validation seule
+        }
+        // SAFETY: `addr..addr+size` est une région committée du processus (vérifiée par `query`) ;
+        // le `Vec` ne possède pas cette mémoire : on retient une référence supplémentaire sur l'`Arc`
+        // (jamais relâchée) pour qu'il ne soit jamais détruit, et il n'est jamais redimensionné.
+        let backing = unsafe { Vec::from_raw_parts(addr as *mut u8, size, size) };
+        let backing = Arc::new(Mutex::new(backing));
+        std::mem::forget(Arc::clone(&backing));
+        let heap = Box::new(D3D12HeapObject {
+            header: ComHeader::new((&raw const D3D12_HEAP_VTBL).cast()),
+            desc: D3D12HeapDesc {
+                size_in_bytes: size as u64,
+                alignment: 65536,
+                ..Default::default()
+            },
+            backing,
+            base_addr: addr,
+            size,
+        });
+        // SAFETY: `out_heap` vérifié non-nul.
+        unsafe { *out_heap = Box::into_raw(heap).cast() };
+        sb_info!(
+            CHANNEL,
+            "OpenExistingHeapFromAddress({address:p}) -> tas partagé de {size} octets"
+        );
+        S_OK
+    })
+}
+
+/// `ID3D12Device1::SetResidencyPriority` (slot 46) : avec une mémoire unifiée, tout est résident ;
+/// la priorité est un simple indice. Réussit sans effet.
+extern "win64" fn device_set_residency_priority() -> HResult {
+    S_OK
+}
+
+/// `ID3D12Device3::EnqueueMakeResident(flags, numObjects, ppObjects, pFenceToSignal, fenceValue)`
+/// (slot 50) : rien à rendre résident ; la barrière est signalée immédiatement.
+extern "win64" fn device_enqueue_make_resident(
+    _this: *mut D3D12DeviceObject,
+    _flags: u32,
+    num_objects: u32,
+    objects: *const *mut c_void,
+    fence: *mut D3D12FenceObject,
+    fence_value: u64,
+) -> HResult {
+    ffi_guard!(CHANNEL, "EnqueueMakeResident", E_UNEXPECTED, {
+        if num_objects > 0 && objects.is_null() {
+            return E_INVALIDARG;
+        }
+        if fence.is_null() {
+            return E_INVALIDARG;
+        }
+        // SAFETY: `fence` provient de `CreateFence` (objet du bridge, jamais libéré).
+        unsafe { (*fence).completed.fetch_max(fence_value, Ordering::AcqRel) };
+        S_OK
+    })
+}
+
 const fn build_device_vtbl() -> D3D12DeviceVtbl {
     let mut slots = UNIMPL_SLOTS;
     let mut pad = 0;
@@ -3138,6 +3252,10 @@ const fn build_device_vtbl() -> D3D12DeviceVtbl {
     slots[29] = vslot(device_create_placed_resource as *const c_void);
     slots[36] = vslot(device_create_fence as *const c_void);
     slots[38] = vslot(device_get_copyable_footprints as *const c_void);
+    // `ID3D12Device1` à `ID3D12Device3` (slots 44..50) : seuls ceux de sémantique non ambiguë.
+    slots[46] = vslot(device_set_residency_priority as *const c_void);
+    slots[48] = vslot(device_open_existing_heap_from_address as *const c_void);
+    slots[50] = vslot(device_enqueue_make_resident as *const c_void);
     D3D12DeviceVtbl { slots }
 }
 
@@ -3633,6 +3751,107 @@ mod xbox_ext_tests {
         assert_eq!(device_raytracing_available(dev), Some(false));
         let mut not_dev = 0usize;
         assert_eq!(device_raytracing_available((&raw mut not_dev).cast()), None);
+    }
+
+    /// `OpenExistingHeapFromAddress` : valide l'adresse, partage la mémoire du titre sans copie.
+    #[test]
+    fn open_existing_heap_from_address_shares_guest_memory() {
+        // Région committée de 64 Kio, comme `XMemVirtualAlloc` en fournirait une.
+        // SAFETY: mapping anonyme privé de 64 Kio, libéré en fin de test.
+        let mem = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                65536,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED);
+        let dev = ptr::null_mut();
+        let mut heap: *mut c_void = ptr::null_mut();
+
+        // Paramètres invalides.
+        assert_eq!(
+            device_open_existing_heap_from_address(dev, ptr::null(), &IID_ID3D12HEAP, &mut heap),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            device_open_existing_heap_from_address(
+                dev,
+                (mem as usize + 8) as *const c_void,
+                &IID_ID3D12HEAP,
+                &mut heap
+            ),
+            E_INVALIDARG,
+            "adresse non alignée"
+        );
+        let bogus = Guid::new(7, 7, 7, [7; 8]);
+        assert_eq!(
+            device_open_existing_heap_from_address(dev, mem, &bogus, &mut heap),
+            sb_common::abi::E_NOINTERFACE
+        );
+        assert!(heap.is_null());
+        // Validation seule (`ppvHeap == NULL`).
+        assert_eq!(
+            device_open_existing_heap_from_address(dev, mem, &IID_ID3D12HEAP, ptr::null_mut()),
+            S_FALSE_HR
+        );
+
+        // Succès : le tas couvre la région et partage la mémoire.
+        assert_eq!(
+            device_open_existing_heap_from_address(dev, mem, &IID_ID3D12HEAP, &mut heap),
+            S_OK
+        );
+        assert!(!heap.is_null());
+        // SAFETY: objet fraîchement créé par la fonction testée.
+        let h = unsafe { &*heap.cast::<D3D12HeapObject>() };
+        assert_eq!(h.base_addr, mem as usize);
+        assert_eq!(h.size, 65536);
+        assert_eq!(h.desc.size_in_bytes, 65536);
+        h.backing.lock()[0] = 0xAB; // écrit via le tas…
+        // SAFETY: lecture du premier octet de la région mappée.
+        assert_eq!(
+            unsafe { *mem.cast::<u8>() },
+            0xAB,
+            "…visible dans la mémoire du titre"
+        );
+
+        // Mémoire non mappée : refusée.
+        // SAFETY: démappe la région pour obtenir une adresse libre (le tas créé plus haut a une
+        // référence `Arc` retenue et n'est jamais touché après).
+        unsafe { libc::munmap(mem, 65536) };
+        let mut gone: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_open_existing_heap_from_address(dev, mem, &IID_ID3D12HEAP, &mut gone),
+            E_INVALIDARG
+        );
+    }
+
+    #[test]
+    fn residency_methods_succeed_and_signal_the_fence() {
+        assert_eq!(device_set_residency_priority(), S_OK);
+        let fence = Box::new(D3D12FenceObject {
+            header: ComHeader::new((&raw const D3D12_FENCE_VTBL).cast()),
+            completed: AtomicU64::new(3),
+        });
+        let fence = Box::into_raw(fence);
+        let dev = ptr::null_mut();
+        assert_eq!(
+            device_enqueue_make_resident(dev, 0, 0, ptr::null(), fence, 9),
+            S_OK
+        );
+        // SAFETY: `fence` vient d'être créé ci-dessus.
+        assert_eq!(unsafe { (*fence).completed.load(Ordering::Acquire) }, 9);
+        assert_eq!(
+            device_enqueue_make_resident(dev, 0, 0, ptr::null(), ptr::null_mut(), 1),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            device_enqueue_make_resident(dev, 0, 2, ptr::null(), fence, 1),
+            E_INVALIDARG
+        );
     }
 
     #[test]
