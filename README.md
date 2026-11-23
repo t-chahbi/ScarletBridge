@@ -42,7 +42,7 @@ ScarletBridge is built **specifically for Linux** and written **100% in Rust (Ed
 
 ## Project status
 
-**Early active development — core runtime & 3D/Compute Vulkan pipeline work end-to-end on real hardware.** The workspace has **270+ unit tests** (`cargo test --workspace`, all passing, `clippy` and `rustfmt` clean) plus **6** cross-compiled PE32+ x86-64 harnesses under `tests/harness/`; developed and tested natively on Linux (AMD Radeon RX 5700 XT / Mesa RADV Vulkan 1.4) with zero Wine.
+**Early active development — core runtime & 3D/Compute Vulkan pipeline work end-to-end on real hardware.** The workspace has **270+ unit tests** (`cargo test --workspace`, all passing, `clippy` and `rustfmt` clean) plus **7** cross-compiled PE32+ x86-64 harnesses under `tests/harness/` (including `api_conformance`, which exercises the CRT, Win32, Winsock, `bcrypt` and `rpcrt4` APIs through a real PE import table); developed and tested natively on Linux (AMD Radeon RX 5700 XT / Mesa RADV Vulkan 1.4) with zero Wine.
 
 | What | Status |
 |---|---|

@@ -322,6 +322,10 @@ name = "sb-harness-aaa-pipeline-bench"
 version = "0.1.0"
 
 [[package]]
+name = "sb-harness-api-conformance"
+version = "0.1.0"
+
+[[package]]
 name = "sb-harness-d3d12-cube"
 version = "0.1.0"
 
