@@ -262,6 +262,22 @@ fn append_detailed_state(msg: &mut String, ucontext: *mut libc::c_void) {
         }
     }
 
+    // Derniers avertissements / erreurs du bridge : nomment en général la méthode non implémentée
+    // ou le chemin refusé qui précède l'arrêt du titre.
+    let problems = sb_common::log::recent_problems(12);
+    if problems.is_empty() {
+        let _ = writeln!(msg, "Avertissements récents : aucun");
+    } else {
+        let _ = writeln!(
+            msg,
+            "Derniers avertissements / erreurs du bridge ({}, le plus récent en bas) :",
+            problems.len()
+        );
+        for p in &problems {
+            let _ = writeln!(msg, "  {p}");
+        }
+    }
+
     // Derniers appels d'API HLE (traceur `SB_TRACE_API`).
     let calls = crate::trampoline::recent_api_calls(40);
     if calls.is_empty() {
@@ -332,6 +348,7 @@ mod tests {
             return;
         }
         install_crash_handlers();
+        sb_common::sb_warn!("test", "marqueur-avertissement-avant-crash");
         // SAFETY: `int3` volontaire pour déclencher SIGTRAP dans le processus enfant.
         unsafe { core::arch::asm!("int3") };
     }
@@ -352,6 +369,12 @@ mod tests {
         assert!(stderr.contains("SIGTRAP"), "{stderr}");
         assert!(stderr.contains("EXCEPTION_BREAKPOINT"), "{stderr}");
         assert!(stderr.contains("Backtrace"), "{stderr}");
+        // L'avertissement émis avant le crash est repris dans le rapport (en plus de la ligne live).
+        assert!(stderr.contains("Derniers avertissements"), "{stderr}");
+        assert!(
+            stderr.matches("marqueur-avertissement-avant-crash").count() >= 2,
+            "{stderr}"
+        );
     }
 
     /// Processus enfant : `strlen(NULL)` dans la libc hôte (SIGSEGV hors image PE).

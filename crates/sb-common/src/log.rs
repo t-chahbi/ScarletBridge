@@ -7,7 +7,7 @@
 //! - `SB_STUB_BACKTRACE` : `1` pour inclure la stack trace lors du premier appel d'un stub.
 
 use std::backtrace::Backtrace;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -96,6 +96,23 @@ struct LoggerState {
 
 static LOGGER: OnceLock<LoggerState> = OnceLock::new();
 
+/// Nombre de lignes `WARN` / `ERR` conservées pour le rapport de crash.
+const PROBLEM_RING: usize = 24;
+
+/// Dernières lignes `WARN` / `ERR` émises (les plus anciennes sont éliminées).
+static PROBLEMS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+/// Dernières lignes d'avertissement et d'erreur émises (la plus ancienne en premier), au plus
+/// `max`. Lecture sans verrou bloquant : utilisable depuis un handler de signal (vide si le verrou
+/// est pris).
+pub fn recent_problems(max: usize) -> Vec<String> {
+    let Some(ring) = PROBLEMS.try_lock() else {
+        return Vec::new();
+    };
+    let skip = ring.len().saturating_sub(max);
+    ring.iter().skip(skip).cloned().collect()
+}
+
 fn state() -> &'static LoggerState {
     LOGGER.get_or_init(|| {
         let spec = std::env::var("SB_LOG").unwrap_or_else(|_| "info".to_string());
@@ -152,6 +169,16 @@ pub fn log_raw(
     let mut stderr = std::io::stderr().lock();
     let _ = stderr.write_all(line.as_bytes());
     drop(stderr);
+
+    // Mémorise les avertissements et erreurs (y compris les stubs) pour le rapport de crash.
+    if level <= LogLevel::Warn
+        && let Some(mut ring) = PROBLEMS.try_lock()
+    {
+        if ring.len() >= PROBLEM_RING {
+            ring.pop_front();
+        }
+        ring.push_back(line.trim_end().to_string());
+    }
 
     if let Some(mut guard) = st.file.try_lock()
         && let Some(ref mut f) = *guard
@@ -251,5 +278,32 @@ mod tests {
         assert!(filter.enabled("XMEM", LogLevel::Debug));
         assert!(filter.enabled("vfs", LogLevel::Debug));
         assert!(!filter.enabled("vfs", LogLevel::Trace));
+    }
+
+    #[test]
+    fn recent_problems_keeps_warnings_and_errors_but_not_info() {
+        log_raw("test", LogLevel::Info, None, format_args!("info-ignoree"));
+        log_raw(
+            "test",
+            LogLevel::Warn,
+            None,
+            format_args!("warn-conservee-42"),
+        );
+        log_raw(
+            "test",
+            LogLevel::Error,
+            None,
+            format_args!("erreur-conservee-43"),
+        );
+        let recent = recent_problems(PROBLEM_RING).join("\n");
+        assert!(recent.contains("warn-conservee-42"), "{recent}");
+        assert!(recent.contains("erreur-conservee-43"), "{recent}");
+        assert!(!recent.contains("info-ignoree"), "{recent}");
+        // Le tampon est borné : les plus anciennes lignes sont éliminées.
+        for i in 0..(PROBLEM_RING + 10) {
+            log_raw("test", LogLevel::Warn, None, format_args!("bruit-{i}"));
+        }
+        assert!(recent_problems(1000).len() <= PROBLEM_RING);
+        assert!(recent_problems(2).len() <= 2);
     }
 }
