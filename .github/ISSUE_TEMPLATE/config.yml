@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Contributing Guide & Architecture
+    url: https://github.com/t-chahbi/ScarletBridge/blob/main/CONTRIBUTING.md
+    about: Read how to build, test, and contribute clean-room Rust code to ScarletBridge.
+  - name: Roadmap
+    url: https://github.com/t-chahbi/ScarletBridge/blob/main/ROADMAP.md
+    about: See completed milestones and open areas looking for contributors.
