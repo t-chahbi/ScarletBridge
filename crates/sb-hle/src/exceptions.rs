@@ -44,7 +44,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
-use sb_common::{ffi_guard, sb_err};
+use sb_common::{ffi_guard, sb_err, sb_warn};
 use sb_loader::unwind::{
     Context, RuntimeFunction, UNW_FLAG_EHANDLER, UNW_FLAG_NHANDLER, UNW_FLAG_UHANDLER,
     image_base_for_pc, lookup_function_entry, virtual_unwind,
@@ -547,6 +547,22 @@ unsafe fn call_continue_handlers(rec: *mut ExceptionRecord, ctx: *mut Context) {
 pub(crate) unsafe fn dispatch_exception(rec: *mut ExceptionRecord, ctx: *mut Context) -> bool {
     // SAFETY: contrat de l'appelant.
     unsafe {
+        // Les premières exceptions livrées au titre sont toujours journalisées : un gestionnaire de
+        // plantage du titre (vectoriel ou filtre) les consomme sans autre trace.
+        static LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+            let where_ = sb_loader::module_manager()
+                .describe_address((*ctx).rip as usize)
+                .unwrap_or_else(|| "<hors module PE>".to_string());
+            sb_warn!(
+                CHANNEL,
+                "exception livrée au titre : code={:#010x} flags={:#x} rip={:#x} ({where_}) params={:x?}",
+                (*rec).exception_code,
+                (*rec).exception_flags,
+                (*ctx).rip,
+                &(&(*rec).exception_information)[..((*rec).number_parameters as usize).min(4)]
+            );
+        }
         seh_trace!(
             "dispatch code={:#010x} flags={:#x} rip={:#x} rsp={:#x}",
             (*rec).exception_code,
