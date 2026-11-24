@@ -180,7 +180,21 @@ pub(crate) fn virtual_alloc(addr: usize, size: usize, alloc_type: u32, protect: 
 }
 
 /// Implémentation de `VirtualFree`.
+/// `MEM_COALESCE_PLACEHOLDERS` / `MEM_PRESERVE_PLACEHOLDER` (combinés à `MEM_RELEASE`).
+const MEM_PLACEHOLDER_BITS: u32 = 0x0000_0003;
+
 pub(crate) fn virtual_free(addr: usize, size: usize, free_type: u32) -> bool {
+    // API de placeholders (Windows 10+) : `VirtualFree(addr, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)`
+    // scinde un placeholder, `MEM_COALESCE_PLACEHOLDERS` en fusionne. La mémoire reste réservée et
+    // aucun mapping n'est modifié : un succès sans effet suffit (la libération finale
+    // `MEM_RELEASE` sur la base la rendra).
+    if addr != 0
+        && free_type & MEM_RELEASE != 0
+        && free_type & MEM_PLACEHOLDER_BITS != 0
+        && free_type & !(MEM_RELEASE | MEM_PLACEHOLDER_BITS) == 0
+    {
+        return true;
+    }
     if addr == 0 || !(free_type == MEM_RELEASE || free_type == MEM_DECOMMIT) {
         set_last_error(ERROR_INVALID_PARAMETER);
         return false;
@@ -416,6 +430,20 @@ pub(super) extern "win64" fn VirtualFreeEx(
 mod tests {
     use super::*;
     use sb_loader::last_error;
+
+    #[test]
+    fn placeholder_release_flags_succeed_without_unmapping() {
+        super::super::init_test_thread();
+        let base = virtual_alloc(0, 0x40000, MEM_RESERVE, PAGE_READWRITE);
+        assert_ne!(base, 0);
+        // Scission de placeholder (MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) : succès, réservation intacte.
+        assert!(virtual_free(base, 0x10000, MEM_RELEASE | 0x2));
+        assert_eq!(query(base).expect("mbi").state, MEM_RESERVE);
+        // Fusion (MEM_COALESCE_PLACEHOLDERS) idem ; des bits inconnus restent refusés.
+        assert!(virtual_free(base, 0x40000, MEM_RELEASE | 0x1));
+        assert!(!virtual_free(base, 0, MEM_RELEASE | 0x100));
+        assert!(virtual_free(base, 0, MEM_RELEASE));
+    }
 
     #[test]
     fn reserve_commit_query_release() {
