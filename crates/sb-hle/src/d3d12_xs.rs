@@ -3297,6 +3297,74 @@ extern "win64" fn device_slot48(
     })
 }
 
+/// Slot 73 du périphérique **console** : création d'une liste de commandes.
+///
+/// Mesuré sur un appel réel : `(this, desc*, ID3D12CommandAllocator*, NULL, …)` où `desc` est un
+/// descripteur étendu de 32 octets ou plus (même forme que celui de la création de file, type de
+/// liste dans le premier mot), le troisième argument est un allocateur renvoyé par le bridge et le
+/// quatrième est NULL (PSO initial). L'IID et la sortie suivent sur la pile : c'est la forme de
+/// `CreateCommandList(nodeMask, type, allocator, pso, riid, ppv)` où le masque et le type sont
+/// remplacés par un descripteur. Signature **déduite de ces arguments**.
+extern "win64" fn device_slot73(
+    this: *mut D3D12DeviceObject,
+    desc: *const c_void,
+    allocator: *mut c_void,
+    initial_pso: *mut D3D12PsoObject,
+    riid: *const Guid,
+    out: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ID3D12Device::slot73", E_UNEXPECTED, {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        // SAFETY: `out` non-nul ; sortie remise à NULL en cas d'échec.
+        unsafe { *out = ptr::null_mut() };
+        if d3d_known_object_name(allocator as usize) != Some("ID3D12CommandAllocator") {
+            sb_warn!(
+                CHANNEL,
+                "slot 73 (liste de commandes) : le troisième argument n'est pas un allocateur du bridge -> E_INVALIDARG"
+            );
+            return E_INVALIDARG;
+        }
+        if !riid.is_null() {
+            // SAFETY: `riid` non-nul ; GUID lu sans exigence d'alignement.
+            let wanted = unsafe { ptr::read_unaligned(riid) };
+            if wanted != IID_ID3D12GRAPHICSCOMMANDLIST
+                && wanted != crate::com::IID_IUNKNOWN
+                && let Some(other) = crate::com::known_iid_name(&wanted)
+            {
+                sb_warn!(
+                    CHANNEL,
+                    "slot 73 : interface {other} demandée pour une liste de commandes -> E_NOINTERFACE"
+                );
+                return sb_common::abi::E_NOINTERFACE;
+            }
+        }
+        // Type de liste : premier mot du descripteur (0 = direct, 1 = bundle, 2 = calcul, 3 = copie).
+        let raw = sb_loader::trampoline::peek_memory(desc as usize, 4);
+        let list_type = if raw.len() == 4 {
+            u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
+        } else {
+            0
+        };
+        if list_type > 3 {
+            sb_warn!(
+                CHANNEL,
+                "slot 73 : type de liste {list_type} invalide -> E_INVALIDARG"
+            );
+            return E_INVALIDARG;
+        }
+        let hr = device_create_command_list(this, 0, list_type, allocator, initial_pso, riid, out);
+        if hr == S_OK {
+            sb_info!(
+                CHANNEL,
+                "slot 73 : CreateCommandList de la console (type={list_type}, PSO initial={initial_pso:p}) -> S_OK"
+            );
+        }
+        hr
+    })
+}
+
 /// `ID3D12Device1::SetResidencyPriority` (slot 46) : avec une mémoire unifiée, tout est résident ;
 /// la priorité est un simple indice. Réussit sans effet.
 extern "win64" fn device_set_residency_priority() -> HResult {
@@ -3360,6 +3428,7 @@ const fn build_device_vtbl() -> D3D12DeviceVtbl {
     // `ID3D12Device1` à `ID3D12Device3` (slots 44..50) : seuls ceux de sémantique non ambiguë.
     slots[46] = vslot(device_set_residency_priority as *const c_void);
     slots[48] = vslot(device_slot48 as *const c_void);
+    slots[73] = vslot(device_slot73 as *const c_void);
     slots[50] = vslot(device_enqueue_make_resident as *const c_void);
     D3D12DeviceVtbl { slots }
 }
@@ -4018,6 +4087,92 @@ mod xbox_ext_tests {
             text.contains("mot 0") && text.contains("ID3D12CommandQueue"),
             "{text}"
         );
+    }
+
+    /// Slot 73 de la console : liste de commandes créée avec un descripteur étendu et un allocateur.
+    #[test]
+    fn slot73_creates_a_command_list_from_an_allocator_and_descriptor() {
+        let mut dev: *mut c_void = ptr::null_mut();
+        if D3D12CreateDevice(ptr::null_mut(), 0xC100, &IID_ID3D12DEVICE, &mut dev) != S_OK {
+            return; // pas de GPU Vulkan dans cet environnement
+        }
+        let mut alloc: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_allocator(dev.cast(), 0, &IID_ID3D12DEVICE, &mut alloc),
+            S_OK
+        );
+        // Octets mesurés : type 0 (direct), 2, 1, 0, puis extension.
+        let mut desc = [0u8; 64];
+        desc[4] = 2;
+        desc[8] = 1;
+        desc[24..32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
+        let mut list: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_slot73(
+                dev.cast(),
+                desc.as_ptr().cast(),
+                alloc,
+                ptr::null_mut(),
+                &IID_ID3D12GRAPHICSCOMMANDLIST,
+                &mut list
+            ),
+            S_OK
+        );
+        assert!(!list.is_null());
+        assert_eq!(
+            d3d_known_object_name(list as usize),
+            Some("ID3D12GraphicsCommandList")
+        );
+        // Allocateur invalide, sortie NULL, IID d'un autre objet, type invalide.
+        let mut l2: *mut c_void = ptr::null_mut();
+        let bogus = 0x1234usize as *mut c_void;
+        assert_eq!(
+            device_slot73(
+                dev.cast(),
+                desc.as_ptr().cast(),
+                bogus,
+                ptr::null_mut(),
+                &IID_ID3D12GRAPHICSCOMMANDLIST,
+                &mut l2
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            device_slot73(
+                dev.cast(),
+                desc.as_ptr().cast(),
+                alloc,
+                ptr::null_mut(),
+                &IID_ID3D12GRAPHICSCOMMANDLIST,
+                ptr::null_mut()
+            ),
+            E_POINTER
+        );
+        assert_eq!(
+            device_slot73(
+                dev.cast(),
+                desc.as_ptr().cast(),
+                alloc,
+                ptr::null_mut(),
+                &IID_ID3D12COMMANDQUEUE,
+                &mut l2
+            ),
+            sb_common::abi::E_NOINTERFACE
+        );
+        let mut bad = desc;
+        bad[0] = 9;
+        assert_eq!(
+            device_slot73(
+                dev.cast(),
+                bad.as_ptr().cast(),
+                alloc,
+                ptr::null_mut(),
+                &IID_ID3D12GRAPHICSCOMMANDLIST,
+                &mut l2
+            ),
+            E_INVALIDARG
+        );
+        assert!(l2.is_null());
     }
 
     #[test]
