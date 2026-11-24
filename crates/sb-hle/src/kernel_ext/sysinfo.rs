@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sb_common::abi::{WIN_FALSE, WIN_TRUE, WinBool};
 use sb_common::wide::from_pcwstr;
-use sb_common::{ffi_guard, sb_debug, sb_err};
+use sb_common::{ffi_guard, sb_debug, sb_err, sb_info};
 use sb_loader::{module_manager, set_last_error};
 
 use super::{
@@ -41,16 +41,28 @@ pub(super) extern "win64" fn CheckRemoteDebuggerPresent(
 pub(super) extern "win64" fn OutputDebugStringA(text: *const i8) {
     ffi_guard!(CHANNEL, "OutputDebugStringA", (), {
         if let Some(s) = ansi_to_string(text) {
-            sb_debug!("debugstr", "{}", s.trim_end_matches(['\r', '\n']));
+            debug_string(&s);
         }
     })
+}
+
+/// Chaînes de débogage du titre : visibles en info (les 300 premières), car elles précèdent souvent
+/// un arrêt (assertions, rapports de plantage) dont la cause n'apparaît nulle part ailleurs.
+fn debug_string(s: &str) {
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let s: String = s.trim_end_matches(['\r', '\n']).chars().take(400).collect();
+    if SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 300 {
+        sb_info!("debugstr", "{}", s);
+    } else {
+        sb_debug!("debugstr", "{}", s);
+    }
 }
 
 pub(super) extern "win64" fn OutputDebugStringW(text: *const u16) {
     ffi_guard!(CHANNEL, "OutputDebugStringW", (), {
         // SAFETY: `text` est un `PCWSTR` valide ou nul.
         if let Some(s) = unsafe { from_pcwstr(text) } {
-            sb_debug!("debugstr", "{}", s.trim_end_matches(['\r', '\n']));
+            debug_string(&s);
         }
     })
 }
