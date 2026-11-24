@@ -16,7 +16,7 @@ mod bcrypt;
 mod com_ext;
 pub(crate) mod misc;
 mod msg;
-mod rtl;
+pub(crate) mod rtl;
 mod sysinfo;
 mod time;
 mod user;
@@ -293,6 +293,12 @@ pub fn exports() -> HashMap<&'static str, usize> {
     reg!("GetThreadLocale", time::GetThreadLocale);
     reg!("LocaleNameToLCID", time::LocaleNameToLCID);
     reg!("LCIDToLocaleName", time::LCIDToLocaleName);
+
+    // exceptions SEH / vectorielles / déroulage (voir `crate::exceptions`)
+    for (k, v) in crate::exceptions::kernel_exports() {
+        m.insert(k, v);
+    }
+    sb_loader::signal::set_exception_dispatcher(crate::exceptions::signal_dispatch);
 
     m
 }

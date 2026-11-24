@@ -8,7 +8,6 @@
 
 use core::ffi::{CStr, c_void};
 use core::ptr;
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
@@ -454,20 +453,12 @@ extern "win64" fn type_info_name(data: *mut TypeInfoData, root: *mut c_void) -> 
 
 // ---------- exception courante & purecall ----------
 
-thread_local! {
-    /// `EXCEPTION_RECORD*` de l'exception C++ en cours de traitement (toujours nul : le runtime
-    /// HLE ne propage pas d'exception C++, `_CxxThrowException` termine le processus).
-    static CURRENT_EXCEPTION: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
-    /// `CONTEXT*` associé.
-    static CURRENT_EXCEPTION_CONTEXT: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
-}
-
 extern "win64" fn current_exception() -> *mut *mut c_void {
-    CURRENT_EXCEPTION.with(Cell::as_ptr)
+    crate::exceptions::cxx::current_exception_cell()
 }
 
 extern "win64" fn current_exception_context() -> *mut *mut c_void {
-    CURRENT_EXCEPTION_CONTEXT.with(Cell::as_ptr)
+    crate::exceptions::cxx::current_exception_context_cell()
 }
 
 static PURECALL_HANDLER: AtomicUsize = AtomicUsize::new(0);

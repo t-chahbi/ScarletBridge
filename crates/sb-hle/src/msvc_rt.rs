@@ -86,17 +86,9 @@ pub fn msvcp_threading_exports() -> HashMap<&'static str, usize> {
     m
 }
 
+/// `vcruntime140_1.dll` : les handlers C++/SEH sont fournis par `crate::exceptions`.
 pub fn vcruntime_1_exports() -> HashMap<&'static str, usize> {
-    let mut m = HashMap::new();
-    macro_rules! reg {
-        ($name:expr, $f:ident) => {
-            m.insert($name, $f as *const () as usize);
-        };
-    }
-    reg!("__CxxFrameHandler4", __CxxFrameHandler4);
-    reg!("__CxxFrameHandler3", __CxxFrameHandler4);
-    reg!("__C_specific_handler", __CxxFrameHandler4);
-    m
+    HashMap::new()
 }
 
 pub fn concrt_exports() -> HashMap<&'static str, usize> {
@@ -344,15 +336,6 @@ extern "win64" fn _Query_perf_frequency() -> i64 {
 }
 
 // ---------- vcruntime140_1.dll ----------
-
-extern "win64" fn __CxxFrameHandler4(
-    _rec: *mut c_void,
-    _frame: *mut c_void,
-    _ctx: *mut c_void,
-    _dispatcher: *mut c_void,
-) -> i32 {
-    1 // ExceptionContinueSearch
-}
 
 // ---------- concrt140.dll (Concurrency Runtime) ----------
 

@@ -65,7 +65,6 @@ pub fn exports() -> HashMap<&'static str, usize> {
     reg!("SetLastError", SetLastError);
     reg!("EncodePointer", EncodePointer);
     reg!("DecodePointer", DecodePointer);
-    reg!("AddVectoredExceptionHandler", AddVectoredExceptionHandler);
     reg!("SetUnhandledExceptionFilter", SetUnhandledExceptionFilter);
     reg!("SetThreadStackGuarantee", SetThreadStackGuarantee);
     reg!("IsThreadAFiber", IsThreadAFiber);
@@ -682,10 +681,6 @@ extern "win64" fn EncodePointer(ptr_val: usize) -> usize {
 
 extern "win64" fn DecodePointer(ptr_val: usize) -> usize {
     ptr_val
-}
-
-extern "win64" fn AddVectoredExceptionHandler(_first: u32, _handler: usize) -> usize {
-    1
 }
 
 /// Filtre d'exception de niveau supérieur (`SetUnhandledExceptionFilter`).

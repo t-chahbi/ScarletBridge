@@ -105,15 +105,7 @@ pub fn exports() -> HashMap<&'static str, usize> {
     reg!("exit", crt_exit);
     reg!("_exit", crt_quick_exit);
     reg!("abort", crt_abort);
-    reg!("terminate", crt_abort);
     reg!("_purecall", crt_abort);
-    reg!("__std_terminate", crt_abort);
-    reg!("__C_specific_handler", __C_specific_handler);
-    reg!("__CxxFrameHandler3", __CxxFrameHandler3);
-    reg!("__CxxFrameHandler4", __CxxFrameHandler3);
-    reg!("_CxxThrowException", _CxxThrowException);
-    reg!("__std_exception_copy", __std_exception_copy);
-    reg!("__std_exception_destroy", __std_exception_destroy);
     reg!("_beginthreadex", crt_beginthreadex);
     reg!("_endthreadex", crt_endthreadex);
 
@@ -209,6 +201,10 @@ pub fn exports() -> HashMap<&'static str, usize> {
 
     // Mathématiques, temps et locale : voir `crt_math.rs` (errno EDOM/ERANGE fidèle).
 
+    // Exceptions SEH / C++ : voir `exceptions.rs`.
+    for (k, v) in crate::exceptions::crt_exports() {
+        m.insert(k, v);
+    }
     m
 }
 
@@ -591,7 +587,7 @@ extern "win64" fn crt_quick_exit(code: i32) -> ! {
     crt_exit(code);
 }
 
-extern "win64" fn crt_abort() -> ! {
+pub(crate) extern "win64" fn crt_abort() -> ! {
     sb_err!(
         CHANNEL,
         "abort() / terminate() appelé par le binaire invité"
@@ -600,35 +596,6 @@ extern "win64" fn crt_abort() -> ! {
     let _ = std::io::stderr().flush();
     std::process::exit(134);
 }
-
-extern "win64" fn __C_specific_handler(
-    _rec: *mut c_void,
-    _frame: *mut c_void,
-    _ctx: *mut c_void,
-    _disp: *mut c_void,
-) -> i32 {
-    1 // ExceptionContinueSearch
-}
-
-extern "win64" fn __CxxFrameHandler3(
-    _rec: *mut c_void,
-    _frame: *mut c_void,
-    _ctx: *mut c_void,
-    _disp: *mut c_void,
-) -> i32 {
-    1
-}
-
-extern "win64" fn _CxxThrowException(exc: *mut c_void, info: *mut c_void) -> ! {
-    sb_err!(
-        CHANNEL,
-        "_CxxThrowException(exc={exc:p}, throw_info={info:p}) — unwind C++ SEH non supporté"
-    );
-    std::process::exit(101);
-}
-
-extern "win64" fn __std_exception_copy(_from: *const c_void, _to: *mut c_void) {}
-extern "win64" fn __std_exception_destroy(_data: *mut c_void) {}
 
 // ---------- Stdio & Fichiers ----------
 //

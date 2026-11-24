@@ -30,10 +30,11 @@ pub const fn fastfail_supported() -> bool {
 /// (`int3` / `__debugbreak` invité : `EXCEPTION_BREAKPOINT`).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn install_crash_handlers() {
+    ensure_thread_altstack();
     // SAFETY: `sigaction` avec handler `SA_SIGINFO` conforme POSIX.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         sa.sa_sigaction = fault_handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
@@ -53,15 +54,6 @@ extern "C" fn fault_handler(
     info: *mut libc::siginfo_t,
     ucontext: *mut libc::c_void,
 ) {
-    let sig_name = match sig {
-        libc::SIGSEGV => "SIGSEGV",
-        libc::SIGILL => "SIGILL",
-        libc::SIGBUS => "SIGBUS",
-        libc::SIGFPE => "SIGFPE",
-        libc::SIGTRAP => "SIGTRAP (int3 invité)",
-        _ => "SIGNAL",
-    };
-
     // SAFETY: `info` et `ucontext` sont fournis par le noyau Linux pour `SA_SIGINFO`.
     let fault_addr = if !info.is_null() {
         unsafe { (*info).si_addr() as usize }
@@ -113,6 +105,42 @@ extern "C" fn fault_handler(
         }
     }
 
+    // Faute dans du code invité : exception SEH (EXCEPTION_RECORD + CONTEXT) dispatchée sur la
+    // pile invitée ; le rapport ci-dessous n'est produit que si personne ne la gère.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if !ucontext.is_null() && try_redirect_to_seh(sig, info, ucontext, rip, rsp, fault_addr) {
+        return;
+    }
+
+    // SAFETY: rétablit l'action par défaut (équivalent de `SA_RESETHAND`) : une faute dans le
+    // rapport lui-même termine le processus au lieu de boucler.
+    unsafe { libc::signal(sig, libc::SIG_DFL) };
+    let tail = |msg: &mut String| {
+        if !ucontext.is_null() {
+            append_detailed_state(msg, ucontext);
+        }
+    };
+    fatal_fault_report(sig, fault_addr, [rip, rsp, rax, rcx, rdx, r8, r9], tail)
+}
+
+/// Rapport de crash « historique » (signal, `module+RVA`, registres, pile, backtrace) puis
+/// `_exit(128 + sig)`. `regs` = `[rip, rsp, rax, rcx, rdx, r8, r9]`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn fatal_fault_report(
+    sig: i32,
+    fault_addr: usize,
+    regs: [usize; 7],
+    detail: impl FnOnce(&mut String),
+) -> ! {
+    let [rip, rsp, rax, rcx, rdx, r8, r9] = regs;
+    let sig_name = match sig {
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGILL => "SIGILL",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGTRAP => "SIGTRAP (int3 invité)",
+        _ => "SIGNAL",
+    };
     let location = module_manager()
         .describe_address(rip)
         .or_else(|| describe_trampoline(rip))
@@ -134,9 +162,7 @@ extern "C" fn fault_handler(
              RIP pointe après l'instruction ; les assertions / abort de runtime C++ finissent ainsi.\n",
         );
     }
-    if !ucontext.is_null() {
-        append_detailed_state(&mut msg, ucontext);
-    }
+    detail(&mut msg);
     msg.push_str("===============================================================\n");
     let _ = std::io::stderr().write_all(msg.as_bytes());
     let _ = std::io::stderr().flush();
@@ -144,6 +170,101 @@ extern "C" fn fault_handler(
     // SAFETY: terminer proprement avec le code signal standard (128 + sig).
     unsafe {
         libc::_exit(128 + sig);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod seh;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use seh::ensure_thread_altstack;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use seh::try_redirect_to_seh;
+
+/// Pile alternative de signaux (sans effet hors Linux x86-64).
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn ensure_thread_altstack() {}
+
+/// Dispatcher d'exceptions invité (`RtlDispatchException` de `sb-hle`), enregistré au démarrage.
+///
+/// Reçoit un `EXCEPTION_RECORD*` et un `CONTEXT*` ; retourne `true` si l'exécution doit reprendre
+/// avec le contexte (éventuellement modifié), `false` si personne n'a géré l'exception. Si un
+/// handler déroule la pile, la fonction ne revient pas.
+pub type GuestExceptionDispatcher =
+    unsafe extern "win64" fn(*mut u8, *mut crate::unwind::Context) -> bool;
+
+static GUEST_DISPATCHER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Enregistre le dispatcher d'exceptions invité (appelé par `sb-hle`).
+pub fn set_exception_dispatcher(f: GuestExceptionDispatcher) {
+    GUEST_DISPATCHER.store(f as usize, std::sync::atomic::Ordering::Release);
+}
+
+/// Dispatcher enregistré, s'il existe.
+pub fn exception_dispatcher() -> Option<GuestExceptionDispatcher> {
+    let v = GUEST_DISPATCHER.load(std::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        None
+    } else {
+        // SAFETY: la valeur provient de `set_exception_dispatcher`.
+        Some(unsafe { std::mem::transmute::<usize, GuestExceptionDispatcher>(v) })
+    }
+}
+
+/// Termine immédiatement le processus avec `code` (tampons standard vidés).
+pub fn exit_process_now(code: u32) -> ! {
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: terminaison immédiate du processus.
+    unsafe { libc::_exit(code as i32) }
+}
+
+/// Écrit le rapport d'une exception SEH invitée non gérée (code, `module+RVA`, registres, pile,
+/// backtrace `.pdata`) puis termine le processus avec le code de l'exception.
+pub fn exit_with_guest_exception_report(
+    code: u32,
+    flags: u32,
+    address: usize,
+    info: &[usize],
+    ctx: &crate::unwind::Context,
+) -> ! {
+    let location = module_manager()
+        .describe_address(ctx.rip as usize)
+        .unwrap_or_else(|| "<hors module PE>".to_string());
+    let mut msg = format!(
+        "\n==================== [ScarletBridge UNHANDLED EXCEPTION] ====================\n\
+         Code     : {code:#010x} (flags {flags:#x})\n\
+         Adresse  : {address:#018x}\n\
+         RIP      : {:#018x} ({location})\n\
+         RSP      : {:#018x}   RAX: {:#018x}\n",
+        ctx.rip, ctx.rsp, ctx.rax
+    );
+    for (i, v) in info.iter().enumerate() {
+        msg.push_str(&format!("Param[{i}] : {v:#018x}\n"));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    append_detailed_regs(&mut msg, &regs_from_context(ctx));
+    msg.push_str("===============================================================\n");
+    let _ = std::io::stderr().write_all(msg.as_bytes());
+    exit_process_now(code)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn regs_from_context(c: &crate::unwind::Context) -> Regs {
+    Regs {
+        rip: c.rip,
+        rsp: c.rsp,
+        rax: c.rax,
+        rbx: c.rbx,
+        rbp: c.rbp,
+        rsi: c.rsi,
+        rdi: c.rdi,
+        r10: c.r10,
+        r11: c.r11,
+        r12: c.r12,
+        r13: c.r13,
+        r14: c.r14,
+        r15: c.r15,
+        efl: u64::from(c.eflags),
     }
 }
 
@@ -180,32 +301,71 @@ pub fn describe_host_address(addr: usize) -> Option<String> {
 /// si l'adresse appartient à une image PE chargée ou à une pile plausible.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn append_detailed_state(msg: &mut String, ucontext: *mut libc::c_void) {
-    use std::fmt::Write as _;
-
     // SAFETY: `ucontext` fourni par le noyau Linux pour `SA_SIGINFO`.
     let ctx = unsafe { &*(ucontext as *const libc::ucontext_t) };
     let g = &ctx.uc_mcontext.gregs;
-    let r = |n: i32| g[n as usize] as usize;
+    let r = |n: i32| g[n as usize] as u64;
+    let regs = Regs {
+        rip: r(libc::REG_RIP),
+        rsp: r(libc::REG_RSP),
+        rax: r(libc::REG_RAX),
+        rbx: r(libc::REG_RBX),
+        rbp: r(libc::REG_RBP),
+        rsi: r(libc::REG_RSI),
+        rdi: r(libc::REG_RDI),
+        r10: r(libc::REG_R10),
+        r11: r(libc::REG_R11),
+        r12: r(libc::REG_R12),
+        r13: r(libc::REG_R13),
+        r14: r(libc::REG_R14),
+        r15: r(libc::REG_R15),
+        efl: r(libc::REG_EFL),
+    };
+    append_detailed_regs(msg, &regs);
+}
+
+/// Registres nécessaires au rapport détaillé (issus d'un `ucontext_t` ou d'un `CONTEXT`).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct Regs {
+    rip: u64,
+    rsp: u64,
+    rax: u64,
+    rbx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    efl: u64,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn append_detailed_regs(msg: &mut String, regs: &Regs) {
+    use std::fmt::Write as _;
     let _ = writeln!(
         msg,
         "RBX {:#018x}  RBP {:#018x}  RSI {:#018x}  RDI {:#018x}\n\
          R10 {:#018x}  R11 {:#018x}  R12 {:#018x}  R13 {:#018x}\n\
          R14 {:#018x}  R15 {:#018x}  EFL {:#010x}",
-        r(libc::REG_RBX),
-        r(libc::REG_RBP),
-        r(libc::REG_RSI),
-        r(libc::REG_RDI),
-        r(libc::REG_R10),
-        r(libc::REG_R11),
-        r(libc::REG_R12),
-        r(libc::REG_R13),
-        r(libc::REG_R14),
-        r(libc::REG_R15),
-        r(libc::REG_EFL),
+        regs.rbx,
+        regs.rbp,
+        regs.rsi,
+        regs.rdi,
+        regs.r10,
+        regs.r11,
+        regs.r12,
+        regs.r13,
+        regs.r14,
+        regs.r15,
+        regs.efl,
     );
-
-    let rip = r(libc::REG_RIP);
-    let rsp = r(libc::REG_RSP);
+    let r = regs;
+    let rip = regs.rip as usize;
+    let rsp = regs.rsp as usize;
     let in_image = |a: usize| crate::unwind::image_base_for_pc(a).is_some();
 
     if in_image(rip) && in_image(rip.saturating_sub(16)) {
@@ -221,7 +381,7 @@ fn append_detailed_state(msg: &mut String, ucontext: *mut libc::c_void) {
         let _ = writeln!(msg);
     }
 
-    if rsp != 0 && rsp % 8 == 0 {
+    if rsp != 0 && rsp.is_multiple_of(8) {
         let _ = writeln!(msg, "Pile     : (RSP+0x00..)");
         for i in 0..8usize {
             // SAFETY: sommet de pile du thread fautif (le noyau l'a mappée) ; 8 qwords.
@@ -238,7 +398,7 @@ fn append_detailed_state(msg: &mut String, ucontext: *mut libc::c_void) {
     // Trame hôte (RIP hors image PE) : la pile `.pdata` est inutilisable ; on balaie les 96 premiers
     // mots de pile et on affiche ceux qui ressemblent à une adresse de retour dans une
     // bibliothèque hôte (heuristique : peut contenir des valeurs périmées).
-    if !in_image(rip) && rsp != 0 && rsp % 8 == 0 {
+    if !in_image(rip) && rsp != 0 && rsp.is_multiple_of(8) {
         let mut shown = 0;
         let _ = writeln!(
             msg,
@@ -300,17 +460,17 @@ fn append_detailed_state(msg: &mut String, ucontext: *mut libc::c_void) {
     let mut uc = crate::unwind::Context {
         rip: rip as u64,
         rsp: rsp as u64,
-        rbp: r(libc::REG_RBP) as u64,
-        rbx: r(libc::REG_RBX) as u64,
-        rsi: r(libc::REG_RSI) as u64,
-        rdi: r(libc::REG_RDI) as u64,
-        r12: r(libc::REG_R12) as u64,
-        r13: r(libc::REG_R13) as u64,
-        r14: r(libc::REG_R14) as u64,
-        r15: r(libc::REG_R15) as u64,
+        rbp: r.rbp,
+        rbx: r.rbx,
+        rsi: r.rsi,
+        rdi: r.rdi,
+        r12: r.r12,
+        r13: r.r13,
+        r14: r.r14,
+        r15: r.r15,
         ..crate::unwind::Context::default()
     };
-    uc.rax = r(libc::REG_RAX) as u64;
+    uc.rax = r.rax;
     // SAFETY: pile du thread fautif ; le parcours s'arrête dès qu'une adresse sort des images PE.
     let frames = unsafe { crate::unwind::guest_backtrace(uc, 32) };
     if frames.is_empty() {

@@ -15,50 +15,6 @@ use super::{
 
 // ---------- `_X*` ----------
 
-fn msg_of(p: *const i8) -> String {
-    if p.is_null() {
-        String::new()
-    } else {
-        // SAFETY: message C fourni par la STL (chaîne terminée).
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-    }
-}
-
-extern "win64" fn x_bad_alloc() {
-    fatal_throw("std::bad_alloc", "bad allocation");
-}
-
-extern "win64" fn x_bad_function_call() {
-    fatal_throw("std::bad_function_call", "bad function call");
-}
-
-extern "win64" fn x_invalid_argument(msg: *const i8) {
-    fatal_throw("std::invalid_argument", &msg_of(msg));
-}
-
-extern "win64" fn x_length_error(msg: *const i8) {
-    fatal_throw("std::length_error", &msg_of(msg));
-}
-
-extern "win64" fn x_out_of_range(msg: *const i8) {
-    fatal_throw("std::out_of_range", &msg_of(msg));
-}
-
-extern "win64" fn x_runtime_error(msg: *const i8) {
-    fatal_throw("std::runtime_error", &msg_of(msg));
-}
-
-/// `_Throw_C_error(int)` : codes `_Thrd_result` → `std::system_error` (`errc`).
-extern "win64" fn throw_c_error(code: i32) {
-    let what = match code {
-        1 | 2 => "resource unavailable try again", // _Thrd_nomem / _Thrd_timedout
-        3 => "device or resource busy",            // _Thrd_busy
-        4 => "invalid argument",                   // _Thrd_error
-        _ => "abort()",                            // MSVC : abort() direct
-    };
-    fatal_throw("std::system_error", &format!("{what} (code {code})"));
-}
-
 /// `std::uncaught_exception()` : le runtime ne propage jamais d'exception C++ → toujours faux.
 extern "win64" fn uncaught_exception() -> bool {
     false
@@ -388,13 +344,6 @@ pub fn register(m: &mut HashMap<&'static str, usize>) {
             m.insert($name, $f as *const () as usize);
         };
     }
-    reg!("?_Xbad_alloc@std@@YAXXZ", x_bad_alloc);
-    reg!("?_Xbad_function_call@std@@YAXXZ", x_bad_function_call);
-    reg!("?_Xinvalid_argument@std@@YAXPEBD@Z", x_invalid_argument);
-    reg!("?_Xlength_error@std@@YAXPEBD@Z", x_length_error);
-    reg!("?_Xout_of_range@std@@YAXPEBD@Z", x_out_of_range);
-    reg!("?_Xruntime_error@std@@YAXPEBD@Z", x_runtime_error);
-    reg!("?_Throw_C_error@std@@YAXH@Z", throw_c_error);
     reg!("?uncaught_exception@std@@YA_NXZ", uncaught_exception);
     reg!("?_Syserror_map@std@@YAPEBDH@Z", syserror_map);
     reg!("?_Winerror_map@std@@YAHH@Z", winerror_map);

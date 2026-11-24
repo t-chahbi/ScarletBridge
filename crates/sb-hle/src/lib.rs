@@ -10,6 +10,7 @@ pub mod crt_math;
 pub mod crt_str;
 pub mod d3d11;
 pub mod d3d12_xs;
+pub mod exceptions;
 pub mod file_io;
 #[macro_use]
 pub mod gdk_classes;

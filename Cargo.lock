@@ -342,6 +342,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-harness-eh-test"
+version = "0.1.0"
+
+[[package]]
 name = "sb-harness-mt-io-stress"
 version = "0.1.0"
 
@@ -368,7 +372,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "sb-common",
+ "sb-gpu",
  "sb-hle",
  "sb-loader",
  "sb-stubgen",

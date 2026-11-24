@@ -137,6 +137,7 @@ thread_local! {
 /// Initialise le `TEB` Windows pour le thread Linux courant et configure `GS` via `arch_prctl`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn init_thread_teb(image_base: usize) -> Result<*mut Teb, std::io::Error> {
+    crate::signal::ensure_thread_altstack();
     let peb_ptr = global_peb_ptr();
     if image_base != 0 {
         set_peb_image_base(image_base);

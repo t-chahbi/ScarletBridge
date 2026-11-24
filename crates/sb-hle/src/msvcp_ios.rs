@@ -25,9 +25,10 @@
 //! destructeur virtuel). Les fonctions membres retournant une classe le font par pointeur caché
 //! (inséré juste après `this`).
 //!
-//! Exceptions C++ : le runtime ne sait pas encore lever d'exception C++ (`_CxxThrowException` du
-//! CRT HLE termine le processus). Les `std::_X*`, `ios_base::failure` et `bad_cast` journalisent
-//! donc une erreur puis terminent comme `abort()` — échec documenté, jamais de faux succès.
+//! Exceptions C++ : `std::_X*` et `_Throw_C_error` lèvent de vraies exceptions `std::exception`
+//! (voir `crate::exceptions::cxx::synth`). Les autres sites (`ios_base::failure`, `bad_cast`,
+//! `bad_alloc` des locales...) s'exécutent dans des fonctions Rust hôtes, sans contexte invité à
+//! dérouler : ils journalisent une erreur puis terminent comme `abort()` (`fatal_throw`).
 
 #![allow(non_snake_case, unused_variables)]
 
@@ -91,7 +92,7 @@ pub(crate) unsafe fn vslot(obj: *const c_void, idx: usize) -> *const () {
 pub(crate) fn fatal_throw(kind: &str, msg: &str) -> ! {
     sb_common::sb_err!(
         CHANNEL,
-        "exception C++ {kind}(\"{msg}\") non propageable (pas de SEH C++) — abort()"
+        "exception C++ {kind}(\"{msg}\") non propageable depuis le code hôte — abort()"
     );
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -105,6 +106,8 @@ pub fn exports() -> HashMap<&'static str, usize> {
     streambuf::register(&mut m);
     ios::register(&mut m);
     support::register(&mut m);
+    // `std::_X*`, `_Throw_C_error`, `std::exception_ptr` : vraies exceptions C++ (SEH).
+    crate::exceptions::cxx::register_msvcp(&mut m);
     m
 }
 

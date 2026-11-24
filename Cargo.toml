@@ -19,6 +19,7 @@ members = [
     "tests/harness/d3d12-triangle",
     "tests/harness/d3d12-cube",
     "tests/harness/mt-io-stress",
+    "tests/harness/eh-test",
     "tests/harness/aaa-pipeline-bench",
     "tests/harness/api-conformance",
 ]
