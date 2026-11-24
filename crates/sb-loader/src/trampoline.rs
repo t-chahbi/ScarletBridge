@@ -330,6 +330,56 @@ fn trace_names() -> &'static RwLock<Vec<(String, String)>> {
     TRACE_NAMES.get_or_init(|| RwLock::new(Vec::new()))
 }
 
+/// Backtrace invité du premier appel à une API « de fin » (installation d'un filtre d'exception,
+/// rapport WER, abort, `RaiseException`, ...) : montre quel code du titre a décidé de s'arrêter,
+/// ce que le rapport d'un plantage tardif (dans le gestionnaire de plantage du titre) ne montre pas.
+static FATAL_PATH: OnceLock<String> = OnceLock::new();
+
+/// Texte du premier chemin « fatal » rencontré (vide si aucun) — pour le rapport de plantage.
+pub fn first_fatal_path() -> Option<&'static str> {
+    FATAL_PATH.get().map(String::as_str)
+}
+
+fn capture_fatal_path(stub_id: u64, ret: u64, caller_rsp: usize) {
+    const FATAL: [&str; 8] = [
+        "SetUnhandledExceptionFilter",
+        "WerRegisterFile",
+        "RaiseException",
+        "RaiseFailFastException",
+        "TerminateProcess",
+        "abort",
+        "_invoke_watson",
+        "__fastfail",
+    ];
+    if FATAL_PATH.get().is_some() {
+        return;
+    }
+    let Some(names) = trace_names().try_read() else {
+        return;
+    };
+    let Some((dll, sym)) = names.get(stub_id as usize) else {
+        return;
+    };
+    if !FATAL.contains(&sym.as_str()) {
+        return;
+    }
+    let ctx = crate::unwind::Context {
+        rip: ret,
+        rsp: caller_rsp as u64,
+        ..crate::unwind::Context::default()
+    };
+    // SAFETY: pile du thread courant ; le parcours s'arrête dès qu'une adresse sort des images PE.
+    let frames = unsafe { crate::unwind::guest_backtrace(ctx, 24) };
+    let mut text = format!("Premier appel à {dll}!{sym}, émis depuis :\n");
+    for (i, pc) in frames.iter().enumerate() {
+        let loc = crate::module_manager()
+            .describe_address(*pc)
+            .unwrap_or_else(|| "?".to_string());
+        text.push_str(&format!("  #{i:<2} {pc:#018x}  {loc}\n"));
+    }
+    let _ = FATAL_PATH.set(text);
+}
+
 /// Appelé par chaque thunk de trace avec `regs = [rcx, rdx, r8, r9]` (sauvegardés sur la pile).
 extern "win64" fn api_trace_dispatch(stub_id: u64, regs: *const u64) {
     ffi_guard!("trace", "api_trace_dispatch", (), {
@@ -365,6 +415,7 @@ extern "win64" fn api_trace_dispatch(stub_id: u64, regs: *const u64) {
                 None => words[0].store(0, Ordering::Relaxed),
             }
         }
+        capture_fatal_path(stub_id, ret, regs as usize + 0x70);
         slot.seq.store(seq, Ordering::Release);
         if api_trace_mode() == ApiTraceMode::Live
             && let Some(names) = trace_names().try_read()

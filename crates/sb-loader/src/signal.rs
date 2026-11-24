@@ -438,6 +438,10 @@ fn append_detailed_regs(msg: &mut String, regs: &Regs) {
         }
     }
 
+    if let Some(path) = crate::trampoline::first_fatal_path() {
+        let _ = write!(msg, "{path}");
+    }
+
     // Derniers appels d'API HLE (traceur `SB_TRACE_API`).
     let calls = crate::trampoline::recent_api_calls(420);
     if calls.is_empty() {
