@@ -1190,6 +1190,18 @@ fn xmem_region_for(st: &XmemState, addr: usize, len: usize) -> Option<(usize, Xm
     (end <= base + region.size).then_some((base, *region))
 }
 
+/// Vrai si `addr` appartient à une réservation `XMemVirtualAlloc` (mémoire fournie par le titre).
+pub(crate) fn is_xmem_address(addr: usize) -> bool {
+    let st = XMEM_STATE.lock();
+    xmem_region_for(&st, addr, 1).is_some()
+}
+
+/// Réserve de test : une région XMem de `size` octets, pour les tests des autres modules.
+#[cfg(test)]
+pub(crate) fn xmem_test_region(size: usize) -> usize {
+    XMemVirtualAlloc(ptr::null_mut(), size, MEM_RESERVE, 0x2, 0x04) as usize
+}
+
 /// Remplace une page par une réserve sans accès (décommit d'une vue physique).
 fn xmem_decommit_page(st: &mut XmemState, va: usize) -> bool {
     st.mappings.remove(&va);

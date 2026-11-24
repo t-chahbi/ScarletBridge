@@ -2905,7 +2905,36 @@ extern "win64" fn device_create_descriptor_heap(
         unsafe { *desc }
     };
     let count = u64::from(d.num_descriptors.max(1));
-    let base = NEXT_DESC_HANDLE.fetch_add(count * 32, Ordering::Relaxed) as usize;
+    let mut base = NEXT_DESC_HANDLE.fetch_add(count * 32, Ordering::Relaxed) as usize;
+    // Variante console : le descripteur est suivi (à partir de l'octet 16) d'une adresse de mémoire
+    // fournie par le titre, et celui-ci vérifie que le handle CPU de début du tas la reprend
+    // exactement (assertion `int3` sinon). On adopte donc la première adresse située dans une réservation XMem.
+    if !desc.is_null() {
+        let raw = sb_loader::trampoline::peek_memory(desc as usize, 64);
+        let mut given = 0usize;
+        for chunk in raw.get(16..).unwrap_or(&[]).chunks_exact(8) {
+            let v = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])) as usize;
+            if v >= 0x1_0000 && crate::gdk_xs::is_xmem_address(v) {
+                given = v;
+                break;
+            }
+        }
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+            sb_info!(
+                CHANNEL,
+                "CreateDescriptorHeap : type={} n={} drapeaux={:#x} masque={:#x}, octets 16..64={:02x?} -> adresse fournie {given:#x}",
+                d.heap_type,
+                d.num_descriptors,
+                d.flags,
+                d.node_mask,
+                raw.get(16..).unwrap_or(&[])
+            );
+        }
+        if given != 0 {
+            base = given;
+        }
+    }
     let heap = Box::new(D3D12DescHeapObject {
         header: ComHeader::new(traced_vtbl(
             (&raw const D3D12_DESC_HEAP_VTBL).cast(),
@@ -3966,6 +3995,40 @@ pub(crate) extern "win64" fn D3D12ConfigureVirtualMemoryX(config: *const u32) ->
 #[cfg(test)]
 mod xbox_ext_tests {
     use super::*;
+
+    /// Variante console de `CreateDescriptorHeap` : une adresse XMem placée après le descripteur
+    /// devient le handle CPU de début du tas (le titre vérifie cette égalité par assertion).
+    #[test]
+    fn descriptor_heap_adopts_the_xmem_address_given_after_the_desc() {
+        let region = crate::gdk_xs::xmem_test_region(1 << 20);
+        assert_ne!(region, 0);
+        let given = region + 0x1000;
+        // Descripteur standard (type, nombre, drapeaux, masque) puis l'adresse fournie.
+        let desc: [u64; 3] = [1 << 32, 0, given as u64];
+        let mut out: *mut c_void = core::ptr::null_mut();
+        let hr = device_create_descriptor_heap(
+            core::ptr::null_mut(),
+            desc.as_ptr().cast(),
+            core::ptr::null(),
+            &mut out,
+        );
+        assert_eq!(hr, S_OK);
+        assert_eq!(heap_get_cpu_start(out.cast()), given);
+
+        // Sans adresse XMem derrière le descripteur : identifiant interne habituel.
+        let plain: [u64; 3] = [1 << 32, 0, 0x1234];
+        let mut out2: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            device_create_descriptor_heap(
+                core::ptr::null_mut(),
+                plain.as_ptr().cast(),
+                core::ptr::null(),
+                &mut out2
+            ),
+            S_OK
+        );
+        assert_ne!(heap_get_cpu_start(out2.cast()), 0x1234);
+    }
 
     /// Chaque vtable D3D12 / DXGI couvre `VT_PAD_LEN` slots : un titre qui appelle une méthode
     /// d'une interface récente ou de la console (slot 150, par exemple) tombe sur un slot de
