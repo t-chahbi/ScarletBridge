@@ -232,7 +232,7 @@ pub fn api_trace_mode() -> ApiTraceMode {
     *MODE.get_or_init(|| ApiTraceMode::parse(std::env::var("SB_TRACE_API").ok().as_deref()))
 }
 
-const TRACE_RING: usize = 256;
+const TRACE_RING: usize = 1024;
 const TRACE_STRIDE: usize = 192;
 const TRACE_POOL_SIZE: usize = 1024 * 1024;
 

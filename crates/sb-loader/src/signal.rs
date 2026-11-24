@@ -439,7 +439,7 @@ fn append_detailed_regs(msg: &mut String, regs: &Regs) {
     }
 
     // Derniers appels d'API HLE (traceur `SB_TRACE_API`).
-    let calls = crate::trampoline::recent_api_calls(160);
+    let calls = crate::trampoline::recent_api_calls(420);
     if calls.is_empty() {
         let _ = writeln!(
             msg,
