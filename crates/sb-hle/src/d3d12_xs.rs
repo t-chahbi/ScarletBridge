@@ -110,6 +110,28 @@ pub const IID_IDXGISWAPCHAIN3: Guid = Guid::new(
     0x4AB0,
     [0xB2, 0x36, 0x7D, 0xA0, 0x17, 0x0E, 0xDA, 0xB1],
 );
+/// `IDXGIDevice` (dxgi.h). Les titres le récupèrent via `ID3D12Device::QueryInterface` : un
+/// `E_NOINTERFACE` casse l'init graphique (résolution de l'adaptateur, latence des frames, etc.).
+pub const IID_IDXGIDEVICE: Guid = Guid::new(
+    0x54EC_77FA,
+    0x1377,
+    0x44E6,
+    [0x8C, 0x32, 0x88, 0xFD, 0x5F, 0x44, 0xC8, 0x4C],
+);
+/// `IDXGIAdapter` (dxgi.h).
+pub const IID_IDXGIADAPTER: Guid = Guid::new(
+    0x2411_E7E1,
+    0x12AC,
+    0x4CCF,
+    [0xBD, 0x14, 0x97, 0x98, 0xE8, 0x53, 0x4D, 0xC0],
+);
+/// `IDXGIOutput` (dxgi.h).
+pub const IID_IDXGIOUTPUT: Guid = Guid::new(
+    0xAE02_EEDB,
+    0xC735,
+    0x4690,
+    [0x8D, 0x52, 0x5A, 0x8D, 0xC2, 0x02, 0x13, 0xAA],
+);
 
 // ==================== Structs ABI Windows x86-64 (`d3d12.h` / `dxgi1_2.h`) ====================
 
@@ -2486,6 +2508,23 @@ extern "win64" fn device_qi(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> HResult {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    // `IDXGIDevice` : les titres demandent l'adaptateur DXGI via le périphérique D3D12.
+    if !riid.is_null() && unsafe { *riid } == IID_IDXGIDEVICE {
+        let dev = this as usize;
+        let obj = Box::new(DxgiDeviceObject {
+            header: ComHeader::new(traced_vtbl(
+                (&raw const DXGI_DEVICE_VTBL).cast(),
+                "IDXGIDevice",
+            )),
+            device: dev,
+        });
+        // SAFETY: `ppv` vérifié non-nul ; `obj` est un objet du bridge.
+        unsafe { *ppv = Box::into_raw(obj).cast() };
+        return S_OK;
+    }
     com_query_interface_list("ID3D12Device", this, riid, ppv, &[IID_ID3D12DEVICE])
 }
 
@@ -4709,6 +4748,250 @@ mod xbox_ext_tests {
         resource_write_bytes(res.cast(), 120, &[9; 8]).expect("écriture octets");
     }
 }
+// ==================== `IDXGIDevice` (récupéré via `ID3D12Device::QueryInterface`) ====================
+
+#[repr(C)]
+struct DxgiDeviceVtbl {
+    slots: [VtblSlot; VT_PAD_LEN],
+}
+
+/// Vue `IDXGIDevice` sur un `ID3D12Device` : le titre l'obtient par `QueryInterface` et s'en sert
+/// pour résoudre l'adaptateur et régler la latence. On partage l'état du périphérique.
+#[repr(C)]
+struct DxgiDeviceObject {
+    header: ComHeader,
+    device: usize,
+}
+
+extern "win64" fn dxgi_device_qi(
+    this: *mut ComHeader,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    com_query_interface_list("IDXGIDevice", this, riid, ppv, &[IID_IDXGIDEVICE])
+}
+
+/// `IDXGIDevice::GetParent(riid, ppParent)` : l'objet parent (l'adaptateur).
+extern "win64" fn dxgi_device_get_parent(
+    this: *mut DxgiDeviceObject,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: `ppv` vérifié non-nul ; aucune adaptation en place, on renvoie null.
+    unsafe { *ppv = ptr::null_mut() };
+    let _ = (this, riid);
+    sb_debug!("dxgi", "IDXGIDevice::GetParent -> S_OK (ppv=null)");
+    S_OK
+}
+
+/// `IDXGIDevice::GetAdapter` : renvoie un adaptateur DXGI minimal (le titre s'en sert pour
+/// énumérer les sorties/moniteurs et régler la latence).
+extern "win64" fn dxgi_device_get_adapter(
+    _this: *mut DxgiDeviceObject,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    let adapter = Box::new(DxgiAdapterObject {
+        header: ComHeader::new(traced_vtbl(
+            (&raw const DXGI_ADAPTER_VTBL).cast(),
+            "IDXGIAdapter",
+        )),
+    });
+    // SAFETY: `ppv` vérifié non-nul ; `adapter` est un objet du bridge.
+    unsafe { *ppv = Box::into_raw(adapter).cast() };
+    sb_debug!("dxgi", "IDXGIDevice::GetAdapter -> S_OK");
+    S_OK
+}
+
+/// `IDXGIDevice::SetGPUThreadPriority`.
+extern "win64" fn dxgi_device_set_gpu_thread_priority(_this: *mut DxgiDeviceObject, _p: i32) -> HResult {
+    S_OK
+}
+
+/// `IDXGIDevice::GetGPUThreadPriority` : priorité normale (0).
+extern "win64" fn dxgi_device_get_gpu_thread_priority(_this: *mut DxgiDeviceObject) -> i32 {
+    0
+}
+
+/// `IDXGIDevice1::SetMaximumFrameLatency`.
+extern "win64" fn dxgi_device_set_max_frame_latency(_this: *mut DxgiDeviceObject, _l: u32) -> HResult {
+    S_OK
+}
+
+/// `IDXGIDevice1::GetMaximumFrameLatency` : 1 frame.
+extern "win64" fn dxgi_device_get_max_frame_latency(_this: *mut DxgiDeviceObject) -> u32 {
+    1
+}
+
+const fn build_dxgi_device_vtbl() -> DxgiDeviceVtbl {
+    let mut slots = UNIMPL_SLOTS;
+    let mut pad = 0;
+    while pad < 20 {
+        slots[pad] = vslot(noop_ok as *const c_void);
+        pad += 1;
+    }
+    slots[0] = vslot(dxgi_device_qi as *const c_void);
+    slots[1] = vslot(com_add_ref as *const c_void);
+    slots[2] = vslot(com_release as *const c_void);
+    slots[6] = vslot(dxgi_device_get_parent as *const c_void);
+    slots[7] = vslot(dxgi_device_get_adapter as *const c_void);
+    slots[10] = vslot(dxgi_device_set_gpu_thread_priority as *const c_void);
+    slots[11] = vslot(dxgi_device_get_gpu_thread_priority as *const c_void);
+    slots[12] = vslot(dxgi_device_set_max_frame_latency as *const c_void);
+    slots[13] = vslot(dxgi_device_get_max_frame_latency as *const c_void);
+    DxgiDeviceVtbl { slots }
+}
+
+static DXGI_DEVICE_VTBL: DxgiDeviceVtbl = build_dxgi_device_vtbl();
+
+/// `IDXGIAdapter` : adaptateur minimal renvoyé par `IDXGIDevice::GetAdapter`. Le titre l'utilise
+/// pour énumérer les sorties (`EnumOutputs`) et lire la description de l'adaptateur (`GetDesc`).
+#[repr(C)]
+struct DxgiAdapterVtbl {
+    slots: [VtblSlot; VT_PAD_LEN],
+}
+
+#[repr(C)]
+struct DxgiAdapterObject {
+    header: ComHeader,
+}
+
+/// `IDXGIOutput` : sortie/moniteur minimal renvoyé par `IDXGIAdapter::EnumOutputs`. Le titre y
+/// appelle `GetDisplayModeList` (slot 21 sur la console) pour détecter les fréquences supportées.
+#[repr(C)]
+struct DxgiOutputVtbl {
+    slots: [VtblSlot; VT_PAD_LEN],
+}
+
+#[repr(C)]
+struct DxgiOutputObject {
+    header: ComHeader,
+}
+
+extern "win64" fn dxgi_adapter_qi(
+    this: *mut ComHeader,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    com_query_interface_list(
+        "IDXGIAdapter",
+        this,
+        riid,
+        ppv,
+        &[IID_IDXGIADAPTER],
+    )
+}
+
+/// `IDXGIAdapter::EnumOutputs(Output, ppOutput)` : renvoie une sortie factice (un seul moniteur).
+extern "win64" fn dxgi_adapter_enum_outputs(
+    _this: *mut DxgiAdapterObject,
+    _output_idx: u32,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    let out = Box::new(DxgiOutputObject {
+        header: ComHeader::new(traced_vtbl(
+            (&raw const DXGI_OUTPUT_VTBL).cast(),
+            "IDXGIOutput",
+        )),
+    });
+    // SAFETY: `ppv` vérifié non-nul ; `out` est un objet du bridge.
+    unsafe { *ppv = Box::into_raw(out).cast() };
+    sb_debug!("dxgi", "IDXGIAdapter::EnumOutputs(0) -> S_OK");
+    S_OK
+}
+
+extern "win64" fn dxgi_output_qi(
+    this: *mut ComHeader,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    com_query_interface_list(
+        "IDXGIOutput",
+        this,
+        riid,
+        ppv,
+        &[IID_IDXGIOUTPUT],
+    )
+}
+
+/// `IDXGIOutput::GetDesc` (slot 7) : description minimale de la sortie.
+extern "win64" fn dxgi_output_get_desc(
+    _this: *mut DxgiOutputObject,
+    desc: *mut c_void,
+) -> HResult {
+    if desc.is_null() {
+        return E_POINTER;
+    }
+    // DXGI_OUTPUT_DESC : DeviceName[32] + RECT + AttachedToDesktop + Rotation + Monitor.
+    // SAFETY: `desc` vérifié non-nul ; on écrit une description vide mais cohérente.
+    unsafe {
+        let d = desc.cast::<u8>();
+        ptr::write_bytes(d, 0, 96);
+        // AttachedToDesktop (offset 80) = TRUE.
+        d.add(80).cast::<i32>().write(1);
+    }
+    S_OK
+}
+
+/// `IDXGIOutput::GetDisplayModeList` (slot 21 sur la console) : renvoie 0 mode ; le titre bascule
+/// alors sur sa fréquence par défaut sans énumérer de modes exotiques.
+extern "win64" fn dxgi_output_get_display_mode_list(
+    _this: *mut DxgiOutputObject,
+    _format: u32,
+    _flags: u32,
+    out_count: *mut u32,
+    _desc: *mut c_void,
+) -> HResult {
+    if out_count.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: `out_count` vérifié non-nul.
+    unsafe { *out_count = 0 };
+    sb_debug!("dxgi", "IDXGIOutput::GetDisplayModeList -> 0 modes");
+    S_OK
+}
+
+const fn build_dxgi_adapter_vtbl() -> DxgiAdapterVtbl {
+    let mut slots = UNIMPL_SLOTS;
+    let mut pad = 0;
+    while pad < 10 {
+        slots[pad] = vslot(noop_ok as *const c_void);
+        pad += 1;
+    }
+    slots[0] = vslot(dxgi_adapter_qi as *const c_void);
+    slots[1] = vslot(com_add_ref as *const c_void);
+    slots[2] = vslot(com_release as *const c_void);
+    slots[7] = vslot(dxgi_adapter_enum_outputs as *const c_void);
+    DxgiAdapterVtbl { slots }
+}
+
+static DXGI_ADAPTER_VTBL: DxgiAdapterVtbl = build_dxgi_adapter_vtbl();
+
+const fn build_dxgi_output_vtbl() -> DxgiOutputVtbl {
+    let mut slots = UNIMPL_SLOTS;
+    let mut pad = 0;
+    while pad < 22 {
+        slots[pad] = vslot(noop_ok as *const c_void);
+        pad += 1;
+    }
+    slots[0] = vslot(dxgi_output_qi as *const c_void);
+    slots[1] = vslot(com_add_ref as *const c_void);
+    slots[2] = vslot(com_release as *const c_void);
+    slots[7] = vslot(dxgi_output_get_desc as *const c_void);
+    slots[21] = vslot(dxgi_output_get_display_mode_list as *const c_void);
+    DxgiOutputVtbl { slots }
+}
+
+static DXGI_OUTPUT_VTBL: DxgiOutputVtbl = build_dxgi_output_vtbl();
+
 // ==================== `dxgi.dll` (`IDXGIFactory4` + `IDXGISwapChain3`) ====================
 
 #[repr(C)]
