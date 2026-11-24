@@ -491,21 +491,62 @@ impl ModuleManager {
         } else {
             ptr::null_mut()
         };
-        // SAFETY: allocation anonyme `mmap` RW pour charger le PE32+.
-        let mapped = unsafe {
-            libc::mmap(
-                hint,
-                image_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
+        // Adresse préférée d'abord, de façon stricte : `MAP_FIXED_NOREPLACE` n'écrase jamais un
+        // mapping existant et échoue plutôt que de placer l'image ailleurs (un simple `hint` peut
+        // être ignoré en silence, ce qui est fatal pour une image sans relocations).
+        let mut mapped = libc::MAP_FAILED;
+        if !hint.is_null() {
+            // SAFETY: allocation anonyme RW ; `MAP_FIXED_NOREPLACE` ne remplace aucun mapping.
+            mapped = unsafe {
+                libc::mmap(
+                    hint,
+                    image_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if mapped != libc::MAP_FAILED && mapped != hint {
+                // Noyau ancien qui ignore le drapeau : on libère et on retombe sur le repli.
+                // SAFETY: mapping que nous venons de créer.
+                unsafe { libc::munmap(mapped, image_size) };
+                mapped = libc::MAP_FAILED;
+            }
+        }
+        if mapped == libc::MAP_FAILED {
+            // Repli : n'importe quelle adresse (l'image sera relogée si elle le permet).
+            // SAFETY: allocation anonyme `mmap` RW pour charger le PE32+.
+            mapped = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    image_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+        }
         if mapped == libc::MAP_FAILED {
             return Err(LoaderError::MmapFailed {
                 path: path.to_path_buf(),
                 size: image_size,
+            });
+        }
+        if mapped as usize != preferred_base
+            && opt.data_directories.get_base_relocation_table().is_none()
+        {
+            // Sans table de relocation, les adresses absolues du code seraient fausses : échec net.
+            // SAFETY: libération de l'image que nous venons d'allouer.
+            unsafe { libc::munmap(mapped, image_size) };
+            return Err(LoaderError::InvalidPe {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "base préférée {preferred_base:#x} indisponible dans ce processus et l'image n'a \
+                     aucune table de relocation : chargement impossible (libérez cette plage \
+                     d'adresses, ex. désactivez un préchargement `LD_PRELOAD`)"
+                ),
             });
         }
         let base = mapped as usize;

@@ -13,7 +13,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Xbox GDK runtime classes** served through `QueryApiImpl` (threading/`XAsync`, `XUser`, `XNetworking`, `XGameSave`, `XStore`, `XPackage`, …), DirectStorage (public and console interfaces), `xmem` physical pages, `XboxBvhBuilder`, Media Foundation and Bink stubs.
 - **Diagnostics**: `inspect --missing`, `SB_TRACE_API` call tracer with string previews, `SB_UNIMPLEMENTED=stop`, `SB_GUEST_DLLS`, and a crash report (guest/host symbolization, call stack from `.pdata`).
 
+- **Exceptions**: Windows x64 SEH dispatch (`RaiseException`, `RtlUnwindEx`, vectored handlers, `__C_specific_handler`), MSVC C++ exceptions (`_CxxThrowException`, `__CxxFrameHandler3/4`, `std::exception_ptr`) and hardware faults delivered as SEH exceptions; `SB_TRACE_SEH=1` traces the dispatch.
+- **`scarletbridge doctor`**: checks kernel limits, free load addresses, memory, CPU level, `arch_prctl`, Vulkan, SDL3, display, audio and write permissions, with a fix hint for each warning.
+- **Diagnostics**: unimplemented D3D12/GDK slots now describe their pointer arguments (memory preview, named interface IDs).
+
 ### Fixed
+- The PE loader requests the preferred base strictly (`MAP_FIXED_NOREPLACE`) and refuses, with an explicit message, an image that cannot be placed there and has no relocation table (instead of running with wrong addresses).
 - VFS now resolves `GAME:\…`, `SAVE:\…` and `TEMP:\…` (backslashes, any case); escape attempts are still rejected.
 - D3D12 / DXGI vtables are padded to 192 slots so calls to newer or console-specific methods fail cleanly instead of reading past the table.
 - SDL3: the video subsystem and the Vulkan loader are initialised before querying instance extensions (previously a `SIGSEGV`).

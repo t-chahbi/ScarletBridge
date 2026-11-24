@@ -614,7 +614,10 @@ extern "win64" fn d3d_unimpl_slot<const N: usize>(
     {
         sb_warn!(
             CHANNEL,
-            "{name}::slot {N} non implémenté appelé (this={this:p}, a2={a2:#x}, a3={a3:#x}, a4={a4:#x}) -> E_NOTIMPL"
+            "{name}::slot {N} non implémenté appelé (this={this:p}, a2={}, a3={}, a4={}) -> E_NOTIMPL",
+            crate::com::describe_guest_arg(a2),
+            crate::com::describe_guest_arg(a3),
+            crate::com::describe_guest_arg(a4)
         );
     }
     E_NOTIMPL
@@ -3132,7 +3135,9 @@ extern "win64" fn device_open_existing_heap_from_address(
         if addr == 0 || !addr.is_multiple_of(4096) {
             sb_warn!(
                 CHANNEL,
-                "OpenExistingHeapFromAddress({address:p}) : adresse NULL ou non alignée sur la page -> E_INVALIDARG"
+                "OpenExistingHeapFromAddress : adresse NULL ou non alignée sur la page -> E_INVALIDARG (pAddress={}, riid={}, ppvHeap={out_heap:p}) ; si le titre attend un succès, ce slot n'est peut-être pas cette méthode sur la console",
+                crate::com::describe_guest_arg(addr),
+                crate::com::describe_guest_arg(riid as usize)
             );
             return E_INVALIDARG;
         }

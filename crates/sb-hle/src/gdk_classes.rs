@@ -159,7 +159,10 @@ pub extern "win64" fn unimplemented_slot<const N: usize>(
     {
         sb_warn!(
             CHANNEL,
-            "{class}::slot {N} non implémenté appelé (a2={a2:#x}, a3={a3:#x}, a4={a4:#x}) -> E_NOTIMPL"
+            "{class}::slot {N} non implémenté appelé (a2={}, a3={}, a4={}) -> E_NOTIMPL",
+            crate::com::describe_guest_arg(a2),
+            crate::com::describe_guest_arg(a3),
+            crate::com::describe_guest_arg(a4)
         );
     }
     E_NOTIMPL

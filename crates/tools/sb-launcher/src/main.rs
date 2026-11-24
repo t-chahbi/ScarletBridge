@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod doctor;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
@@ -23,6 +25,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum SubCmd {
+    /// Vérifie l'environnement (noyau, mémoire, CPU, Vulkan, SDL3, affichage, audio, droits).
+    Doctor,
+
     /// Inspecte un répertoire d'application Xbox/GDK ou un binaire PE32+ (couverture HLE native).
     Inspect {
         /// Répertoire contenant l'application ou chemin direct vers un binaire PE32+.
@@ -70,6 +75,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        SubCmd::Doctor => {
+            std::process::exit(doctor::run());
+        }
         SubCmd::Inspect {
             target,
             dll_dir,

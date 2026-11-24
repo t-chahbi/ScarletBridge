@@ -270,6 +270,20 @@ fn read_self(addr: usize, buf: &mut [u8]) -> usize {
     if n < 0 { 0 } else { n as usize }
 }
 
+/// Lit jusqu'à `len` octets de la mémoire du processus à `addr`, sans jamais faire de faute :
+/// retourne les octets effectivement lisibles (vide si l'adresse n'est pas mappée). Utile pour
+/// décrire dans un journal les pointeurs reçus d'un titre.
+pub fn peek_memory(addr: usize, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len.min(4096)];
+    let mut n = read_self(addr, &mut buf);
+    if n == 0 && buf.len() > 16 {
+        // Fin de page : réessaie avec une lecture courte.
+        n = read_self(addr, &mut buf[..16]);
+    }
+    buf.truncate(n);
+    buf
+}
+
 /// Aperçu textuel (ASCII ou UTF-16LE imprimable, au moins 3 caractères) de la mémoire à `addr`.
 fn text_preview(addr: usize) -> Option<(u8, String)> {
     let mut buf = [0u8; PREVIEW_BYTES * 2];
@@ -562,8 +576,12 @@ mod tests {
         a * b
     }
 
+    /// Les tests de trace partagent le tampon global d'appels : on les exécute l'un après l'autre.
+    static TRACE_TESTS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn api_trace_thunk_is_transparent_and_records_calls() {
+        let _serial = TRACE_TESTS.lock();
         let t = allocate_trace_thunk("fake.dll", "Sum", target_sum as *const () as usize);
         // SAFETY: `t` est un thunk x86-64 win64 qui saute vers `target_sum`.
         let f: extern "win64" fn(usize, usize, usize, usize) -> usize =
@@ -591,6 +609,7 @@ mod tests {
 
     #[test]
     fn api_trace_records_string_arguments_ascii_and_utf16() {
+        let _serial = TRACE_TESTS.lock();
         let ascii = b"GAME:\\Media\\a.bin\0";
         let wide: Vec<u16> = "G:\\x\\b.bin\0".encode_utf16().collect();
         let t = allocate_trace_thunk("fake.dll", "OpenPath", target_sum as *const () as usize);
@@ -621,5 +640,16 @@ mod tests {
         assert_eq!(ApiTraceMode::parse(Some("1")), ApiTraceMode::Ring);
         assert_eq!(ApiTraceMode::parse(Some(" LIVE ")), ApiTraceMode::Live);
         assert_eq!(ApiTraceMode::parse(Some("non")), ApiTraceMode::Off);
+    }
+
+    #[test]
+    fn peek_memory_reads_valid_memory_and_never_faults() {
+        let data = [
+            1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        ];
+        let got = peek_memory(data.as_ptr() as usize, 8);
+        assert_eq!(got, &data[..8]);
+        assert!(peek_memory(0, 16).is_empty());
+        assert!(peek_memory(0xDEAD_0000, 16).is_empty());
     }
 }

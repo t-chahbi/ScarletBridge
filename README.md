@@ -42,7 +42,7 @@ ScarletBridge is built **specifically for Linux** and written **100% in Rust (Ed
 
 ## Project status
 
-**Early active development — core runtime & 3D/Compute Vulkan pipeline work end-to-end on real hardware.** The workspace has **270+ unit tests** (`cargo test --workspace`, all passing, `clippy` and `rustfmt` clean) plus **7** cross-compiled PE32+ x86-64 harnesses under `tests/harness/` (including `api_conformance`, which exercises the CRT, Win32, Winsock, `bcrypt` and `rpcrt4` APIs through a real PE import table); developed and tested natively on Linux (AMD Radeon RX 5700 XT / Mesa RADV Vulkan 1.4) with zero Wine.
+**Early active development — core runtime & 3D/Compute Vulkan pipeline work end-to-end on real hardware.** The workspace has **320+ unit tests** (`cargo test --workspace`, all passing, `clippy` and `rustfmt` clean) plus **8** cross-compiled PE32+ x86-64 harnesses under `tests/harness/` (including `api_conformance`, which exercises the CRT, Win32, Winsock, `bcrypt` and `rpcrt4` APIs through a real PE import table); developed and tested natively on Linux (AMD Radeon RX 5700 XT / Mesa RADV Vulkan 1.4) with zero Wine.
 
 | What | Status |
 |---|---|
@@ -55,7 +55,7 @@ ScarletBridge is built **specifically for Linux** and written **100% in Rust (Ed
 | Unified memory (`xmem.dll`) & AMD RDNA 2 tiling | ✅ Works — 64 KiB aligned `VK_EXT_external_memory_host` CPU/GPU memory + 2D tile/detile (`xg_tiling`) |
 | Direct3D 11 & WinRT/UWP (`d3d11.rs`, `winrt_objects.rs`) | ⚠️ In progress — OpenLara Xbox boots natively, initializes D3D11→Vulkan + XAudio2 + 6 WinRT classes, and writes `S:\perlin3_128.raw`; D3D11 `CreateInputLayout` & `CreateTexture2D(pInitialData)` still needed for full 3D frames |
 | Xbox GDK GameOS, Audio & Input (`XTaskQueue`, `XUser`, `XAudio2_9`, `GameInput`, strict offline `XCurl`/`libHttpClient.GDK`) | ✅ Core works — multi-threaded `XTaskQueue`, SDL3 Gamepad, PipeWire/SDL3 audio, offline-by-default. ⚠️ Multi-voice XMA2 decoding & WinRT keyboard/mouse events not yet wired |
-| Win32 / UCRT / MSVC runtime HLE (`kernel32`, `api-ms-win-*`, `ucrtbase`, `msvcp140`, `vcruntime140`, `bcrypt`, `rpcrt4`, `dbghelp`, ntuser) | ✅ Broad coverage — C runtime (`printf`/`scanf` engines, `strto*`, time, math with `errno`), STL iostreams/locale layouts, `setjmp`/`longjmp`, RTTI `__RTDynamicCast`, `.pdata` unwinding (`RtlVirtualUnwind`), file I/O through the sandboxed VFS. ⚠️ C++ exception propagation (SEH/`__CxxFrameHandler`) is **not** implemented yet |
+| Win32 / UCRT / MSVC runtime HLE (`kernel32`, `api-ms-win-*`, `ucrtbase`, `msvcp140`, `vcruntime140`, `bcrypt`, `rpcrt4`, `dbghelp`, ntuser) | ✅ Broad coverage — C runtime (`printf`/`scanf` engines, `strto*`, time, math with `errno`), STL iostreams/locale layouts, `setjmp`/`longjmp`, RTTI `__RTDynamicCast`, `.pdata` unwinding (`RtlVirtualUnwind`), file I/O through the sandboxed VFS. ✅ Exceptions: Windows x64 SEH and MSVC C++ (`_CxxThrowException`, `__CxxFrameHandler3/4`, `__C_specific_handler`, vectored handlers, hardware faults as SEH exceptions) propagate for real, validated by the `eh_test` harness (`catch_unwind`, `Drop` during unwinding). ⚠️ The FH4 decoder is reconstructed from public descriptions and checked only against synthetic tables |
 | Offline-first networking (`ws2_32`, `winhttp`, `libHttpClient.GDK`) | ✅ Winsock by name **and ordinal**, WinHTTP and the full libHttpClient surface; strictly offline by default (non-loopback traffic fails with the documented Windows error codes), loopback works. ⚠️ No TLS, no WebSockets |
 | Xbox GDK runtime classes (`xgameruntime`: threading/`XAsync`, `XUser`, `XNetworking`, `XGameSave`, `XStore`, `XPackage`, …), DirectStorage, `xmem` physical pages | ✅ Served through `QueryApiImpl` with a single offline local user; unknown slots fail cleanly (`E_NOTIMPL`) and are logged by name. ⚠️ Several console-specific interface layouts are **inferred**, not documented — see the code comments |
 | Encrypted / commercial Xbox Series games | ❌ No — out of scope by design (unencrypted PE32+ x86-64 binaries only) |
@@ -67,6 +67,9 @@ ScarletBridge is designed for **maximum compatibility with Xbox / GDK applicatio
 Because compatibility depends on which APIs a bundle imports, the tooling is built to tell you exactly what is covered and what is not:
 
 ```sh
+# 0. Is this machine ready? (kernel limits, free load addresses, CPU level, Vulkan, SDL3, display, audio, permissions)
+./target/release/scarletbridge doctor
+
 # 1. Which imports does this bundle use, and how many are implemented natively?
 ./target/release/scarletbridge inspect --missing /path/to/bundle/app.exe
 
