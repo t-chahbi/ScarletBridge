@@ -623,7 +623,11 @@ fn scan_shaders(bytes: &[u8]) -> ShaderInfo {
 }
 
 /// Noms de fichiers cités dans le binaire (chaînes ASCII se terminant par une extension connue).
-fn scan_file_references(bytes: &[u8], import_dlls: &BTreeSet<String>) -> Vec<String> {
+fn scan_file_references(
+    bytes: &[u8],
+    import_dlls: &BTreeSet<String>,
+    hle: &DefaultHleResolver,
+) -> Vec<String> {
     const EXTS: [&str; 24] = [
         ".rpf", ".bin", ".dat", ".pak", ".json", ".xml", ".cfg", ".ini", ".bik", ".bk2", ".bnk",
         ".wem", ".awc", ".xvd", ".pri", ".txt", ".lua", ".cso", ".dds", ".ogg", ".mp4", ".dll",
@@ -662,6 +666,7 @@ fn scan_file_references(bytes: &[u8], import_dlls: &BTreeSet<String>) -> Vec<Str
                     || name.starts_with("api-ms-")
                     || name.starts_with("ext-ms-")
                     || import_dlls.contains(&name)
+                    || (name.ends_with(".dll") && hle.is_hle_module(&name))
                 {
                     continue;
                 }
@@ -1206,7 +1211,7 @@ pub fn analyze(exe: &Path, bundle_dir: Option<&Path>, opts: &Options) -> Result<
     let mut files_referenced = Vec::new();
     {
         let existing = bundle_dir.map(bundle_file_names);
-        for name in scan_file_references(&bytes, &import_dll_names) {
+        for name in scan_file_references(&bytes, &import_dll_names, &hle) {
             // Les noms contenant `%` sont des modèles de format (`track_%02d.ogg`), pas des fichiers.
             let is_pattern = name.contains('%');
             files_referenced.push(FileRef {
@@ -1632,9 +1637,11 @@ mod tests {
     #[test]
     fn file_references_are_extracted_and_system_dlls_ignored() {
         let mut blob = Vec::new();
-        blob.extend_from_slice(b"\0\0G:\\Media\\audio.rpf\0\0kernel32.dll\0xx\0config.json\0");
+        blob.extend_from_slice(
+            b"\0\0G:\\Media\\audio.rpf\0\0kernel32.dll\0\0ntdll.dll\0xx\0config.json\0",
+        );
         let imports: BTreeSet<String> = ["kernel32.dll".to_string()].into();
-        let names = scan_file_references(&blob, &imports);
+        let names = scan_file_references(&blob, &imports, &DefaultHleResolver::new());
         assert!(names.contains(&"audio.rpf".to_string()), "{names:?}");
         assert!(names.contains(&"config.json".to_string()), "{names:?}");
         assert!(!names.contains(&"kernel32.dll".to_string()), "{names:?}");

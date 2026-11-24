@@ -1090,6 +1090,115 @@ fn create_launcher() -> *mut ComHeader {
     singleton(&CELL, LAUNCHER_VTBL.as_ptr().cast())
 }
 
+// ---------------------------------------------------------------------------------------------
+// XAppCaptureImpl : captures d'écran / vidéo de la console. Aucune capture hors ligne : tous les
+// slots échouent proprement (`E_NOTIMPL`, journalisés par numéro) ; la vtable est large pour qu'un
+// titre qui appelle une méthode de capture ne lise jamais hors de la table.
+// ---------------------------------------------------------------------------------------------
+
+const CLSID_XAPPCAPTURE: Guid = guid("a4f1aee2-4bf1-4485-b008-a7c26d52ac27");
+const APPCAPTURE_SLOT_COUNT: usize = 3 + 24;
+
+qi_fn!(appcapture_qi, "XAppCaptureImpl", &[CLSID_XAPPCAPTURE]);
+
+static APPCAPTURE_VTBL: [VtblSlot; APPCAPTURE_SLOT_COUNT] = [
+    vslot(appcapture_qi as *const c_void),
+    vslot(com_add_ref as *const c_void),
+    vslot(com_release as *const c_void),
+    unimpl!(3),
+    unimpl!(4),
+    unimpl!(5),
+    unimpl!(6),
+    unimpl!(7),
+    unimpl!(8),
+    unimpl!(9),
+    unimpl!(10),
+    unimpl!(11),
+    unimpl!(12),
+    unimpl!(13),
+    unimpl!(14),
+    unimpl!(15),
+    unimpl!(16),
+    unimpl!(17),
+    unimpl!(18),
+    unimpl!(19),
+    unimpl!(20),
+    unimpl!(21),
+    unimpl!(22),
+    unimpl!(23),
+    unimpl!(24),
+    unimpl!(25),
+    unimpl!(26),
+];
+const _: () = assert!(APPCAPTURE_VTBL.len() == APPCAPTURE_SLOT_COUNT);
+
+fn create_appcapture() -> *mut ComHeader {
+    static CELL: OnceLock<usize> = OnceLock::new();
+    singleton(&CELL, APPCAPTURE_VTBL.as_ptr().cast())
+}
+
+// ---------------------------------------------------------------------------------------------
+// XGameInviteImpl : invitations de jeu. Hors ligne, aucune invitation n'arrive : l'enregistrement
+// d'un rappel réussit et donne un jeton inerte ; la désinscription réussit toujours.
+// ---------------------------------------------------------------------------------------------
+
+const CLSID_XGAMEINVITE: Guid = guid("0651aae2-4012-4077-bf84-8b9097090e2c");
+const GAMEINVITE_SLOT_COUNT: usize = 3 + 10;
+
+qi_fn!(gameinvite_qi, "XGameInviteImpl", &[CLSID_XGAMEINVITE]);
+
+/// `HRESULT XGameInviteRegisterForEvent(XTaskQueueHandle, void*, XGameInviteEventCallback*, XTaskQueueRegistrationToken*)`.
+extern "win64" fn gameinvite_register(
+    _this: *mut c_void,
+    _queue: usize,
+    _context: *mut c_void,
+    callback: usize,
+    token: *mut u64,
+) -> HResult {
+    static NEXT_TOKEN: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0x4747_0000);
+    ffi_guard!(CHANNEL, "XGameInviteRegisterForEvent", E_FAIL, {
+        if callback == 0 || token.is_null() {
+            return E_INVALIDARG;
+        }
+        let t = NEXT_TOKEN.fetch_add(1, Ordering::AcqRel);
+        // SAFETY: `token` vérifié non-nul ; `XTaskQueueRegistrationToken` est un `uint64_t`.
+        unsafe { core::ptr::write_unaligned(token, t) };
+        sb_debug!(
+            CHANNEL,
+            "XGameInviteRegisterForEvent -> jeton {t:#x} (aucune invitation hors ligne)"
+        );
+        S_OK
+    })
+}
+
+/// `bool XGameInviteUnregisterForEvent(XTaskQueueRegistrationToken, bool wait)`.
+extern "win64" fn gameinvite_unregister(_this: *mut c_void, _token: u64, _wait: u8) -> u8 {
+    1
+}
+
+static GAMEINVITE_VTBL: [VtblSlot; GAMEINVITE_SLOT_COUNT] = [
+    vslot(gameinvite_qi as *const c_void),
+    vslot(com_add_ref as *const c_void),
+    vslot(com_release as *const c_void),
+    vslot(gameinvite_register as *const c_void),   // 3
+    vslot(gameinvite_unregister as *const c_void), // 4
+    unimpl!(5),
+    unimpl!(6),
+    unimpl!(7),
+    unimpl!(8),
+    unimpl!(9),
+    unimpl!(10),
+    unimpl!(11),
+    unimpl!(12),
+];
+const _: () = assert!(GAMEINVITE_VTBL.len() == GAMEINVITE_SLOT_COUNT);
+
+fn create_gameinvite() -> *mut ComHeader {
+    static CELL: OnceLock<usize> = OnceLock::new();
+    singleton(&CELL, GAMEINVITE_VTBL.as_ptr().cast())
+}
+
 /// Classes fournies par ce module (enregistrées dans `gdk_classes::registry`).
 pub fn classes() -> Vec<ClassDef> {
     vec![
@@ -1138,6 +1247,18 @@ pub fn classes() -> Vec<ClassDef> {
             clsid: CLSID_XLAUNCHER,
             extra_iids: &[],
             create: create_launcher,
+        },
+        ClassDef {
+            name: "XAppCaptureImpl",
+            clsid: CLSID_XAPPCAPTURE,
+            extra_iids: &[],
+            create: create_appcapture,
+        },
+        ClassDef {
+            name: "XGameInviteImpl",
+            clsid: CLSID_XGAMEINVITE,
+            extra_iids: &[],
+            create: create_gameinvite,
         },
     ]
 }
@@ -1579,6 +1700,34 @@ mod tests {
             let f: extern "win64" fn(*mut c_void) -> HResult = slot(o, n);
             assert_eq!(f(o), E_FAIL);
         }
+    }
+
+    #[test]
+    fn app_capture_and_game_invite_are_served_and_fail_cleanly() {
+        use sb_common::abi::E_NOTIMPL;
+        let cap = obj(&CLSID_XAPPCAPTURE);
+        for n in [3usize, 10, 26] {
+            let f: extern "win64" fn(*mut c_void, usize, usize, usize) -> HResult = slot(cap, n);
+            assert_eq!(f(cap, 0, 0, 0), E_NOTIMPL, "XAppCapture slot {n}");
+        }
+        let inv = obj(&CLSID_XGAMEINVITE);
+        let reg: extern "win64" fn(*mut c_void, usize, *mut c_void, usize, *mut u64) -> HResult =
+            slot(inv, 3);
+        let mut tok = 0u64;
+        assert_eq!(reg(inv, 0, core::ptr::null_mut(), 0x1234, &mut tok), S_OK);
+        assert_ne!(tok, 0);
+        assert_eq!(
+            reg(inv, 0, core::ptr::null_mut(), 0, &mut tok),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            reg(inv, 0, core::ptr::null_mut(), 1, core::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        let unreg: extern "win64" fn(*mut c_void, u64, u8) -> u8 = slot(inv, 4);
+        assert_eq!(unreg(inv, tok, 1), 1);
+        let extra: extern "win64" fn(*mut c_void, usize, usize, usize) -> HResult = slot(inv, 9);
+        assert_eq!(extra(inv, 0, 0, 0), E_NOTIMPL);
     }
 
     #[test]
