@@ -1098,6 +1098,8 @@ const MEM_COMMIT: u32 = 0x0000_1000;
 const MEM_RESERVE: u32 = 0x0000_2000;
 /// Bit de mode « pages 64 KiB » observé dans `AllocationType` (même valeur que `MEM_PHYSICAL`).
 const XMEM_MEM_64K_PAGES: u32 = 0x0040_0000;
+/// `MEM_REPLACE_PLACEHOLDER` (API de placeholders Windows 10+).
+const MEM_REPLACE_PLACEHOLDER: u32 = 0x0000_4000;
 /// `MEM_LARGE_PAGES` : pages 2 MiB.
 const MEM_LARGE_PAGES: u32 = 0x2000_0000;
 
@@ -1424,7 +1426,11 @@ extern "win64" fn XMemVirtualAlloc(
         let Some(prot) = xmem_protect_to_posix(protect) else {
             return xmem_fail(ERROR_INVALID_PARAMETER, ptr::null_mut());
         };
-        let known = MEM_COMMIT | MEM_RESERVE | XMEM_MEM_64K_PAGES | MEM_LARGE_PAGES;
+        let known = MEM_COMMIT
+            | MEM_RESERVE
+            | MEM_REPLACE_PLACEHOLDER
+            | XMEM_MEM_64K_PAGES
+            | MEM_LARGE_PAGES;
         if allocation_type & !known != 0 {
             sb_debug!(
                 "xmem",
@@ -1452,6 +1458,46 @@ extern "win64" fn XMemVirtualAlloc(
             if unsafe { libc::mprotect(start as *mut libc::c_void, end - start, prot) } != 0 {
                 return xmem_fail(ERROR_NOT_ENOUGH_MEMORY, ptr::null_mut());
             }
+            return start as *mut c_void;
+        }
+
+        // `MEM_REPLACE_PLACEHOLDER` : la plage est un placeholder issu d'une réservation précédente
+        // (scindée par `VirtualFree(.., MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)`) ; on la remappe
+        // à l'adresse exacte, sans réaligner sur la granularité des grandes pages.
+        if allocation_type & MEM_REPLACE_PLACEHOLDER != 0 && !address.is_null() {
+            let start = (address as usize) & !0xFFF;
+            let Some(end) = (address as usize)
+                .checked_add(size)
+                .map(|e| e.next_multiple_of(4096))
+            else {
+                return xmem_fail(ERROR_INVALID_PARAMETER, ptr::null_mut());
+            };
+            if xmem_region_for(&st, start, end - start).is_none() {
+                return xmem_fail(ERROR_INVALID_ADDRESS, ptr::null_mut());
+            }
+            let map_prot = if allocation_type & MEM_COMMIT != 0 {
+                prot
+            } else {
+                libc::PROT_NONE
+            };
+            // SAFETY: plage incluse dans une réservation `XMemVirtualAlloc` possédée par l'émulateur.
+            let p = unsafe {
+                libc::mmap(
+                    start as *mut libc::c_void,
+                    end - start,
+                    map_prot,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return xmem_fail(ERROR_NOT_ENOUGH_MEMORY, ptr::null_mut());
+            }
+            sb_trace!(
+                "xmem",
+                "XMemVirtualAlloc(placeholder {start:#x}+{size:#x}, type={allocation_type:#x}) -> {start:#x}"
+            );
             return start as *mut c_void;
         }
 
@@ -1835,6 +1881,36 @@ mod xmem_bvh_tests {
             let state = u32::from_le_bytes(mbi[32..36].try_into().expect("4 octets"));
             assert_eq!(state, MEM_COMMIT);
         }
+
+        // Placeholder : réserve large, scission, puis remplacement à l'adresse exacte (grandes pages).
+        let big = XMemVirtualAlloc(
+            ptr::null_mut(),
+            8 << 20,
+            MEM_RESERVE | 0x0040_0000,
+            0x7,
+            0x04,
+        );
+        assert!(!big.is_null());
+        let part = (big as usize + 0x10000) as *mut c_void;
+        let repl = XMemVirtualAlloc(
+            part,
+            0x20000,
+            MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_LARGE_PAGES | 0x0040_0000,
+            0x27,
+            0x04,
+        );
+        assert_eq!(repl, part);
+        // Hors de toute réservation : refusé.
+        assert!(
+            XMemVirtualAlloc(
+                0x10_0000_0000usize as *mut c_void,
+                0x10000,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+                0x7,
+                0x04
+            )
+            .is_null()
+        );
 
         // Réserve puis commit partiel.
         let r = XMemVirtualAlloc(ptr::null_mut(), 1 << 20, MEM_RESERVE, 0x2, 0x01);
