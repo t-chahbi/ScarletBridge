@@ -557,6 +557,69 @@ extern "win64" fn noop_ok() -> HResult {
 /// Longueur uniforme des vtables D3D12 / DXGI (slots 0..`VT_PAD_LEN`).
 const VT_PAD_LEN: usize = 192;
 
+/// Tables de méthodes tracées (`SB_TRACE_API`) : `(original → copie, copie → original)`.
+static TRACED_VTBLS: std::sync::LazyLock<Mutex<(HashMap<usize, usize>, HashMap<usize, usize>)>> =
+    std::sync::LazyLock::new(|| Mutex::new((HashMap::new(), HashMap::new())));
+
+/// Construit une copie de `orig` (`VT_PAD_LEN` slots) dont chaque slot passe par un thunk de trace
+/// nommé `<objet>::slotN` : les appels de méthodes COM apparaissent alors dans le tampon d'appels du
+/// rapport de crash, avec leurs quatre premiers arguments et un aperçu des chaînes pointées.
+fn build_traced_vtbl(orig: *const c_void, name: &str) -> *const c_void {
+    // SAFETY: toutes les vtables D3D12/DXGI étendues sont des `[VtblSlot; VT_PAD_LEN]` statiques.
+    let slots = unsafe { core::slice::from_raw_parts(orig.cast::<VtblSlot>(), VT_PAD_LEN) };
+    let traced: Vec<VtblSlot> = slots
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            let thunk = sb_loader::trampoline::allocate_trace_thunk(
+                "d3d12",
+                &format!("{name}::slot{i}"),
+                slot.0 as usize,
+            );
+            vslot(thunk as *const c_void)
+        })
+        .collect();
+    Box::leak(traced.into_boxed_slice()).as_ptr().cast()
+}
+
+/// Table de méthodes à donner à un objet : l'originale, ou sa copie tracée si `SB_TRACE_API` est actif.
+fn traced_vtbl(orig: *const c_void, name: &'static str) -> *const c_void {
+    if sb_loader::trampoline::api_trace_mode() == sb_loader::trampoline::ApiTraceMode::Off {
+        return orig;
+    }
+    let mut maps = TRACED_VTBLS.lock();
+    if let Some(&t) = maps.0.get(&(orig as usize)) {
+        return t as *const c_void;
+    }
+    let t = build_traced_vtbl(orig, name);
+    maps.0.insert(orig as usize, t as usize);
+    maps.1.insert(t as usize, orig as usize);
+    t
+}
+
+/// Table d'origine d'une table éventuellement tracée (identité si elle n'est pas tracée).
+fn original_vtbl(v: *const c_void) -> *const c_void {
+    TRACED_VTBLS
+        .lock()
+        .1
+        .get(&(v as usize))
+        .map_or(v, |&o| o as *const c_void)
+}
+
+/// Résultat renvoyé par un slot D3D12/DXGI non implémenté.
+///
+/// Par défaut `S_OK` : les méthodes propres à la console (cadencement d'image, tampons de commandes,
+/// réglages) sont presque toutes des réglages que le titre vérifie ; un échec les fait s'arrêter sur
+/// une assertion alors qu'un succès sans effet les laisse poursuivre. `SB_D3D12_UNIMPL=notimpl`
+/// rétablit `E_NOTIMPL` (utile pour repérer une méthode dont le titre lit réellement le résultat).
+fn unimplemented_slot_result() -> HResult {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ok = *OK.get_or_init(|| {
+        !std::env::var("SB_D3D12_UNIMPL").is_ok_and(|v| v.eq_ignore_ascii_case("notimpl"))
+    });
+    if ok { S_OK } else { E_NOTIMPL }
+}
+
 /// Nom de l'objet D3D12/DXGI dont `this` est une instance d'après son pointeur de vtable, ou
 /// `None` si `this` n'est pas un objet du bridge. Lecture sûre : `this` peut être n'importe quelle
 /// valeur envoyée par le titre.
@@ -568,9 +631,9 @@ fn d3d_known_object_name(this: usize) -> Option<&'static str> {
     if head.len() < 8 {
         return None;
     }
-    let vtbl = usize::from_le_bytes([
+    let vtbl = original_vtbl(usize::from_le_bytes([
         head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
-    ]);
+    ]) as *const c_void) as usize;
     let known: [(usize, &'static str); 12] = [
         (
             (&raw const D3D12_ROOTSIG_VTBL) as usize,
@@ -648,13 +711,18 @@ extern "win64" fn d3d_unimpl_slot<const N: usize>(
     {
         sb_warn!(
             CHANNEL,
-            "{name}::slot {N} non implémenté appelé (this={this:p}, a2={}, a3={}, a4={}) -> E_NOTIMPL",
+            "{name}::slot {N} non implémenté appelé (this={this:p}, a2={}, a3={}, a4={}) -> {} (SB_D3D12_UNIMPL=notimpl pour E_NOTIMPL)",
             describe_d3d_arg(a2),
             describe_d3d_arg(a3),
-            describe_d3d_arg(a4)
+            describe_d3d_arg(a4),
+            if unimplemented_slot_result() == S_OK {
+                "S_OK par tolérance"
+            } else {
+                "E_NOTIMPL"
+            }
         );
     }
-    E_NOTIMPL
+    unimplemented_slot_result()
 }
 
 /// Slots de réserve : `d3d_unimpl_slot::<0>` … `d3d_unimpl_slot::<191>`.
@@ -1273,7 +1341,10 @@ fn alloc_d3d12_resource(desc: D3D12ResourceDesc, is_backbuffer: bool) -> *mut D3
     let fixed_addr = backing.as_mut_ptr() as usize;
     ALLOCATED_BUFFER_SIZES.lock().insert(fixed_addr, byte_len);
     let obj = Box::new(D3D12ResourceObject {
-        header: ComHeader::new((&raw const D3D12_RESOURCE_VTBL).cast()),
+        header: ComHeader::new(traced_vtbl(
+            (&raw const D3D12_RESOURCE_VTBL).cast(),
+            "ID3D12Resource",
+        )),
         desc,
         is_backbuffer,
         backing: Arc::new(Mutex::new(backing)),
@@ -1303,7 +1374,10 @@ fn alloc_placed_d3d12_resource(
     let fixed_addr = heap.base_addr + offset;
     ALLOCATED_BUFFER_SIZES.lock().insert(fixed_addr, byte_len);
     let obj = Box::new(D3D12ResourceObject {
-        header: ComHeader::new((&raw const D3D12_RESOURCE_VTBL).cast()),
+        header: ComHeader::new(traced_vtbl(
+            (&raw const D3D12_RESOURCE_VTBL).cast(),
+            "ID3D12Resource",
+        )),
         desc,
         is_backbuffer: false,
         backing: Arc::clone(&heap.backing),
@@ -2430,7 +2504,10 @@ extern "win64" fn device_create_command_queue(
     // SAFETY: `this` et `out_queue` vérifiés non-nuls.
     let dev = unsafe { &*this };
     let q = Box::new(D3D12QueueObject {
-        header: ComHeader::new((&raw const D3D12_QUEUE_VTBL).cast()),
+        header: ComHeader::new(traced_vtbl(
+            (&raw const D3D12_QUEUE_VTBL).cast(),
+            "ID3D12CommandQueue",
+        )),
         shared: Arc::clone(&dev.shared),
     });
     unsafe {
@@ -2450,7 +2527,10 @@ extern "win64" fn device_create_command_allocator(
         return E_POINTER;
     }
     let alloc = Box::new(D3D12CmdAllocObject {
-        header: ComHeader::new((&raw const D3D12_CMD_ALLOC_VTBL).cast()),
+        header: ComHeader::new(traced_vtbl(
+            (&raw const D3D12_CMD_ALLOC_VTBL).cast(),
+            "ID3D12CommandAllocator",
+        )),
     });
     // SAFETY: `out_alloc` vérifié non-nul.
     unsafe {
@@ -2624,7 +2704,10 @@ extern "win64" fn device_create_graphics_pso(
         match renderer.create_pipeline_from_dxbc_with_config(vs_bytes, ps_bytes, &cfg) {
             Ok(pipeline_id) => {
                 let pso = Box::new(D3D12PsoObject {
-                    header: ComHeader::new((&raw const D3D12_PSO_VTBL).cast()),
+                    header: ComHeader::new(traced_vtbl(
+                        (&raw const D3D12_PSO_VTBL).cast(),
+                        "ID3D12PipelineState",
+                    )),
                     pipeline_id,
                     is_compute: false,
                 });
@@ -2671,7 +2754,10 @@ extern "win64" fn device_create_compute_pso(
         match renderer.create_compute_pipeline_from_dxbc(cs_bytes) {
             Ok(pipeline_id) => {
                 let pso = Box::new(D3D12PsoObject {
-                    header: ComHeader::new((&raw const D3D12_PSO_VTBL).cast()),
+                    header: ComHeader::new(traced_vtbl(
+                        (&raw const D3D12_PSO_VTBL).cast(),
+                        "ID3D12PipelineState",
+                    )),
                     pipeline_id,
                     is_compute: true,
                 });
@@ -2787,7 +2873,10 @@ extern "win64" fn device_create_command_list(
         ops.push(RecordedOp::Render(rc));
     }
     let cl = Box::new(D3D12CmdListObject {
-        header: ComHeader::new((&raw const D3D12_CMDLIST_VTBL).cast()),
+        header: ComHeader::new(traced_vtbl(
+            (&raw const D3D12_CMDLIST_VTBL).cast(),
+            "ID3D12GraphicsCommandList",
+        )),
         ops: Mutex::new(ops),
         closed: Mutex::new(false),
         graphics_root_regs: Mutex::new(Vec::new()),
@@ -2818,7 +2907,10 @@ extern "win64" fn device_create_descriptor_heap(
     let count = u64::from(d.num_descriptors.max(1));
     let base = NEXT_DESC_HANDLE.fetch_add(count * 32, Ordering::Relaxed) as usize;
     let heap = Box::new(D3D12DescHeapObject {
-        header: ComHeader::new((&raw const D3D12_DESC_HEAP_VTBL).cast()),
+        header: ComHeader::new(traced_vtbl(
+            (&raw const D3D12_DESC_HEAP_VTBL).cast(),
+            "ID3D12DescriptorHeap",
+        )),
         desc: d,
         base_handle: base,
     });
@@ -2864,7 +2956,10 @@ extern "win64" fn device_create_root_signature(
         }
     }
     let rs = Box::new(D3D12RootSigObject {
-        header: ComHeader::new((&raw const D3D12_ROOTSIG_VTBL).cast()),
+        header: ComHeader::new(traced_vtbl(
+            (&raw const D3D12_ROOTSIG_VTBL).cast(),
+            "ID3D12RootSignature",
+        )),
         param_registers,
     });
     // SAFETY: `out_rs` vérifié non-nul.
@@ -3034,7 +3129,10 @@ extern "win64" fn device_create_heap(
         let mut buf = vec![0u8; size];
         let base_addr = buf.as_mut_ptr() as usize;
         let heap = Box::new(D3D12HeapObject {
-            header: ComHeader::new((&raw const D3D12_HEAP_VTBL).cast()),
+            header: ComHeader::new(traced_vtbl(
+                (&raw const D3D12_HEAP_VTBL).cast(),
+                "ID3D12Heap",
+            )),
             desc: d,
             backing: Arc::new(Mutex::new(buf)),
             base_addr,
@@ -3134,7 +3232,10 @@ extern "win64" fn device_create_fence(
         return E_POINTER;
     }
     let fence = Box::new(D3D12FenceObject {
-        header: ComHeader::new((&raw const D3D12_FENCE_VTBL).cast()),
+        header: ComHeader::new(traced_vtbl(
+            (&raw const D3D12_FENCE_VTBL).cast(),
+            "ID3D12Fence",
+        )),
         completed: AtomicU64::new(initial_value),
     });
     // SAFETY: `out_fence` vérifié non-nul.
@@ -3211,7 +3312,10 @@ extern "win64" fn device_open_existing_heap_from_address(
         let backing = Arc::new(Mutex::new(backing));
         std::mem::forget(Arc::clone(&backing));
         let heap = Box::new(D3D12HeapObject {
-            header: ComHeader::new((&raw const D3D12_HEAP_VTBL).cast()),
+            header: ComHeader::new(traced_vtbl(
+                (&raw const D3D12_HEAP_VTBL).cast(),
+                "ID3D12Heap",
+            )),
             desc: D3D12HeapDesc {
                 size_in_bytes: size as u64,
                 alignment: 65536,
@@ -3284,14 +3388,17 @@ extern "win64" fn device_slot48(
         }
         let hr = device_create_command_queue(this, &desc, riid, out);
         if hr == S_OK {
-            sb_info!(
-                CHANNEL,
-                "slot 48 : CreateCommandQueue de la console (type={}, priorité={}, drapeaux={:#x}, masque={:#x}, extension ignorée) -> S_OK",
-                desc.queue_type,
-                desc.priority,
-                desc.flags,
-                desc.node_mask
-            );
+            static LOGGED: AtomicU32 = AtomicU32::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 6 {
+                sb_info!(
+                    CHANNEL,
+                    "slot 48 : CreateCommandQueue de la console (type={}, priorité={}, drapeaux={:#x}, masque={:#x}) -> S_OK (les suivants en debug)",
+                    desc.queue_type,
+                    desc.priority,
+                    desc.flags,
+                    desc.node_mask
+                );
+            }
         }
         hr
     })
@@ -3356,10 +3463,13 @@ extern "win64" fn device_slot73(
         }
         let hr = device_create_command_list(this, 0, list_type, allocator, initial_pso, riid, out);
         if hr == S_OK {
-            sb_info!(
-                CHANNEL,
-                "slot 73 : CreateCommandList de la console (type={list_type}, PSO initial={initial_pso:p}) -> S_OK"
-            );
+            static LOGGED: AtomicU32 = AtomicU32::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 6 {
+                sb_info!(
+                    CHANNEL,
+                    "slot 73 : CreateCommandList de la console (type={list_type}, PSO initial={initial_pso:p}) -> S_OK (les suivants en debug)"
+                );
+            }
         }
         hr
     })
@@ -3478,7 +3588,10 @@ pub(crate) extern "win64" fn D3D12CreateDevice(
 
         if !out_device.is_null() {
             let dev = Box::new(D3D12DeviceObject {
-                header: ComHeader::new((&raw const D3D12_DEVICE_VTBL).cast()),
+                header: ComHeader::new(traced_vtbl(
+                    (&raw const D3D12_DEVICE_VTBL).cast(),
+                    "ID3D12Device",
+                )),
                 shared: Arc::new(SharedD3D12State {
                     renderer: Mutex::new(renderer),
                     sdl_window: Mutex::new(None),
@@ -3632,7 +3745,7 @@ pub(crate) fn device_raytracing_available(device: *mut c_void) -> Option<bool> {
     }
     // SAFETY: tout objet COM commence par un pointeur de vtable ; on ne fait que le comparer.
     let vtbl = unsafe { (*device.cast::<ComHeader>()).vtbl };
-    if vtbl != (&raw const D3D12_DEVICE_VTBL).cast::<c_void>() {
+    if original_vtbl(vtbl) != (&raw const D3D12_DEVICE_VTBL).cast::<c_void>() {
         return None;
     }
     // SAFETY: la vtable identifie un `D3D12DeviceObject` alloué par `D3D12CreateDevice`.
@@ -3647,7 +3760,7 @@ fn resource_from_ptr<'a>(res: *mut c_void) -> Option<&'a D3D12ResourceObject> {
     }
     // SAFETY: lecture du seul pointeur de vtable pour authentifier l'objet.
     let vtbl = unsafe { (*res.cast::<ComHeader>()).vtbl };
-    if vtbl != (&raw const D3D12_RESOURCE_VTBL).cast::<c_void>() {
+    if original_vtbl(vtbl) != (&raw const D3D12_RESOURCE_VTBL).cast::<c_void>() {
         return None;
     }
     // SAFETY: la vtable identifie un `D3D12ResourceObject` ScarletBridge vivant.
@@ -3877,7 +3990,11 @@ mod xbox_ext_tests {
                     // SAFETY: les slots de réserve ont la signature de `d3d_unimpl_slot`.
                     let f: extern "win64" fn(*mut c_void, usize, usize, usize) -> HResult =
                         unsafe { core::mem::transmute(slot) };
-                    assert_eq!(f(fake.as_ptr() as *mut c_void, 0, 0, 0), E_NOTIMPL, $name);
+                    assert_eq!(
+                        f(fake.as_ptr() as *mut c_void, 0, 0, 0),
+                        unimplemented_slot_result(),
+                        $name
+                    );
                 }
             }};
         }
@@ -4057,7 +4174,10 @@ mod xbox_ext_tests {
     #[test]
     fn unimplemented_slot_arguments_recognise_bridge_objects() {
         let queue = D3D12QueueObject {
-            header: ComHeader::new((&raw const D3D12_QUEUE_VTBL).cast()),
+            header: ComHeader::new(traced_vtbl(
+                (&raw const D3D12_QUEUE_VTBL).cast(),
+                "ID3D12CommandQueue",
+            )),
             shared: Arc::new(SharedD3D12State {
                 renderer: parking_lot::Mutex::new(
                     match VulkanRenderer::new(
@@ -4179,7 +4299,10 @@ mod xbox_ext_tests {
     fn residency_methods_succeed_and_signal_the_fence() {
         assert_eq!(device_set_residency_priority(), S_OK);
         let fence = Box::new(D3D12FenceObject {
-            header: ComHeader::new((&raw const D3D12_FENCE_VTBL).cast()),
+            header: ComHeader::new(traced_vtbl(
+                (&raw const D3D12_FENCE_VTBL).cast(),
+                "ID3D12Fence",
+            )),
             completed: AtomicU64::new(3),
         });
         let fence = Box::into_raw(fence);
@@ -4466,7 +4589,10 @@ fn create_swapchain_impl(
     }
 
     let sc = Box::new(DxgiSwapChain3Object {
-        header: ComHeader::new((&raw const DXGI_SC3_VTBL).cast()),
+        header: ComHeader::new(traced_vtbl(
+            (&raw const DXGI_SC3_VTBL).cast(),
+            "IDXGISwapChain3",
+        )),
         shared,
         width,
         height,
@@ -4538,7 +4664,10 @@ pub(crate) extern "win64" fn CreateDXGIFactory1(
             return E_POINTER;
         }
         let f = Box::new(DxgiFactory4Object {
-            header: ComHeader::new((&raw const DXGI_FACTORY4_VTBL).cast()),
+            header: ComHeader::new(traced_vtbl(
+                (&raw const DXGI_FACTORY4_VTBL).cast(),
+                "IDXGIFactory4",
+            )),
         });
         // SAFETY: `out_factory` vérifié non-nul.
         unsafe {
