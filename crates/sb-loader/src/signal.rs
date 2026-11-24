@@ -442,6 +442,10 @@ fn append_detailed_regs(msg: &mut String, regs: &Regs) {
         let _ = write!(msg, "{path}");
     }
 
+    for st in crate::trampoline::requested_stacks() {
+        let _ = write!(msg, "Pile demandée (SB_TRACE_FROM) : {st}");
+    }
+
     // Derniers appels d'API HLE (traceur `SB_TRACE_API`).
     let calls = crate::trampoline::recent_api_calls(420);
     if calls.is_empty() {

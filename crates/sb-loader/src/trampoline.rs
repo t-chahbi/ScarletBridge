@@ -340,9 +340,74 @@ pub fn first_fatal_path() -> Option<&'static str> {
     FATAL_PATH.get().map(String::as_str)
 }
 
+/// Décalages (relatifs à l'image) de sites d'appel dont on veut la pile : `SB_TRACE_FROM=0x55e8c1a,...`.
+fn trace_from_offsets() -> &'static [usize] {
+    static OFFS: OnceLock<Vec<usize>> = OnceLock::new();
+    OFFS.get_or_init(|| {
+        std::env::var("SB_TRACE_FROM")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|t| {
+                        usize::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+static REQUESTED_STACKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Piles demandées par `SB_TRACE_FROM` (au plus 6, première occurrence de chaque site).
+pub fn requested_stacks() -> Vec<String> {
+    REQUESTED_STACKS.lock().clone()
+}
+
+fn capture_requested_stack(stub_id: u64, ret: u64, caller_rsp: usize) {
+    let offs = trace_from_offsets();
+    if offs.is_empty() {
+        return;
+    }
+    let Some(loc) = crate::module_manager().describe_address(ret as usize) else {
+        return;
+    };
+    let Some(off) = loc
+        .rsplit_once("+0x")
+        .and_then(|(_, h)| usize::from_str_radix(h, 16).ok())
+    else {
+        return;
+    };
+    if !offs.contains(&off) {
+        return;
+    }
+    let mut stacks = REQUESTED_STACKS.lock();
+    if stacks.len() >= 6 || stacks.iter().any(|s| s.starts_with(&format!("{loc} "))) {
+        return;
+    }
+    let sym = trace_names()
+        .try_read()
+        .and_then(|n| n.get(stub_id as usize).map(|(d, s)| format!("{d}!{s}")))
+        .unwrap_or_default();
+    let ctx = crate::unwind::Context {
+        rip: ret,
+        rsp: caller_rsp as u64,
+        ..crate::unwind::Context::default()
+    };
+    // SAFETY: pile du thread courant ; le parcours s'arrête hors des images PE.
+    let frames = unsafe { crate::unwind::guest_backtrace(ctx, 24) };
+    let mut text = format!("{loc} appelle {sym} :\n");
+    for (i, pc) in frames.iter().enumerate() {
+        let l = crate::module_manager()
+            .describe_address(*pc)
+            .unwrap_or_else(|| "?".to_string());
+        text.push_str(&format!("  #{i:<2} {pc:#018x}  {l}\n"));
+    }
+    stacks.push(text);
+}
+
 fn capture_fatal_path(stub_id: u64, ret: u64, caller_rsp: usize) {
-    const FATAL: [&str; 8] = [
-        "SetUnhandledExceptionFilter",
+    capture_requested_stack(stub_id, ret, caller_rsp);
+    const FATAL: [&str; 7] = [
         "WerRegisterFile",
         "RaiseException",
         "RaiseFailFastException",
