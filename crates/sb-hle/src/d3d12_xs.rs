@@ -2972,38 +2972,6 @@ extern "win64" fn device_create_descriptor_heap(
     S_OK
 }
 
-/// Slot 127 du périphérique **console** (signature déduite des appels, non documentée) :
-/// `(this, in_out, 8, out2)`. Appelé juste après `GetResourceAllocationInfo` ; le titre lit ensuite
-/// deux mots de `in_out` (octets 16 et 24) comme les bornes d'une plage dont il vérifie la taille
-/// (≤ 2 Mio) par assertion. Sans ressource sous-jacente à placer, la plage rendue est vide.
-extern "win64" fn device_slot127(
-    _this: *mut D3D12DeviceObject,
-    in_out: *mut u64,
-    _a3: usize,
-    _out2: *mut c_void,
-) -> HResult {
-    if !in_out.is_null() {
-        let before = sb_loader::trampoline::peek_memory(in_out as usize, 48);
-        static BEFORE: AtomicU32 = AtomicU32::new(0);
-        if BEFORE.fetch_add(1, Ordering::Relaxed) < 2 {
-            sb_info!(CHANNEL, "slot 127 : in_out avant = {before:02x?}");
-        }
-        // SAFETY: `in_out` désigne une structure de ≥ 32 octets du titre (lue à ces offsets).
-        unsafe {
-            in_out.add(2).write_unaligned(0);
-            in_out.add(3).write_unaligned(0);
-        }
-    }
-    static LOGGED: AtomicU32 = AtomicU32::new(0);
-    if LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
-        sb_info!(
-            CHANNEL,
-            "slot 127 : plage de placement vide écrite aux octets 16..32 (signature déduite) -> S_OK"
-        );
-    }
-    S_OK
-}
-
 /// Copie `count` descripteurs de 32 octets (mémoire des tas + table des liaisons).
 fn copy_descriptor_run(dev: &D3D12DeviceObject, dst: usize, src: usize, count: usize) {
     if dst == 0 || src == 0 || dst == src {
@@ -3762,7 +3730,6 @@ const fn build_device_vtbl() -> D3D12DeviceVtbl {
     slots[46] = vslot(device_set_residency_priority as *const c_void);
     slots[48] = vslot(device_slot48 as *const c_void);
     slots[73] = vslot(device_slot73 as *const c_void);
-    slots[127] = vslot(device_slot127 as *const c_void);
     slots[50] = vslot(device_enqueue_make_resident as *const c_void);
     D3D12DeviceVtbl { slots }
 }
