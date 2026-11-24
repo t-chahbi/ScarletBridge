@@ -4809,7 +4809,10 @@ extern "win64" fn dxgi_device_get_adapter(
 }
 
 /// `IDXGIDevice::SetGPUThreadPriority`.
-extern "win64" fn dxgi_device_set_gpu_thread_priority(_this: *mut DxgiDeviceObject, _p: i32) -> HResult {
+extern "win64" fn dxgi_device_set_gpu_thread_priority(
+    _this: *mut DxgiDeviceObject,
+    _p: i32,
+) -> HResult {
     S_OK
 }
 
@@ -4819,7 +4822,10 @@ extern "win64" fn dxgi_device_get_gpu_thread_priority(_this: *mut DxgiDeviceObje
 }
 
 /// `IDXGIDevice1::SetMaximumFrameLatency`.
-extern "win64" fn dxgi_device_set_max_frame_latency(_this: *mut DxgiDeviceObject, _l: u32) -> HResult {
+extern "win64" fn dxgi_device_set_max_frame_latency(
+    _this: *mut DxgiDeviceObject,
+    _l: u32,
+) -> HResult {
     S_OK
 }
 
@@ -4878,13 +4884,7 @@ extern "win64" fn dxgi_adapter_qi(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> HResult {
-    com_query_interface_list(
-        "IDXGIAdapter",
-        this,
-        riid,
-        ppv,
-        &[IID_IDXGIADAPTER],
-    )
+    com_query_interface_list("IDXGIAdapter", this, riid, ppv, &[IID_IDXGIADAPTER])
 }
 
 /// `IDXGIAdapter::EnumOutputs(Output, ppOutput)` : renvoie une sortie factice (un seul moniteur).
@@ -4913,20 +4913,11 @@ extern "win64" fn dxgi_output_qi(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> HResult {
-    com_query_interface_list(
-        "IDXGIOutput",
-        this,
-        riid,
-        ppv,
-        &[IID_IDXGIOUTPUT],
-    )
+    com_query_interface_list("IDXGIOutput", this, riid, ppv, &[IID_IDXGIOUTPUT])
 }
 
 /// `IDXGIOutput::GetDesc` (slot 7) : description minimale de la sortie.
-extern "win64" fn dxgi_output_get_desc(
-    _this: *mut DxgiOutputObject,
-    desc: *mut c_void,
-) -> HResult {
+extern "win64" fn dxgi_output_get_desc(_this: *mut DxgiOutputObject, desc: *mut c_void) -> HResult {
     if desc.is_null() {
         return E_POINTER;
     }
