@@ -2983,6 +2983,11 @@ extern "win64" fn device_slot127(
     _out2: *mut c_void,
 ) -> HResult {
     if !in_out.is_null() {
+        let before = sb_loader::trampoline::peek_memory(in_out as usize, 48);
+        static BEFORE: AtomicU32 = AtomicU32::new(0);
+        if BEFORE.fetch_add(1, Ordering::Relaxed) < 2 {
+            sb_info!(CHANNEL, "slot 127 : in_out avant = {before:02x?}");
+        }
         // SAFETY: `in_out` désigne une structure de ≥ 32 octets du titre (lue à ces offsets).
         unsafe {
             in_out.add(2).write_unaligned(0);
@@ -3118,6 +3123,20 @@ extern "win64" fn device_get_resource_allocation_info(
     if !out.is_null() {
         // SAFETY: `out` est la destination fournie par l'appelant (16 octets).
         unsafe { *out = [total, 65536] };
+    }
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+        let first = if descs.is_null() || num_descs == 0 {
+            None
+        } else {
+            // SAFETY: `descs` non nul, au moins un descripteur.
+            Some(unsafe { *descs })
+        };
+        sb_info!(
+            CHANNEL,
+            "GetResourceAllocationInfo : {num_descs} desc(s), premier = {:?} -> taille {total:#x}, alignement 0x10000",
+            first.map(|d| (d.dimension, d.width, d.height, d.format, d.layout))
+        );
     }
     out
 }
