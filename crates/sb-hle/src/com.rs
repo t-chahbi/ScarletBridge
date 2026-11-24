@@ -475,7 +475,7 @@ pub(crate) fn known_iid_name(g: &Guid) -> Option<&'static str> {
 /// lisible, affiche l'IID (nommé s'il est connu) ou les premiers octets ; sinon la valeur seule.
 /// La lecture ne fait jamais de faute.
 pub(crate) fn describe_guest_arg(value: usize) -> String {
-    let bytes = sb_loader::trampoline::peek_memory(value, 32);
+    let bytes = sb_loader::trampoline::peek_memory(value, 64);
     if bytes.len() < 16 {
         return format!("{value:#x}");
     }

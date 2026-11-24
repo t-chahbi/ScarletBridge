@@ -557,14 +557,20 @@ extern "win64" fn noop_ok() -> HResult {
 /// Longueur uniforme des vtables D3D12 / DXGI (slots 0..`VT_PAD_LEN`).
 const VT_PAD_LEN: usize = 192;
 
-/// Nom de l'objet D3D12 dont `this` est une instance, d'après son pointeur de vtable.
-fn d3d_object_name(this: *mut c_void) -> &'static str {
-    if this.is_null() {
-        return "objet NULL";
+/// Nom de l'objet D3D12/DXGI dont `this` est une instance d'après son pointeur de vtable, ou
+/// `None` si `this` n'est pas un objet du bridge. Lecture sûre : `this` peut être n'importe quelle
+/// valeur envoyée par le titre.
+fn d3d_known_object_name(this: usize) -> Option<&'static str> {
+    if this == 0 {
+        return None;
     }
-    // SAFETY: lecture du premier mot (pointeur de vtable) d'un objet COM du bridge ; `this` vient
-    // du titre et peut être invalide, mais la lecture ne sert qu'à comparer des adresses.
-    let vtbl = unsafe { ptr::read_unaligned(this.cast::<usize>()) };
+    let head = sb_loader::trampoline::peek_memory(this, 8);
+    if head.len() < 8 {
+        return None;
+    }
+    let vtbl = usize::from_le_bytes([
+        head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
+    ]);
     let known: [(usize, &'static str); 12] = [
         (
             (&raw const D3D12_ROOTSIG_VTBL) as usize,
@@ -594,7 +600,35 @@ fn d3d_object_name(this: *mut c_void) -> &'static str {
     known
         .iter()
         .find(|(addr, _)| *addr == vtbl)
-        .map_or("objet D3D12/DXGI", |(_, name)| name)
+        .map(|(_, n)| *n)
+}
+
+/// Nom de l'objet D3D12 dont `this` est une instance (diagnostic d'un slot non implémenté).
+fn d3d_object_name(this: *mut c_void) -> &'static str {
+    if this.is_null() {
+        return "objet NULL";
+    }
+    d3d_known_object_name(this as usize).unwrap_or("objet D3D12/DXGI")
+}
+
+/// Décrit un argument reçu d'un titre pour un journal : octets pointés, IID nommé, et — quand la
+/// valeur ou l'un des huit premiers mots pointés désigne un objet du bridge — son type. Cela
+/// permet de reconnaître qu'un argument est une file, un tas, un tableau d'objets, etc.
+fn describe_d3d_arg(v: usize) -> String {
+    let mut s = crate::com::describe_guest_arg(v);
+    if let Some(n) = d3d_known_object_name(v) {
+        s.push_str(&format!(" [objet du bridge : {n}]"));
+    }
+    let bytes = sb_loader::trampoline::peek_memory(v, 64);
+    for (i, chunk) in bytes.as_chunks::<8>().0.iter().enumerate() {
+        let q = u64::from_le_bytes(*chunk) as usize;
+        if q > 0xFFFF
+            && let Some(n) = d3d_known_object_name(q)
+        {
+            s.push_str(&format!(" [mot {i} = {q:#x} : objet du bridge {n}]"));
+        }
+    }
+    s
 }
 
 /// Slot `N` non implémenté : journalise (une fois par objet et par slot) puis `E_NOTIMPL`.
@@ -615,9 +649,9 @@ extern "win64" fn d3d_unimpl_slot<const N: usize>(
         sb_warn!(
             CHANNEL,
             "{name}::slot {N} non implémenté appelé (this={this:p}, a2={}, a3={}, a4={}) -> E_NOTIMPL",
-            crate::com::describe_guest_arg(a2),
-            crate::com::describe_guest_arg(a3),
-            crate::com::describe_guest_arg(a4)
+            describe_d3d_arg(a2),
+            describe_d3d_arg(a3),
+            describe_d3d_arg(a4)
         );
     }
     E_NOTIMPL
@@ -3197,6 +3231,72 @@ extern "win64" fn device_open_existing_heap_from_address(
     })
 }
 
+/// Slot 48 du périphérique **console** : constructeur dont l'objet est choisi par l'IID demandé.
+///
+/// Mesuré sur un appel réel : `(this, desc*, REFIID, void**)` avec `riid = ID3D12CommandQueue` et un
+/// descripteur de 32 octets dont les 16 premiers sont une `D3D12_COMMAND_QUEUE_DESC` (type, priorité,
+/// drapeaux, masque de nœud) suivie de champs propres à la console. Ce slot n'est donc pas
+/// `ID3D12Device3::OpenExistingHeapFromAddress` (même position dans la table PC) : sur la console
+/// c'est une variante de `CreateCommandQueue`. On aiguille d'après l'IID :
+/// - `ID3D12CommandQueue` → création de file (préfixe de descripteur standard, extension ignorée) ;
+/// - sinon → `OpenExistingHeapFromAddress` (lecture PC du slot).
+extern "win64" fn device_slot48(
+    this: *mut D3D12DeviceObject,
+    arg: *const c_void,
+    riid: *const Guid,
+    out: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ID3D12Device::slot48", E_UNEXPECTED, {
+        let wants_queue = !riid.is_null()
+            // SAFETY: `riid` non-nul ; GUID lu sans exigence d'alignement.
+            && unsafe { ptr::read_unaligned(riid) } == IID_ID3D12COMMANDQUEUE;
+        if !wants_queue {
+            return device_open_existing_heap_from_address(this, arg, riid, out);
+        }
+        if arg.is_null() || out.is_null() {
+            return E_POINTER;
+        }
+        // SAFETY: `out` non-nul ; sortie remise à NULL en cas d'échec.
+        unsafe { *out = ptr::null_mut() };
+        // Préfixe standard du descripteur (16 octets) ; le reste est une extension de la console.
+        let raw = sb_loader::trampoline::peek_memory(arg as usize, 16);
+        if raw.len() < 16 {
+            sb_warn!(
+                CHANNEL,
+                "slot 48 (file de commandes) : descripteur illisible -> E_INVALIDARG"
+            );
+            return E_INVALIDARG;
+        }
+        let word = |i: usize| u32::from_le_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]);
+        let desc = D3D12CommandQueueDesc {
+            queue_type: word(0),
+            priority: word(4) as i32,
+            flags: word(8),
+            node_mask: word(12),
+        };
+        if desc.queue_type > 3 {
+            sb_warn!(
+                CHANNEL,
+                "slot 48 (file de commandes) : type {} invalide -> E_INVALIDARG",
+                desc.queue_type
+            );
+            return E_INVALIDARG;
+        }
+        let hr = device_create_command_queue(this, &desc, riid, out);
+        if hr == S_OK {
+            sb_info!(
+                CHANNEL,
+                "slot 48 : CreateCommandQueue de la console (type={}, priorité={}, drapeaux={:#x}, masque={:#x}, extension ignorée) -> S_OK",
+                desc.queue_type,
+                desc.priority,
+                desc.flags,
+                desc.node_mask
+            );
+        }
+        hr
+    })
+}
+
 /// `ID3D12Device1::SetResidencyPriority` (slot 46) : avec une mémoire unifiée, tout est résident ;
 /// la priorité est un simple indice. Réussit sans effet.
 extern "win64" fn device_set_residency_priority() -> HResult {
@@ -3259,7 +3359,7 @@ const fn build_device_vtbl() -> D3D12DeviceVtbl {
     slots[38] = vslot(device_get_copyable_footprints as *const c_void);
     // `ID3D12Device1` à `ID3D12Device3` (slots 44..50) : seuls ceux de sémantique non ambiguë.
     slots[46] = vslot(device_set_residency_priority as *const c_void);
-    slots[48] = vslot(device_open_existing_heap_from_address as *const c_void);
+    slots[48] = vslot(device_slot48 as *const c_void);
     slots[50] = vslot(device_enqueue_make_resident as *const c_void);
     D3D12DeviceVtbl { slots }
 }
@@ -3831,6 +3931,92 @@ mod xbox_ext_tests {
         assert_eq!(
             device_open_existing_heap_from_address(dev, mem, &IID_ID3D12HEAP, &mut gone),
             E_INVALIDARG
+        );
+    }
+
+    /// Slot 48 de la console : file de commandes créée d'après l'IID, avec une description étendue.
+    #[test]
+    fn slot48_creates_a_command_queue_from_an_extended_console_descriptor() {
+        let mut dev: *mut c_void = ptr::null_mut();
+        let hr = D3D12CreateDevice(ptr::null_mut(), 0xC100, &IID_ID3D12DEVICE, &mut dev);
+        if hr != S_OK {
+            return; // pas de GPU Vulkan dans cet environnement
+        }
+        // Octets mesurés sur la console : type=2 (calcul), priorité=0, drapeaux=1, masque=0, puis
+        // une extension (ici un champ valant 0x140000000).
+        let mut desc = [0u8; 32];
+        desc[0] = 2;
+        desc[8] = 1;
+        desc[24..32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
+        let mut queue: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_slot48(
+                dev.cast(),
+                desc.as_ptr().cast(),
+                &IID_ID3D12COMMANDQUEUE,
+                &mut queue
+            ),
+            S_OK
+        );
+        assert!(!queue.is_null());
+        // Type de file invalide, descripteur NULL, sortie NULL.
+        let mut bad = desc;
+        bad[0] = 9;
+        let mut q2: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_slot48(
+                dev.cast(),
+                bad.as_ptr().cast(),
+                &IID_ID3D12COMMANDQUEUE,
+                &mut q2
+            ),
+            E_INVALIDARG
+        );
+        assert!(q2.is_null());
+        assert_eq!(
+            device_slot48(dev.cast(), ptr::null(), &IID_ID3D12COMMANDQUEUE, &mut q2),
+            E_POINTER
+        );
+        // Un IID de tas retombe sur OpenExistingHeapFromAddress (adresse non alignée → refusé).
+        assert_eq!(
+            device_slot48(dev.cast(), desc.as_ptr().cast(), &IID_ID3D12HEAP, &mut q2),
+            E_INVALIDARG
+        );
+    }
+
+    /// Un argument qui pointe vers un objet du bridge (ou un tableau d'objets) est reconnu.
+    #[test]
+    fn unimplemented_slot_arguments_recognise_bridge_objects() {
+        let queue = D3D12QueueObject {
+            header: ComHeader::new((&raw const D3D12_QUEUE_VTBL).cast()),
+            shared: Arc::new(SharedD3D12State {
+                renderer: parking_lot::Mutex::new(
+                    match VulkanRenderer::new(
+                        match GpuContext::new(false) {
+                            Ok(g) => g,
+                            Err(_) => return, // pas de GPU Vulkan ici
+                        },
+                        64,
+                        64,
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    },
+                ),
+                sdl_window: parking_lot::Mutex::new(None),
+                descriptors: parking_lot::Mutex::new(HashMap::new()),
+            }),
+        };
+        let qptr = (&raw const queue) as usize;
+        assert_eq!(d3d_known_object_name(qptr), Some("ID3D12CommandQueue"));
+        assert_eq!(d3d_known_object_name(0x10), None);
+        assert!(describe_d3d_arg(qptr).contains("objet du bridge : ID3D12CommandQueue"));
+        // Tableau dont le premier mot est un pointeur vers une file.
+        let array = [qptr as u64, 1, 0, 0];
+        let text = describe_d3d_arg(array.as_ptr() as usize);
+        assert!(
+            text.contains("mot 0") && text.contains("ID3D12CommandQueue"),
+            "{text}"
         );
     }
 
