@@ -2907,6 +2907,7 @@ extern "win64" fn device_create_descriptor_heap(
     };
     let count = u64::from(d.num_descriptors.max(1));
     let mut base = NEXT_DESC_HANDLE.fetch_add(count * 32, Ordering::Relaxed) as usize;
+    let mut provided = false;
     // Variante console : le descripteur est suivi (à partir de l'octet 16) d'une adresse de mémoire
     // fournie par le titre, et celui-ci vérifie que le handle CPU de début du tas la reprend
     // exactement (assertion `int3` sinon). On adopte donc la première adresse située dans une réservation XMem.
@@ -2934,6 +2935,26 @@ extern "win64" fn device_create_descriptor_heap(
         }
         if given != 0 {
             base = given;
+            provided = true;
+        }
+    }
+    // Sur la console, les handles CPU de descripteurs sont de vraies adresses que le titre écrit
+    // directement : sans mémoire fournie, le tas reçoit sa propre zone (`count` × 32 octets).
+    if !provided {
+        let len = (count as usize * 32).next_multiple_of(4096);
+        // SAFETY: mapping anonyme privé ; zone libérée avec le processus (les tas vivent longtemps).
+        let p = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if p != libc::MAP_FAILED {
+            base = p as usize;
         }
     }
     let heap = Box::new(D3D12DescHeapObject {
