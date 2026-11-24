@@ -2972,6 +2972,129 @@ extern "win64" fn device_create_descriptor_heap(
     S_OK
 }
 
+/// Copie `count` descripteurs de 32 octets (mémoire des tas + table des liaisons).
+fn copy_descriptor_run(dev: &D3D12DeviceObject, dst: usize, src: usize, count: usize) {
+    if dst == 0 || src == 0 || dst == src {
+        return;
+    }
+    let mut table = dev.shared.descriptors.lock();
+    for i in 0..count {
+        let (d, s) = (dst + i * 32, src + i * 32);
+        if let Some(b) = table.get(&s).copied() {
+            table.insert(d, b);
+        } else {
+            table.remove(&d);
+        }
+    }
+    drop(table);
+    // Les handles sont de vraies adresses sur la console : le titre peut lire/écrire les octets.
+    if crate::gdk_xs::is_xmem_address(src) || !sb_loader::trampoline::peek_memory(src, 1).is_empty()
+    {
+        // SAFETY: les deux plages sont des zones de tas de descripteurs de `count × 32` octets.
+        unsafe { core::ptr::copy(src as *const u8, dst as *mut u8, count * 32) };
+    }
+}
+
+/// `ID3D12Device::CopyDescriptorsSimple(num, destStart, srcStart, type)` (slot 24).
+extern "win64" fn device_copy_descriptors_simple(
+    this: *mut D3D12DeviceObject,
+    num: u32,
+    dest_start: usize,
+    src_start: usize,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` vérifié non-nul.
+    copy_descriptor_run(unsafe { &*this }, dest_start, src_start, num as usize);
+}
+
+/// `ID3D12Device::CopyDescriptors(numDest, destStarts, destSizes, numSrc, srcStarts, srcSizes, type)`
+/// (slot 23) : les plages sont aplaties puis copiées descripteur par descripteur.
+extern "win64" fn device_copy_descriptors(
+    this: *mut D3D12DeviceObject,
+    num_dest: u32,
+    dest_starts: *const usize,
+    dest_sizes: *const u32,
+    num_src: u32,
+    src_starts: *const usize,
+    src_sizes: *const u32,
+) {
+    if this.is_null() || dest_starts.is_null() || src_starts.is_null() {
+        return;
+    }
+    let ranges = |n: u32, starts: *const usize, sizes: *const u32| -> Vec<usize> {
+        let mut v = Vec::new();
+        for i in 0..n as usize {
+            // SAFETY: l'appelant fournit `n` débuts (et `n` tailles si `sizes` est non nul).
+            let (start, size) = unsafe {
+                (
+                    *starts.add(i),
+                    if sizes.is_null() { 1 } else { *sizes.add(i) },
+                )
+            };
+            for k in 0..size as usize {
+                v.push(start + k * 32);
+            }
+        }
+        v
+    };
+    let dst = ranges(num_dest, dest_starts, dest_sizes);
+    let src = ranges(num_src, src_starts, src_sizes);
+    // SAFETY: `this` vérifié non-nul.
+    let dev = unsafe { &*this };
+    for (d, s) in dst.iter().zip(src.iter()) {
+        copy_descriptor_run(dev, *d, *s, 1);
+    }
+}
+
+/// Taille d'allocation (octets, alignée sur 64 KiB) d'une ressource décrite par `d`.
+fn resource_allocation_size(d: &D3D12ResourceDesc) -> u64 {
+    const ALIGN: u64 = 65536;
+    let raw = if d.dimension == 1 {
+        d.width
+    } else {
+        let (row, rows) =
+            texture_row_layout(d.width.min(u64::from(u32::MAX)) as u32, d.height, d.format);
+        let pitch = (row as u64).next_multiple_of(256);
+        let depth = u64::from(d.depth_or_array_size.max(1));
+        let base = pitch * rows as u64 * depth;
+        // Chaîne de mips : ~4/3 de la base.
+        if d.mip_levels > 1 {
+            base + base / 3
+        } else {
+            base
+        }
+    };
+    raw.max(1).next_multiple_of(ALIGN)
+}
+
+/// `ID3D12Device::GetResourceAllocationInfo(visibleMask, numDescs, descs)` (slot 25).
+///
+/// La structure rendue (16 octets) passe par un pointeur de retour caché : `rcx` = destination,
+/// `rdx` = `this`. Taille = somme des tailles alignées sur 64 KiB, alignement 64 KiB.
+extern "win64" fn device_get_resource_allocation_info(
+    out: *mut [u64; 2],
+    _this: *mut D3D12DeviceObject,
+    _visible_mask: u32,
+    num_descs: u32,
+    descs: *const D3D12ResourceDesc,
+) -> *mut [u64; 2] {
+    let mut total = 0u64;
+    if !descs.is_null() {
+        for i in 0..num_descs as usize {
+            // SAFETY: l'appelant fournit `num_descs` descripteurs consécutifs.
+            let d = unsafe { *descs.add(i) };
+            total += resource_allocation_size(&d);
+        }
+    }
+    if !out.is_null() {
+        // SAFETY: `out` est la destination fournie par l'appelant (16 octets).
+        unsafe { *out = [total, 65536] };
+    }
+    out
+}
+
 extern "win64" fn device_get_desc_increment(_this: *mut D3D12DeviceObject, _heap_type: u32) -> u32 {
     32
 }
@@ -3581,6 +3704,9 @@ const fn build_device_vtbl() -> D3D12DeviceVtbl {
     slots[20] = vslot(device_create_rtv as *const c_void);
     slots[21] = vslot(device_create_dsv as *const c_void);
     slots[22] = vslot(device_create_sampler as *const c_void);
+    slots[23] = vslot(device_copy_descriptors as *const c_void);
+    slots[24] = vslot(device_copy_descriptors_simple as *const c_void);
+    slots[25] = vslot(device_get_resource_allocation_info as *const c_void);
     slots[27] = vslot(device_create_committed_resource as *const c_void);
     slots[28] = vslot(device_create_heap as *const c_void);
     slots[29] = vslot(device_create_placed_resource as *const c_void);
@@ -4017,6 +4143,38 @@ pub(crate) extern "win64" fn D3D12ConfigureVirtualMemoryX(config: *const u32) ->
 #[cfg(test)]
 mod xbox_ext_tests {
     use super::*;
+
+    #[test]
+    fn allocation_info_sums_aligned_sizes_via_hidden_return_pointer() {
+        let descs = [
+            D3D12ResourceDesc {
+                dimension: 1,
+                width: 100,
+                height: 1,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                ..Default::default()
+            },
+            D3D12ResourceDesc {
+                dimension: 1,
+                width: 70000,
+                height: 1,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                ..Default::default()
+            },
+        ];
+        let mut out = [0u64; 2];
+        let r = device_get_resource_allocation_info(
+            &mut out,
+            core::ptr::null_mut(),
+            1,
+            2,
+            descs.as_ptr(),
+        );
+        assert_eq!(r, &mut out as *mut _);
+        assert_eq!(out, [65536 + 131072, 65536]);
+    }
 
     /// Variante console de `CreateDescriptorHeap` : une adresse XMem placée après le descripteur
     /// devient le handle CPU de début du tas (le titre vérifie cette égalité par assertion).
