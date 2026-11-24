@@ -969,6 +969,14 @@ pub const IID_IDSTORAGE_STATUS_ARRAY: Guid = Guid::new(
     0x453b,
     [0xa0, 0x2e, 0x31, 0x37, 0x9b, 0xd6, 0x46, 0x56],
 );
+/// IID de tableau de statut DirectStorage **console** demandé à `CreateStatusArray` par les titres
+/// Xbox (`cd66d752-2786-44f7-9070-e2a6fdad3f1b`). Vtable identique à `IDStorageStatusArray`.
+pub const IID_IDSTORAGE_STATUS_ARRAY_X: Guid = Guid::new(
+    0xcd66_d752,
+    0x2786,
+    0x44f7,
+    [0x90, 0x70, 0xe2, 0xa6, 0xfd, 0xad, 0x3f, 0x1b],
+);
 pub const IID_IDSTORAGE_QUEUE: Guid = Guid::new(
     0xcfdb_d83f,
     0x9e06,
@@ -986,6 +994,15 @@ pub const IID_IDSTORAGE_QUEUE2: Guid = Guid::new(
     0x3a49,
     0x44a2,
     [0xb4, 0x6f, 0x65, 0x36, 0x49, 0x47, 0x0d, 0x18],
+);
+/// IID de file d'attente DirectStorage **console** demandé par `CreateQueueX` (slot 10 de la
+/// fabrique console). Valeur relevée sur un appel réel (`3c02cb0c-c050-4195-99a1-a1ce94ba33c5`),
+/// non documentée publiquement : vtable identique à `IDStorageQueue` pour les slots publics.
+pub const IID_IDSTORAGE_QUEUE_X: Guid = Guid::new(
+    0x3c02_cb0c,
+    0xc050,
+    0x4195,
+    [0x99, 0xa1, 0xa1, 0xce, 0x94, 0xba, 0x33, 0xc5],
 );
 
 const fn hr(v: u32) -> HResult {
@@ -1482,15 +1499,24 @@ impl DsQueueShared {
         // Lecture de la source.
         let data: Vec<u8> = match req.source_type() {
             DSTORAGE_REQUEST_SOURCE_FILE => {
-                let Some(f) = ds_file_from_ptr(req.source[0] as usize) else {
+                // Source fichier console : `{Offset, Size, IDStorageFile*}` (ordre des champs
+                // inversé par rapport à `dstorage.h` PC `{Source, Offset, Size}`).
+                let Some(f) = ds_file_from_ptr(req.source[2] as usize) else {
+                    sb_warn!(
+                        DS_CHANNEL,
+                        "poignée de fichier inconnue : source[0]={:#x}, source[1]={:#x}, source[2]={:#x}",
+                        req.source[0],
+                        req.source[1],
+                        req.source[2]
+                    );
                     return E_DSTORAGE_INVALID_FILE_HANDLE;
                 };
                 let Some(file) = f.file.lock().clone() else {
                     return E_DSTORAGE_FILE_NOT_OPEN;
                 };
-                let size = req.source[2] as u32 as usize;
+                let size = req.source[1] as u32 as usize;
                 let mut buf = vec![0u8; size];
-                if let Err(e) = file.read_exact_at(&mut buf, req.source[1]) {
+                if let Err(e) = file.read_exact_at(&mut buf, req.source[0]) {
                     return if e.kind() == std::io::ErrorKind::UnexpectedEof {
                         E_DSTORAGE_END_OF_FILE
                     } else {
@@ -1923,6 +1949,55 @@ fn riid_matches(riid: *const Guid, wanted: &[Guid]) -> bool {
     ok
 }
 
+/// Valide un descripteur de file d'attente (`CreateQueue` / `CreateQueueX`).
+fn validate_queue_desc(d: &DStorageQueueDesc) -> HResult {
+    if !(DSTORAGE_MIN_QUEUE_CAPACITY..=DSTORAGE_MAX_QUEUE_CAPACITY).contains(&d.capacity) {
+        return E_DSTORAGE_INVALID_QUEUE_CAPACITY;
+    }
+    if !(-1..=2).contains(&d.priority) {
+        return E_DSTORAGE_INVALID_QUEUE_PRIORITY;
+    }
+    if d.source_type != DSTORAGE_REQUEST_SOURCE_FILE && d.source_type != DSTORAGE_REQUEST_SOURCE_MEMORY {
+        return E_DSTORAGE_INVALID_SOURCE_TYPE;
+    }
+    S_OK
+}
+
+/// Crée une file d'attente DirectStorage et l'écrit dans `out` (code commun à `CreateQueue` et
+/// `CreateQueueX`).
+fn spawn_dstorage_queue(out: *mut *mut c_void, d: DStorageQueueDesc) -> HResult {
+    let shared = Arc::new(DsQueueShared {
+        desc: d,
+        state: Mutex::new(DsQueueState::default()),
+        cv: Condvar::new(),
+        error: Mutex::new(DStorageErrorRecord::default()),
+        error_event: crate::sync::create_event_handle(true, false),
+        closed: AtomicBool::new(false),
+    });
+    let worker_shared = Arc::clone(&shared);
+    let worker = match std::thread::Builder::new()
+        .name("sb-dstorage".to_string())
+        .spawn(move || worker_shared.worker_loop())
+    {
+        Ok(h) => h,
+        Err(_) => return hr(0x8007_000E), // E_OUTOFMEMORY
+    };
+    let q = Box::new(DsQueueObject {
+        header: ComHeader::new((&raw const DS_QUEUE_VTBL).cast()),
+        shared,
+        worker: Mutex::new(Some(worker)),
+    });
+    write_out(out, Box::into_raw(q).cast());
+    sb_debug!(
+        DS_CHANNEL,
+        "CreateQueue(source={}, capacity={}, priority={}) -> S_OK",
+        d.source_type,
+        d.capacity,
+        d.priority
+    );
+    S_OK
+}
+
 extern "win64" fn ds_factory_create_queue(
     this: *mut DsFactoryObject,
     desc: *const DStorageQueueDesc,
@@ -1939,16 +2014,9 @@ extern "win64" fn ds_factory_create_queue(
         }
         // SAFETY: `desc` non-nul (32 octets).
         let d = unsafe { ptr::read_unaligned(desc) };
-        if !(DSTORAGE_MIN_QUEUE_CAPACITY..=DSTORAGE_MAX_QUEUE_CAPACITY).contains(&d.capacity) {
-            return E_DSTORAGE_INVALID_QUEUE_CAPACITY;
-        }
-        if !(-1..=2).contains(&d.priority) {
-            return E_DSTORAGE_INVALID_QUEUE_PRIORITY;
-        }
-        if d.source_type != DSTORAGE_REQUEST_SOURCE_FILE
-            && d.source_type != DSTORAGE_REQUEST_SOURCE_MEMORY
-        {
-            return E_DSTORAGE_INVALID_SOURCE_TYPE;
+        let valid = validate_queue_desc(&d);
+        if valid != S_OK {
+            return valid;
         }
         if !riid_matches(
             riid,
@@ -1956,40 +2024,41 @@ extern "win64" fn ds_factory_create_queue(
                 IID_IDSTORAGE_QUEUE,
                 IID_IDSTORAGE_QUEUE1,
                 IID_IDSTORAGE_QUEUE2,
+                IID_IDSTORAGE_QUEUE_X,
             ],
         ) {
             return E_NOINTERFACE;
         }
-        let shared = Arc::new(DsQueueShared {
-            desc: d,
-            state: Mutex::new(DsQueueState::default()),
-            cv: Condvar::new(),
-            error: Mutex::new(DStorageErrorRecord::default()),
-            error_event: crate::sync::create_event_handle(true, false),
-            closed: AtomicBool::new(false),
-        });
-        let worker_shared = Arc::clone(&shared);
-        let worker = match std::thread::Builder::new()
-            .name("sb-dstorage".to_string())
-            .spawn(move || worker_shared.worker_loop())
-        {
-            Ok(h) => h,
-            Err(_) => return hr(0x8007_000E), // E_OUTOFMEMORY
-        };
-        let q = Box::new(DsQueueObject {
-            header: ComHeader::new((&raw const DS_QUEUE_VTBL).cast()),
-            shared,
-            worker: Mutex::new(Some(worker)),
-        });
-        write_out(out, Box::into_raw(q).cast());
-        sb_debug!(
-            DS_CHANNEL,
-            "CreateQueue(source={}, capacity={}, priority={}) -> S_OK",
-            d.source_type,
-            d.capacity,
-            d.priority
-        );
-        S_OK
+        spawn_dstorage_queue(out, d)
+    })
+}
+
+/// Slot 10 de la fabrique console : `CreateQueueX`, variante console de `CreateQueue`.
+///
+/// Signature déduite d'un appel réel : `(this, const DSTORAGE_QUEUE_DESC*, REFIID, void** ppv)`.
+/// Le `riid` (IID file d'attente console, non public) est accepté tel quel. Le résultat est la
+/// file d'attente écrite dans `*ppv` (déréférencée ensuite par le titre via son propre wrapper).
+extern "win64" fn ds_factory_create_queue_x(
+    this: *mut DsFactoryObject,
+    desc: *const DStorageQueueDesc,
+    _riid: *const Guid,
+    out: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(DS_CHANNEL, "IDStorageFactoryX::CreateQueueX", E_UNEXPECTED, {
+        write_out(out, ptr::null_mut());
+        if ds_factory(this).is_none() || desc.is_null() {
+            return E_INVALIDARG;
+        }
+        if out.is_null() {
+            return E_POINTER;
+        }
+        // SAFETY: `desc` non-nul (32 octets, layout console `DStorageQueueDesc`).
+        let d = unsafe { ptr::read_unaligned(desc) };
+        let valid = validate_queue_desc(&d);
+        if valid != S_OK {
+            return valid;
+        }
+        spawn_dstorage_queue(out, d)
     })
 }
 
@@ -2109,7 +2178,7 @@ extern "win64" fn ds_factory_create_status_array(
             if out.is_null() {
                 return E_POINTER;
             }
-            if !riid_matches(riid, &[IID_IDSTORAGE_STATUS_ARRAY]) {
+            if !riid_matches(riid, &[IID_IDSTORAGE_STATUS_ARRAY, IID_IDSTORAGE_STATUS_ARRAY_X]) {
                 return E_NOINTERFACE;
             }
             let obj = Box::new(DsStatusArrayObject {
@@ -2166,7 +2235,9 @@ struct DsFactoryXVtbl {
 }
 
 /// Méthode de la fabrique console au-delà de `IDStorageFactory` (slot `N`) : layout non public,
-/// donc on journalise le slot appelé et on échoue proprement plutôt que de lire hors vtable.
+/// donc on journalise le slot appelé et on réussit sans effet plutôt que d'échouer. Le titre
+/// vérifie le HRESULT de ces appels (ex. slot 10) et piège sur un échec (`int3`), alors qu'aucun
+/// état n'est réellement exigé pour lire des fichiers via le VFS.
 extern "win64" fn ds_x_unknown_slot<const KIND: u8, const N: usize>(
     this: *mut c_void,
     a2: usize,
@@ -2180,9 +2251,9 @@ extern "win64" fn ds_x_unknown_slot<const KIND: u8, const N: usize>(
     };
     sb_warn!(
         DS_CHANNEL,
-        "{object} slot {N} (non publique) appelée (this={this:p}, a2={a2:#x}, a3={a3:#x}, a4={a4:#x}) -> E_NOTIMPL"
+        "{object} slot {N} (non publique) appelée (this={this:p}, a2={a2:#x}, a3={a3:#x}, a4={a4:#x}) -> S_OK par tolérance"
     );
-    sb_common::abi::E_NOTIMPL
+    S_OK
 }
 
 /// Slot 8 de la fabrique console : premier slot au-delà de `IDStorageFactory`.
@@ -2249,6 +2320,7 @@ static DS_FACTORY_X_VTBL: DsFactoryXVtbl = {
         j += 1;
     }
     slots[8] = vslot(ds_x_configure as *const c_void);
+    slots[10] = vslot(ds_factory_create_queue_x as *const c_void);
     DsFactoryXVtbl { slots }
 };
 

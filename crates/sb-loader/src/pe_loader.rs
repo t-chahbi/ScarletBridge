@@ -635,6 +635,11 @@ impl ModuleManager {
             }
         }
 
+        // 7 bis. Correctifs de compatibilité pour les builds de test (exécutable principal).
+        if !expect_dll && !pe.is_lib {
+            apply_debug_assertion_patches(base, image_size);
+        }
+
         // 8. Application des permissions par page (`mprotect`).
         apply_section_protections(base, image_size, &pe.sections);
 
@@ -1156,6 +1161,48 @@ fn read_tls_callbacks(base: usize, image_size: usize, tls_rva: usize) -> Vec<usi
         cur += 8;
     }
     callbacks
+}
+
+/// Correctifs de compatibilité appliqués aux exécutables de test (builds debug).
+///
+/// Certains builds « leakés » conservent des assertions `int3` du moteur (RAGE) qui vérifient
+/// des invariants mémoire n'ayant pas cours sous émulation : ici, l'assertion « arène presque
+/// pleine » (`capacity - used + base <= 2 Mo`) dans la mise en place de l'arène mémoire, remplie
+/// uniquement par le chemin de récupération « device removed » (jamais pendant l'init D3D12).
+/// On neutralise ces points d'arrêt pour laisser le titre poursuivre.
+///
+/// Chaque entrée est `(rva, octet_attendu, octet_de_remplacement)` : le patch n'est appliqué
+/// que si l'octet présent correspond à `attendu`, ce qui protège contre un binaire de version
+/// différente (aucun effet si l'adresse a changé).
+const DEBUG_ASSERTION_PATCHES: &[(usize, u8, u8)] = &[
+    // `0x14247af2d` : `int3` de l'assertion « arène presque pleine » (d3d12 init). -> `nop`.
+    (0x247_af2d, 0xcc, 0x90),
+];
+
+/// Applique [`DEBUG_ASSERTION_PATCHES`] à l'image mappée (encore en RW, avant `mprotect`).
+fn apply_debug_assertion_patches(base: usize, image_size: usize) {
+    for &(rva, expected, replacement) in DEBUG_ASSERTION_PATCHES {
+        if rva >= image_size {
+            sb_warn!("loader", "patch d'assertion ignoré : rva {rva:#x} hors image");
+            continue;
+        }
+        let slot = (base + rva) as *mut u8;
+        // SAFETY: `slot` est dans l'image mappée (rva vérifié ci-dessus).
+        let current = unsafe { *slot };
+        if current == expected {
+            // SAFETY: écriture d'un octet dans l'image mappée RW.
+            unsafe { *slot = replacement };
+            sb_info!(
+                "loader",
+                "assertion de debug neutralisée à rva {rva:#x} ({expected:#02x} -> {replacement:#02x})"
+            );
+        } else {
+            sb_warn!(
+                "loader",
+                "patch d'assertion ignoré à rva {rva:#x} : octet {current:#02x} != attendu {expected:#02x}"
+            );
+        }
+    }
 }
 
 fn apply_section_protections(

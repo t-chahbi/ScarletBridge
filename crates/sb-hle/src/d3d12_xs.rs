@@ -325,6 +325,17 @@ pub struct D3D12RootSignatureDesc {
     pub _pad2: u32,
 }
 
+/// `D3D12_VERSIONED_ROOT_SIGNATURE_DESC` : `Version` (énum) puis l'union `Desc_1_0`/`Desc_1_1`.
+/// Les deux membres d'union partagent `NumParameters` (offset 8) et `pParameters` (offset 16) ;
+/// seul le type des paramètres diffère (v1.1 plus large), sans incidence sur les champs lus.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct D3D12VersionedRootSignatureDesc {
+    pub version: u32,
+    pub _pad0: u32,
+    pub desc: D3D12RootSignatureDesc,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct D3D12CommandQueueDesc {
@@ -504,6 +515,8 @@ const _: () = {
     assert!(size_of::<D3D12RootSignatureDesc>() == 40);
     assert!(offset_of!(D3D12RootSignatureDesc, parameters) == 8);
     assert!(offset_of!(D3D12RootSignatureDesc, flags) == 32);
+    assert!(offset_of!(D3D12VersionedRootSignatureDesc, version) == 0);
+    assert!(offset_of!(D3D12VersionedRootSignatureDesc, desc) == 8);
 };
 
 // ==================== Exports DLL (`d3d12_xs.dll` & `dxgi.dll`) ====================
@@ -3809,6 +3822,47 @@ extern "win64" fn device_slot127(
     S_OK
 }
 
+/// Slot 108 du périphérique **console** : variante de `GetResourceAllocationInfo` qui écrit le
+/// couple `{SizeInBytes, Alignment}` (16 octets) dans le pointeur de retour caché `rcx` (le
+/// périphérique est en `rdx`, convention console non-COM, comme le slot 25). L'alignement rendu
+/// est celui du descripteur (0x1000 pour un tampon) ; le titre vérifie `Alignment == desc.alignment`
+/// et `SizeInBytes < 4 Gio` (assertion `int3` sinon).
+extern "win64" fn device_slot108(
+    out: *mut [u64; 2],
+    _this: *mut D3D12DeviceObject,
+    _a3: u32,
+    _a4: u32,
+    desc: *const D3D12ResourceDesc,
+    _out2: *mut c_void,
+) -> HResult {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    let (size, alignment) = if desc.is_null() {
+        (0u64, 0x1000u64)
+    } else {
+        // SAFETY: `desc` est un `D3D12ResourceDesc` valide fourni par le titre.
+        let d = unsafe { *desc };
+        (resource_allocation_size(&d), d.alignment.max(0x1000))
+    };
+    // SAFETY: `out` vérifié non-nul (16 octets).
+    unsafe { *out = [size, alignment] };
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+        let dim = if desc.is_null() {
+            0
+        } else {
+            // SAFETY: `desc` non-nul.
+            unsafe { (*desc).dimension }
+        };
+        sb_info!(
+            CHANNEL,
+            "slot 108 : GetResourceAllocationInfo console (dim={dim}) -> taille {size:#x}, alignement {alignment:#x}"
+        );
+    }
+    S_OK
+}
+
 const fn build_device_vtbl() -> D3D12DeviceVtbl {
     let mut slots = UNIMPL_SLOTS;
     let mut pad = 0;
@@ -3850,6 +3904,7 @@ const fn build_device_vtbl() -> D3D12DeviceVtbl {
     slots[50] = vslot(device_enqueue_make_resident as *const c_void);
     slots[70] = vslot(device_slot70 as *const c_void);
     slots[127] = vslot(device_slot127 as *const c_void);
+    slots[108] = vslot(device_slot108 as *const c_void);
     D3D12DeviceVtbl { slots }
 }
 
@@ -3982,7 +4037,16 @@ pub(crate) extern "win64" fn D3D12SerializeVersionedRootSignature(
     out_blob: *mut *mut c_void,
     out_error_blob: *mut *mut c_void,
 ) -> HResult {
-    D3D12SerializeRootSignature(desc, 1, out_blob, out_error_blob)
+    // `desc` est un `D3D12_VERSIONED_ROOT_SIGNATURE_DESC` : l'union (équivalente à un
+    // `D3D12_ROOT_SIGNATURE_DESC`) commence à l'offset 8, après `Version`.
+    let (inner, version) = if desc.is_null() {
+        (core::ptr::null(), 1u32)
+    } else {
+        // SAFETY: `desc` pointe vers un `D3D12_VERSIONED_ROOT_SIGNATURE_DESC` valide.
+        let vdesc = unsafe { &*(desc.cast::<D3D12VersionedRootSignatureDesc>()) };
+        (core::ptr::from_ref(&vdesc.desc).cast::<c_void>(), vdesc.version)
+    };
+    D3D12SerializeRootSignature(inner, version, out_blob, out_error_blob)
 }
 
 // ==================== Extensions Xbox Scarlett (`d3d12_xs.dll`) ====================
