@@ -15,6 +15,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+goblin.workspace = true
+iced-x86.workspace = true
 libc.workspace = true
 sb-common.workspace = true
 sb-gpu.workspace = true
@@ -22,6 +24,8 @@ sb-hle.workspace = true
 sb-loader.workspace = true
 sb-stubgen = { path = "../sb-stubgen" }
 sb-vfs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

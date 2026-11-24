@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 mod doctor;
+mod requirements;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -25,6 +26,22 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum SubCmd {
+    /// Inventaire complet de ce qu'un binaire demande (imports, GDK, shaders, CPU, fichiers, bundle…).
+    #[command(alias = "needs")]
+    Requirements {
+        /// Chemin d'un `.exe` PE32+ ou d'un dossier de bundle.
+        target: PathBuf,
+        /// Répertoire de recherche des DLL invitées PE32+ complémentaires.
+        #[arg(long, default_value = "target/x86_64-pc-windows-gnu/debug")]
+        dll_dir: PathBuf,
+        /// Sortie JSON complète (listes non tronquées).
+        #[arg(long)]
+        json: bool,
+        /// Ne balaie pas le code à la recherche des instructions CPU utilisées (plus rapide).
+        #[arg(long)]
+        no_cpu: bool,
+    },
+
     /// Vérifie l'environnement (noyau, mémoire, CPU, Vulkan, SDL3, affichage, audio, droits).
     Doctor,
 
@@ -75,6 +92,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        SubCmd::Requirements {
+            target,
+            dll_dir,
+            json,
+            no_cpu,
+        } => requirements::run(
+            &target,
+            &requirements::Options {
+                json,
+                no_cpu,
+                dll_dir,
+            },
+        ),
         SubCmd::Doctor => {
             std::process::exit(doctor::run());
         }

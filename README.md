@@ -70,7 +70,12 @@ Because compatibility depends on which APIs a bundle imports, the tooling is bui
 # 0. Is this machine ready? (kernel limits, free load addresses, CPU level, Vulkan, SDL3, display, audio, permissions)
 ./target/release/scarletbridge doctor
 
-# 1. Which imports does this bundle use, and how many are implemented natively?
+# 1. Everything a binary or bundle asks for — static analysis, nothing is executed:
+#    load address, imports and delay-loads by support tier, GDK classes, embedded DXBC/DXIL shaders,
+#    CPU instructions actually used, cited files, required features and machine needs (--json for all)
+./target/release/scarletbridge requirements /path/to/bundle/app.exe
+
+# 1b. Only the import coverage, with the list of missing symbols
 ./target/release/scarletbridge inspect --missing /path/to/bundle/app.exe
 
 # 2. Run it, recording the last API calls (with decoded string arguments) for crash reports

@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Diagnostics**: `inspect --missing`, `SB_TRACE_API` call tracer with string previews, `SB_UNIMPLEMENTED=stop`, `SB_GUEST_DLLS`, and a crash report (guest/host symbolization, call stack from `.pdata`).
 
 - **Exceptions**: Windows x64 SEH dispatch (`RaiseException`, `RtlUnwindEx`, vectored handlers, `__C_specific_handler`), MSVC C++ exceptions (`_CxxThrowException`, `__CxxFrameHandler3/4`, `std::exception_ptr`) and hardware faults delivered as SEH exceptions; `SB_TRACE_SEH=1` traces the dispatch.
+- **`scarletbridge requirements <exe|bundle>`** (alias `needs`): complete static inventory of what a binary asks for — PE requirements, load address, imports and delay-loads by tier, referenced GDK classes and D3D12 interfaces, embedded DXBC/DXIL shaders with translator support, CPU instructions actually used (checked against the host), cited files present or missing in the bundle, required features with the bridge's status, machine needs and bundle contents; `--json` exports everything.
 - **`scarletbridge doctor`**: checks kernel limits, free load addresses, memory, CPU level, `arch_prctl`, Vulkan, SDL3, display, audio and write permissions, with a fix hint for each warning.
 - **Diagnostics**: unimplemented D3D12/GDK slots now describe their pointer arguments (memory preview, named interface IDs).
 

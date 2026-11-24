@@ -461,6 +461,11 @@ const KNOWN_IIDS: &[(Guid, &str)] = &[
     (IID_IUNKNOWN, "IUnknown"),
 ];
 
+/// Table publique des interfaces connues `(IID, nom)` (analyse statique d'un binaire).
+pub fn known_iid_table() -> &'static [(Guid, &'static str)] {
+    KNOWN_IIDS
+}
+
 /// Nom d'une interface connue (`ID3D12Heap`…), le cas échéant.
 pub(crate) fn known_iid_name(g: &Guid) -> Option<&'static str> {
     KNOWN_IIDS.iter().find(|(k, _)| k == g).map(|(_, n)| *n)
