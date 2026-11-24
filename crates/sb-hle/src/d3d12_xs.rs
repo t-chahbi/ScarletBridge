@@ -3177,16 +3177,23 @@ extern "win64" fn device_create_cbv(
     );
 }
 
+/// `true` si `p` désigne une `ID3D12Resource` créée par le bridge. Sur console, un titre peut
+/// passer le pointeur « unbound » `0xFFFF_FFFF` (descripteur NULL) : sans cette vérification,
+/// lire `fixed_addr`/`byte_len` à travers ce pointeur provoquerait un défaut d'accès hôte.
+fn is_d3d12_resource(p: usize) -> bool {
+    d3d_known_object_name(p) == Some("ID3D12Resource")
+}
+
 extern "win64" fn device_create_srv(
     this: *mut D3D12DeviceObject,
     resource: *mut D3D12ResourceObject,
     _desc: *const c_void,
     dest_descriptor: usize,
 ) {
-    if this.is_null() || resource.is_null() {
+    if this.is_null() || !is_d3d12_resource(resource as usize) {
         return;
     }
-    // SAFETY: `this` et `resource` vérifiés non-nuls.
+    // SAFETY: `this` et `resource` vérifiés (objet `ID3D12Resource` du bridge).
     let dev = unsafe { &*this };
     dev.shared.descriptors.lock().insert(
         dest_descriptor,
@@ -3203,10 +3210,10 @@ extern "win64" fn device_create_uav(
     _desc: *const c_void,
     dest_descriptor: usize,
 ) {
-    if this.is_null() || resource.is_null() {
+    if this.is_null() || !is_d3d12_resource(resource as usize) {
         return;
     }
-    // SAFETY: `this` et `resource` vérifiés non-nuls.
+    // SAFETY: `this` et `resource` vérifiés (objet `ID3D12Resource` du bridge).
     let dev = unsafe { &*this };
     let res = unsafe { &*resource };
     dev.shared.descriptors.lock().insert(
@@ -3692,6 +3699,77 @@ extern "win64" fn device_enqueue_make_resident(
     })
 }
 
+/// Slot 70 du périphérique **console** : création d'un tampon (variante console de
+/// `CreateCommittedResource` pour un buffer). Signature déduite :
+/// `(this, D3D12_RESOURCE_DESC*, void* state, void* out)`.
+extern "win64" fn device_slot70(
+    _this: *mut D3D12DeviceObject,
+    desc: *const D3D12ResourceDesc,
+    _state: *const c_void,
+    _out: *mut c_void,
+) -> HResult {
+    if desc.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: `desc` est un `D3D12ResourceDesc` valide fourni par le titre.
+    let d = unsafe { *desc };
+    let res = alloc_d3d12_resource(d, false);
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+        sb_info!(
+            CHANNEL,
+            "slot 70 : tampon console créé (dim={}, w={}) -> {res:p}",
+            d.dimension,
+            d.width
+        );
+    }
+    S_OK
+}
+
+/// Slot 127 du périphérique **console** : création d'une ressource dans la mémoire fournie par le
+/// titre (variante console de `CreateCommittedResource` / `CreatePlacedResource`).
+///
+/// Signature mesurée sur un appel réel (11 arguments) :
+/// `(this, pReservationDesc*, UINT flags, D3D12_RESOURCE_DESC*, UINT state, void* clearValue,
+///   void*, void*, void*, REFIID, void** ppvResource)`.
+/// Le 4ᵉ argument est un `D3D12_RESOURCE_DESC` standard (vérifié : 3840×2160 RGBA8, layout 5).
+/// Le titre fournit la mémoire via `XMem` ; le bridge alloue son propre tampon unifié équivalent.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn device_slot127(
+    _this: *mut D3D12DeviceObject,
+    _p_reservation: *const c_void,
+    _flags: u32,
+    desc: *const D3D12ResourceDesc,
+    _state: u32,
+    _clear_value: *mut c_void,
+    _extra1: *mut c_void,
+    _extra2: *mut c_void,
+    _extra3: *mut c_void,
+    _riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    if desc.is_null() || ppv.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: `desc` est un `D3D12ResourceDesc` valide fourni par le titre.
+    let d = unsafe { *desc };
+    let res = alloc_d3d12_resource(d, false);
+    // SAFETY: `ppv` vérifié non-nul ; `res` est un objet `ID3D12Resource` du bridge.
+    unsafe { *ppv = res.cast() };
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+        sb_info!(
+            CHANNEL,
+            "slot 127 : ressource console créée (dim={}, w={}, h={}, fmt={}) -> {res:p}",
+            d.dimension,
+            d.width,
+            d.height,
+            d.format
+        );
+    }
+    S_OK
+}
+
 const fn build_device_vtbl() -> D3D12DeviceVtbl {
     let mut slots = UNIMPL_SLOTS;
     let mut pad = 0;
@@ -3731,6 +3809,8 @@ const fn build_device_vtbl() -> D3D12DeviceVtbl {
     slots[48] = vslot(device_slot48 as *const c_void);
     slots[73] = vslot(device_slot73 as *const c_void);
     slots[50] = vslot(device_enqueue_make_resident as *const c_void);
+    slots[70] = vslot(device_slot70 as *const c_void);
+    slots[127] = vslot(device_slot127 as *const c_void);
     D3D12DeviceVtbl { slots }
 }
 
