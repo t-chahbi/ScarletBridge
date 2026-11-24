@@ -243,6 +243,8 @@ const PREVIEW_BYTES: usize = 40;
 struct TraceSlot {
     seq: AtomicU64,
     id: AtomicU64,
+    /// Adresse de retour de l'appelant (code invité qui a émis l'appel).
+    ret: AtomicU64,
     args: [AtomicU64; 4],
     /// Par argument : mot 0 = `genre | longueur << 8` (0 = aucun, 1 = ASCII, 2 = UTF-16), mots
     /// 1..6 = octets de texte (UTF-8 déjà décodé, `PREVIEW_BYTES` au plus).
@@ -339,6 +341,10 @@ extern "win64" fn api_trace_dispatch(stub_id: u64, regs: *const u64) {
         let seq = TRACE_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
         let slot = &trace_slots()[(seq as usize) % TRACE_RING];
         slot.id.store(stub_id, Ordering::Relaxed);
+        // SAFETY: le thunk range `regs` à `rsp+0x20` d'un cadre de 0x88 octets : l'adresse de retour
+        // de l'appelant est à `rsp+0x88`, soit `regs + 0x68`.
+        let ret = unsafe { regs.byte_add(0x68).read() };
+        slot.ret.store(ret, Ordering::Relaxed);
         for (dst, v) in slot.args.iter().zip(a) {
             dst.store(*v, Ordering::Relaxed);
         }
@@ -502,7 +508,12 @@ pub fn recent_api_calls(max: usize) -> Vec<String> {
                 format!("{v:#x} {tag}\"{text}\"")
             })
             .collect();
-        out.push(format!("#{seq} {dll}!{sym}({})", args.join(", ")));
+        let ret = slot.ret.load(Ordering::Relaxed) as usize;
+        let from = crate::module_manager()
+            .describe_address(ret)
+            .map(|m| format!("  <- {m}"))
+            .unwrap_or_default();
+        out.push(format!("#{seq} {dll}!{sym}({}){from}", args.join(", ")));
     }
     out
 }
