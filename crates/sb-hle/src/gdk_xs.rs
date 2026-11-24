@@ -227,8 +227,30 @@ pub fn bink_exports() -> HashMap<&'static str, usize> {
 
 // ---------- xmem.dll (Mémoire unifiée zéro-copie Vulkan) ----------
 
+/// Adresse de l'export `__XMemAllocationHooks__` du titre (structure `{AllocHook, FreeHook,
+/// pContext}`). Sur console, `xmem.dll` lit cet export et délègue chaque `XMemAlloc` au dispatcher
+/// installé par le titre (qui remplit l'arène du gestionnaire mémoire du jeu).
+const XMEM_HOOKS_EXPORT: usize = 0x146844380;
+
 extern "win64" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     ffi_guard!(CHANNEL, "XMemAlloc", ptr::null_mut(), {
+        // SAFETY: image du titre mappée en-process à sa base préférée (delta 0) ; lecture d'un
+        // pointeur de 8 octets dans sa section export.
+        let alloc_hook = unsafe { ptr::read_unaligned(XMEM_HOOKS_EXPORT as *const usize) };
+        // Le hook doit être une adresse de code dans l'image du titre (base 0x140000000).
+        let in_image = (0x140000000..0x14c000000).contains(&alloc_hook);
+        if in_image {
+            // SAFETY: `alloc_hook` est le dispatcher d'alloc du titre (`extern "win64"`), renseigné
+            // par son propre code via `__XMemAllocationHooks__`.
+            let hook: extern "win64" fn(usize, u64) -> *mut c_void =
+                unsafe { core::mem::transmute(alloc_hook) };
+            let p = hook(size, attributes);
+            sb_trace!(
+                "xmem",
+                "XMemAlloc(size={size}, flags={attributes:#x}) -> hook {p:p}"
+            );
+            return p;
+        }
         let low = attributes as u32;
         let is_physical = (low & (1 << 31)) != 0;
         let zero = (low & (1 << 14)) != 0;
