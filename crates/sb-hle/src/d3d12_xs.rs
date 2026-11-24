@@ -558,7 +558,8 @@ extern "win64" fn noop_ok() -> HResult {
 const VT_PAD_LEN: usize = 192;
 
 /// Tables de méthodes tracées (`SB_TRACE_API`) : `(original → copie, copie → original)`.
-static TRACED_VTBLS: std::sync::LazyLock<Mutex<(HashMap<usize, usize>, HashMap<usize, usize>)>> =
+type VtblMaps = (HashMap<usize, usize>, HashMap<usize, usize>);
+static TRACED_VTBLS: std::sync::LazyLock<Mutex<VtblMaps>> =
     std::sync::LazyLock::new(|| Mutex::new((HashMap::new(), HashMap::new())));
 
 /// Construit une copie de `orig` (`VT_PAD_LEN` slots) dont chaque slot passe par un thunk de trace
@@ -2912,8 +2913,8 @@ extern "win64" fn device_create_descriptor_heap(
     if !desc.is_null() {
         let raw = sb_loader::trampoline::peek_memory(desc as usize, 64);
         let mut given = 0usize;
-        for chunk in raw.get(16..).unwrap_or(&[]).chunks_exact(8) {
-            let v = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])) as usize;
+        for chunk in raw.get(16..).unwrap_or(&[]).as_chunks::<8>().0 {
+            let v = u64::from_le_bytes(*chunk) as usize;
             if v >= 0x1_0000 && crate::gdk_xs::is_xmem_address(v) {
                 given = v;
                 break;
