@@ -12,6 +12,7 @@ pub mod d3d11;
 pub mod d3d12_xs;
 pub mod exceptions;
 pub mod file_io;
+pub mod gdeflate;
 #[macro_use]
 pub mod gdk_classes;
 pub mod gdk_xs;

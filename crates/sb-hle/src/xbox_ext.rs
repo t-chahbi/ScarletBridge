@@ -1036,6 +1036,31 @@ pub struct DStorageQueueInfo {
     pub _pad: u32,
 }
 
+/// `DSTORAGE_COMPRESSION_FORMAT_NONE`.
+pub const DSTORAGE_COMPRESSION_FORMAT_NONE: u8 = 0;
+/// `DSTORAGE_COMPRESSION_FORMAT_GDEFLATE`.
+pub const DSTORAGE_COMPRESSION_FORMAT_GDEFLATE: u8 = 1;
+/// `DSTORAGE_COMPRESSION_SUPPORT_CPU_FALLBACK` (décompression logicielle sur le CPU).
+pub const DSTORAGE_COMPRESSION_SUPPORT_CPU_FALLBACK: u32 = 0x4;
+
+/// Décompresse la charge utile GDeflate d'une requête vers un tampon de `uncompressed_size`
+/// octets (allocation fallible, bornée par la taille annoncée par la requête).
+fn gdeflate_request_payload(
+    compressed: &[u8],
+    uncompressed_size: usize,
+) -> Result<Vec<u8>, crate::gdeflate::GDeflateError> {
+    use crate::gdeflate::{GDeflateError, gdeflate_decompress, gdeflate_uncompressed_size};
+    if gdeflate_uncompressed_size(compressed) != Some(uncompressed_size) {
+        return Err(GDeflateError::BadHeader);
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(uncompressed_size)
+        .map_err(|_| GDeflateError::OutputTooSmall)?;
+    out.resize(uncompressed_size, 0);
+    gdeflate_decompress(compressed, &mut out)?;
+    Ok(out)
+}
+
 /// `DSTORAGE_REQUEST` (104 octets). Les unions source/destination sont conservées brutes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -1444,11 +1469,13 @@ impl DsQueueShared {
         if req.source_type() != self.desc.source_type {
             return E_DSTORAGE_INVALID_SOURCE_TYPE;
         }
-        if req.compression_format != 0 {
+        let format = req.compression_format;
+        if format != DSTORAGE_COMPRESSION_FORMAT_NONE
+            && format != DSTORAGE_COMPRESSION_FORMAT_GDEFLATE
+        {
             sb_warn!(
                 DS_CHANNEL,
-                "format de compression {} non pris en charge (GDeflate/custom absents)",
-                req.compression_format
+                "format de compression {format:#04x} non pris en charge (formats custom absents)"
             );
             return E_DSTORAGE_DECOMPRESSION_ERROR;
         }
@@ -1485,6 +1512,22 @@ impl DsQueueShared {
                     unsafe { std::slice::from_raw_parts(src, size) }.to_vec()
                 }
             }
+        };
+        let data = if format == DSTORAGE_COMPRESSION_FORMAT_GDEFLATE {
+            match gdeflate_request_payload(&data, req.uncompressed_size as usize) {
+                Ok(d) => d,
+                Err(e) => {
+                    sb_warn!(
+                        DS_CHANNEL,
+                        "décompression GDeflate en échec ({} octets -> {} attendus) : {e}",
+                        data.len(),
+                        req.uncompressed_size
+                    );
+                    return E_DSTORAGE_DECOMPRESSION_ERROR;
+                }
+            }
+        } else {
+            data
         };
         match req.destination_type() {
             DSTORAGE_DEST_MEMORY => {
@@ -1773,10 +1816,15 @@ extern "win64" fn ds_queue_enqueue_set_event(this: *mut DsQueueObject, handle: u
     })
 }
 
-/// `DSTORAGE_COMPRESSION_SUPPORT GetCompressionSupport(DSTORAGE_COMPRESSION_FORMAT)` : aucune
-/// décompression matérielle ni logicielle n'est disponible → `NONE` (0).
+/// `DSTORAGE_COMPRESSION_SUPPORT GetCompressionSupport(DSTORAGE_COMPRESSION_FORMAT)` : GDeflate est
+/// décompressé par le CPU (Rust pur) → `DSTORAGE_COMPRESSION_SUPPORT_CPU_FALLBACK` (0x4) ; aucun
+/// support matériel (GPU) ; `NONE` (0) pour les formats non compressés/custom (voir ci-dessus).
 extern "win64" fn ds_queue_get_compression_support(this: *mut DsQueueObject, format: u8) -> u32 {
-    0
+    if format == DSTORAGE_COMPRESSION_FORMAT_GDEFLATE {
+        DSTORAGE_COMPRESSION_SUPPORT_CPU_FALLBACK
+    } else {
+        0
+    }
 }
 
 static DS_QUEUE_VTBL: DsQueueVtbl = DsQueueVtbl {
@@ -2772,16 +2820,110 @@ mod tests {
         assert_eq!(ds_status_get_hresult(st, 0), E_ABORT);
         assert_eq!(dst2, vec![0u8; 64]);
 
-        // Compression GDeflate non supportée → échec propre.
-        assert_eq!(ds_queue_get_compression_support(q, 1), 0);
-        let gdeflate = DStorageRequest {
-            compression_format: 1,
-            ..req
+        // GDeflate : support CPU ; une charge utile qui n'est pas un flux GDeflate → échec propre.
+        assert_eq!(
+            ds_queue_get_compression_support(q, 1),
+            DSTORAGE_COMPRESSION_SUPPORT_CPU_FALLBACK
+        );
+        assert_eq!(ds_queue_get_compression_support(q, 0), 0);
+        assert_eq!(ds_queue_get_compression_support(q, 0x80), 0);
+        for format in [1u8, 0x80] {
+            let bad = DStorageRequest {
+                compression_format: format,
+                uncompressed_size: 64,
+                ..req
+            };
+            ds_queue_enqueue_request(q, &bad);
+            ds_queue_enqueue_status(q, status, 0);
+            ds_queue_submit(q);
+            assert!(wait_for(|| ds_status_is_complete(st, 0) == 1));
+            assert_eq!(ds_status_get_hresult(st, 0), E_DSTORAGE_DECOMPRESSION_ERROR);
+        }
+        ds_queue_close(q);
+    }
+
+    #[test]
+    fn dstorage_gdeflate_file_is_decompressed_into_memory() {
+        // Flux GDeflate de référence : 1 Mio de motif « ABCDEFGH » répété.
+        let stream: &[u8] = include_bytes!("../tests/data/gdeflate/rep1m.gdf");
+        let (vfs, base) = temp_vfs();
+        std::fs::write(base.join("game").join("rep.gdf"), stream).expect("write gdf");
+        let factory = new_factory(Some(vfs));
+        let mut file: *mut c_void = ptr::null_mut();
+        let path = wide("game:/rep.gdf");
+        assert_eq!(
+            ds_factory_open_file(factory, path.as_ptr(), &IID_IDSTORAGE_FILE, &mut file),
+            S_OK
+        );
+        let qdesc = DStorageQueueDesc {
+            source_type: DSTORAGE_REQUEST_SOURCE_FILE,
+            capacity: DSTORAGE_MIN_QUEUE_CAPACITY,
+            ..Default::default()
         };
-        ds_queue_enqueue_request(q, &gdeflate);
+        let mut queue: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            ds_factory_create_queue(factory, &qdesc, &IID_IDSTORAGE_QUEUE, &mut queue),
+            S_OK
+        );
+        let q = queue.cast::<DsQueueObject>();
+        let mut status: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            ds_factory_create_status_array(
+                factory,
+                2,
+                ptr::null(),
+                &IID_IDSTORAGE_STATUS_ARRAY,
+                &mut status
+            ),
+            S_OK
+        );
+        let st = status.cast::<DsStatusArrayObject>();
+        let mut dst = vec![0u8; 1 << 20];
+        let req = DStorageRequest {
+            compression_format: DSTORAGE_COMPRESSION_FORMAT_GDEFLATE,
+            options_bits: DSTORAGE_REQUEST_SOURCE_FILE | (DSTORAGE_DEST_MEMORY << 1),
+            source: [file as u64, 0, stream.len() as u64],
+            destination: [dst.as_mut_ptr() as u64, 1 << 20, 0, 0, 0],
+            uncompressed_size: 1 << 20,
+            ..Default::default()
+        };
+        ds_queue_enqueue_request(q, &req);
         ds_queue_enqueue_status(q, status, 0);
         ds_queue_submit(q);
         assert!(wait_for(|| ds_status_is_complete(st, 0) == 1));
+        assert_eq!(ds_status_get_hresult(st, 0), S_OK);
+        assert!(
+            dst.iter()
+                .enumerate()
+                .all(|(i, &b)| b == b"ABCDEFGH"[i % 8])
+        );
+
+        // Taille décompressée annoncée incohérente → erreur de décompression, destination intacte.
+        let mut dst2 = vec![0u8; 1 << 20];
+        let wrong = DStorageRequest {
+            destination: [dst2.as_mut_ptr() as u64, 1 << 20, 0, 0, 0],
+            uncompressed_size: 1000,
+            ..req
+        };
+        ds_queue_enqueue_request(q, &wrong);
+        ds_queue_enqueue_status(q, status, 1);
+        ds_queue_submit(q);
+        assert!(wait_for(|| ds_status_is_complete(st, 1) == 1));
+        assert_eq!(ds_status_get_hresult(st, 1), E_DSTORAGE_DECOMPRESSION_ERROR);
+        assert!(dst2.iter().all(|&b| b == 0));
+
+        // Flux tronqué (CompressedSize trop petit) → erreur de décompression.
+        let cut = DStorageRequest {
+            source: [file as u64, 0, (stream.len() / 2) as u64],
+            destination: [dst2.as_mut_ptr() as u64, 1 << 20, 0, 0, 0],
+            ..req
+        };
+        ds_queue_enqueue_request(q, &cut);
+        ds_queue_enqueue_status(q, status, 0);
+        ds_queue_submit(q);
+        assert!(wait_for(
+            || ds_status_get_hresult(st, 0) != E_PENDING && ds_status_get_hresult(st, 0) != S_OK
+        ));
         assert_eq!(ds_status_get_hresult(st, 0), E_DSTORAGE_DECOMPRESSION_ERROR);
         ds_queue_close(q);
     }
