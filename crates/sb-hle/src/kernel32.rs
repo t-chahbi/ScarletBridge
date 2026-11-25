@@ -313,13 +313,20 @@ pub fn exports() -> HashMap<&'static str, usize> {
     m
 }
 
-// ---------- advapi32 : registre (stub honnête) ----------
+// ---------- advapi32 : registre virtuel Xbox Series X ----------
 
 const ERROR_SUCCESS: u32 = 0;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_MORE_DATA: u32 = 234;
+const REG_DWORD: u32 = 4;
 
-/// Aucune ruche n'existe : met `*out` à NULL et retourne `ERROR_FILE_NOT_FOUND`.
+/// Clé virtuelle exposant les valeurs système Xbox Series X (`ConsoleMode = 0x64`).
+const REG_XBOX_CONSOLE_KEY: usize = 0x5B00_0001;
+/// Mode console Xbox Series X (Anaconda) lu via `RegQueryValueExW(..., L"ConsoleMode")`.
+const XBOX_CONSOLE_MODE_SCARLETT: u32 = 0x64;
+
+/// Aucune ruche correspondante : met `*out` à NULL et retourne `ERROR_FILE_NOT_FOUND`.
 fn reg_not_found(out: *mut usize) -> u32 {
     if !out.is_null() {
         // SAFETY: `out` est un `PHKEY` fourni par l'appelant invité, vérifié non-nul.
@@ -328,69 +335,176 @@ fn reg_not_found(out: *mut usize) -> u32 {
     ERROR_FILE_NOT_FOUND
 }
 
-extern "win64" fn RegOpenKeyW(_hkey: usize, _sub: *const u16, out: *mut usize) -> u32 {
-    ffi_guard!(CHANNEL, "RegOpenKeyW", ERROR_FILE_NOT_FOUND, {
+fn is_xbox_console_reg_subkey(subkey: &str) -> bool {
+    let lower = subkey.to_ascii_lowercase();
+    lower.contains("currentversion\\oem")
+        || lower.ends_with("\\oem")
+        || lower.contains("xbox")
+        || lower.contains("console")
+        || lower.contains("scarlett")
+        || lower.contains("durango")
+        || lower.contains("gameos")
+        || lower.ends_with("\\control")
+        || lower == "control"
+}
+
+fn reg_open_key_common(hkey: usize, subkey: &str, out: *mut usize) -> u32 {
+    if is_xbox_console_reg_subkey(subkey) {
+        if !out.is_null() {
+            // SAFETY: `out` est un `PHKEY` fourni par l'appelant invité, vérifié non-nul.
+            unsafe { *out = REG_XBOX_CONSOLE_KEY };
+        }
+        sb_info!(
+            CHANNEL,
+            "RegOpenKey(hkey={hkey:#x}, '{subkey}') -> HKEY console {REG_XBOX_CONSOLE_KEY:#x}"
+        );
+        ERROR_SUCCESS
+    } else {
+        sb_debug!(
+            CHANNEL,
+            "RegOpenKey(hkey={hkey:#x}, '{subkey}') -> ERROR_FILE_NOT_FOUND"
+        );
         reg_not_found(out)
+    }
+}
+
+fn reg_query_value_common(
+    hkey: usize,
+    name: &str,
+    ty: *mut u32,
+    data: *mut u8,
+    len: *mut u32,
+) -> u32 {
+    if hkey == 0 {
+        return ERROR_INVALID_HANDLE;
+    }
+    if name.eq_ignore_ascii_case("ConsoleMode") {
+        if !ty.is_null() {
+            // SAFETY: `ty` vérifié non-nul.
+            unsafe { *ty = REG_DWORD };
+        }
+        let bytes = XBOX_CONSOLE_MODE_SCARLETT.to_le_bytes();
+        if !data.is_null() {
+            if len.is_null() {
+                return ERROR_MORE_DATA;
+            }
+            // SAFETY: `len` vérifié non-nul.
+            let avail = unsafe { *len };
+            // SAFETY: `len` vérifié non-nul.
+            unsafe { *len = bytes.len() as u32 };
+            if (avail as usize) < bytes.len() {
+                return ERROR_MORE_DATA;
+            }
+            // SAFETY: `data` dispose d'au moins 4 octets en écriture (`avail >= 4`).
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
+        } else if !len.is_null() {
+            // SAFETY: `len` vérifié non-nul.
+            unsafe { *len = bytes.len() as u32 };
+        }
+        sb_info!(
+            CHANNEL,
+            "RegQueryValueEx(hkey={hkey:#x}, 'ConsoleMode') -> REG_DWORD {XBOX_CONSOLE_MODE_SCARLETT:#x}"
+        );
+        return ERROR_SUCCESS;
+    }
+    if hkey == REG_XBOX_CONSOLE_KEY {
+        sb_info!(
+            CHANNEL,
+            "RegQueryValueEx(hkey={hkey:#x}, '{name}') -> ERROR_FILE_NOT_FOUND (clé console)"
+        );
+    } else {
+        sb_debug!(
+            CHANNEL,
+            "RegQueryValueEx(hkey={hkey:#x}, '{name}') -> ERROR_FILE_NOT_FOUND"
+        );
+    }
+    ERROR_FILE_NOT_FOUND
+}
+
+extern "win64" fn RegOpenKeyW(hkey: usize, sub: *const u16, out: *mut usize) -> u32 {
+    ffi_guard!(CHANNEL, "RegOpenKeyW", ERROR_FILE_NOT_FOUND, {
+        // SAFETY: `sub` est soit NUL, soit une chaîne UTF-16LE terminée par nul.
+        let s = unsafe { from_pcwstr(sub) }.unwrap_or_default();
+        reg_open_key_common(hkey, &s, out)
     })
 }
-extern "win64" fn RegOpenKeyA(_hkey: usize, _sub: *const i8, out: *mut usize) -> u32 {
+extern "win64" fn RegOpenKeyA(hkey: usize, sub: *const i8, out: *mut usize) -> u32 {
     ffi_guard!(CHANNEL, "RegOpenKeyA", ERROR_FILE_NOT_FOUND, {
-        reg_not_found(out)
+        let s = if sub.is_null() {
+            String::new()
+        } else {
+            // SAFETY: `sub` vérifié non-nul (chaîne C terminée par nul).
+            unsafe { CStr::from_ptr(sub) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        reg_open_key_common(hkey, &s, out)
     })
 }
 extern "win64" fn RegOpenKeyExW(
-    _hkey: usize,
-    _sub: *const u16,
+    hkey: usize,
+    sub: *const u16,
     _opts: u32,
     _sam: u32,
     out: *mut usize,
 ) -> u32 {
     ffi_guard!(CHANNEL, "RegOpenKeyExW", ERROR_FILE_NOT_FOUND, {
-        reg_not_found(out)
+        // SAFETY: `sub` est soit NUL, soit une chaîne UTF-16LE terminée par nul.
+        let s = unsafe { from_pcwstr(sub) }.unwrap_or_default();
+        reg_open_key_common(hkey, &s, out)
     })
 }
 extern "win64" fn RegOpenKeyExA(
-    _hkey: usize,
-    _sub: *const i8,
+    hkey: usize,
+    sub: *const i8,
     _opts: u32,
     _sam: u32,
     out: *mut usize,
 ) -> u32 {
     ffi_guard!(CHANNEL, "RegOpenKeyExA", ERROR_FILE_NOT_FOUND, {
-        reg_not_found(out)
+        let s = if sub.is_null() {
+            String::new()
+        } else {
+            // SAFETY: `sub` vérifié non-nul (chaîne C terminée par nul).
+            unsafe { CStr::from_ptr(sub) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        reg_open_key_common(hkey, &s, out)
     })
 }
 extern "win64" fn RegQueryValueExW(
-    _hkey: usize,
-    _name: *const u16,
+    hkey: usize,
+    name: *const u16,
     _reserved: *mut u32,
-    _ty: *mut u32,
-    _data: *mut u8,
-    _len: *mut u32,
+    ty: *mut u32,
+    data: *mut u8,
+    len: *mut u32,
 ) -> u32 {
     ffi_guard!(CHANNEL, "RegQueryValueExW", ERROR_FILE_NOT_FOUND, {
-        // Handle NULL (clé jamais ouverte) → invalide, sinon valeur absente.
-        if _hkey == 0 {
-            ERROR_INVALID_HANDLE
-        } else {
-            ERROR_FILE_NOT_FOUND
-        }
+        // SAFETY: `name` est soit NUL, soit une chaîne UTF-16LE terminée par nul.
+        let s = unsafe { from_pcwstr(name) }.unwrap_or_default();
+        reg_query_value_common(hkey, &s, ty, data, len)
     })
 }
 extern "win64" fn RegQueryValueExA(
-    _hkey: usize,
-    _name: *const i8,
+    hkey: usize,
+    name: *const i8,
     _reserved: *mut u32,
-    _ty: *mut u32,
-    _data: *mut u8,
-    _len: *mut u32,
+    ty: *mut u32,
+    data: *mut u8,
+    len: *mut u32,
 ) -> u32 {
     ffi_guard!(CHANNEL, "RegQueryValueExA", ERROR_FILE_NOT_FOUND, {
-        if _hkey == 0 {
-            ERROR_INVALID_HANDLE
+        let s = if name.is_null() {
+            String::new()
         } else {
-            ERROR_FILE_NOT_FOUND
-        }
+            // SAFETY: `name` vérifié non-nul (chaîne C terminée par nul).
+            unsafe { CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        reg_query_value_common(hkey, &s, ty, data, len)
     })
 }
 extern "win64" fn RegCloseKey(_hkey: usize) -> u32 {
@@ -1125,4 +1239,86 @@ extern "win64" fn ProcessPrng(buf: *mut u8, len: usize) -> WinBool {
         }
         WIN_TRUE
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_console_mode_returns_scarlett_dword() {
+        let sub: Vec<u16> = "Software\\Microsoft\\Windows NT\\CurrentVersion\\OEM"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let val: Vec<u16> = "ConsoleMode".encode_utf16().chain(Some(0)).collect();
+        let mut hkey = 0usize;
+        assert_eq!(
+            RegOpenKeyW(0x8000_0002, sub.as_ptr(), &raw mut hkey),
+            ERROR_SUCCESS
+        );
+        assert_eq!(hkey, REG_XBOX_CONSOLE_KEY);
+
+        // Requête de taille sans tampon.
+        let mut ty = 0u32;
+        let mut len = 0u32;
+        assert_eq!(
+            RegQueryValueExW(
+                hkey,
+                val.as_ptr(),
+                ptr::null_mut(),
+                &raw mut ty,
+                ptr::null_mut(),
+                &raw mut len
+            ),
+            ERROR_SUCCESS
+        );
+        assert_eq!(ty, REG_DWORD);
+        assert_eq!(len, 4);
+
+        // Tampon trop petit -> ERROR_MORE_DATA.
+        let mut small = [0u8; 2];
+        len = 2;
+        assert_eq!(
+            RegQueryValueExW(
+                hkey,
+                val.as_ptr(),
+                ptr::null_mut(),
+                &raw mut ty,
+                small.as_mut_ptr(),
+                &raw mut len
+            ),
+            ERROR_MORE_DATA
+        );
+        assert_eq!(len, 4);
+
+        // Lecture complète -> 0x64.
+        let mut out = [0u8; 4];
+        len = 4;
+        assert_eq!(
+            RegQueryValueExW(
+                hkey,
+                val.as_ptr(),
+                ptr::null_mut(),
+                &raw mut ty,
+                out.as_mut_ptr(),
+                &raw mut len
+            ),
+            ERROR_SUCCESS
+        );
+        assert_eq!(u32::from_le_bytes(out), XBOX_CONSOLE_MODE_SCARLETT);
+        assert_eq!(RegCloseKey(hkey), ERROR_SUCCESS);
+
+        // Clé inconnue -> ERROR_FILE_NOT_FOUND.
+        let other: Vec<u16> = "SOFTWARE\\UnknownApp"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut bad_hkey = 1usize;
+        assert_eq!(
+            RegOpenKeyW(0x8000_0002, other.as_ptr(), &raw mut bad_hkey),
+            ERROR_FILE_NOT_FOUND
+        );
+        assert_eq!(bad_hkey, 0);
+    }
 }

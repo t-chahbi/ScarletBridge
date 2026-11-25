@@ -402,11 +402,11 @@ pub const fn dxgi_to_gfx10_format(dxgi: u32) -> (u32, Swizzle) {
         37 => (24, SWIZZLE_RG),
         38 => (28, SWIZZLE_RG),
         // R32 / D32_FLOAT
-        40 | 41 | 39 => (22, SWIZZLE_R),
+        39..=41 => (22, SWIZZLE_R),
         42 => (20, SWIZZLE_R),
         43 => (21, SWIZZLE_R),
         // D24_UNORM_S8_UINT / R24G8
-        44 | 45 | 46 => (141, SWIZZLE_R),
+        44..=46 => (141, SWIZZLE_R),
         // R8G8
         49 | 48 => (14, SWIZZLE_RG),
         50 => (18, SWIZZLE_RG),
@@ -450,7 +450,7 @@ pub const fn dxgi_to_gfx10_format(dxgi: u32) -> (u32, Swizzle) {
         97 | 98 => (181, SWIZZLE_IDENTITY),
         99 => (182, SWIZZLE_IDENTITY),
         // D32_FLOAT_S8X24_UINT
-        19 | 20 | 21 => (146, SWIZZLE_R),
+        19..=21 => (146, SWIZZLE_R),
         _ => (GFX10_FORMAT_8_8_8_8_UNORM, SWIZZLE_IDENTITY),
     }
 }

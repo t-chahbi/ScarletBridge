@@ -211,6 +211,7 @@ fn new_pso_object(pipeline_id: usize, is_compute: bool, native: Arc<NativePso>) 
             (&raw const D3D12_PSO_VTBL).cast(),
             "ID3D12PipelineState",
         )),
+        console_inline_pad: [0u8; 32],
         pipeline_id,
         is_compute,
         native: Some(native),

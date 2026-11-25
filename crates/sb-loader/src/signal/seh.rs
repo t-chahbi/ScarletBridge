@@ -276,7 +276,8 @@ pub(super) fn try_redirect_to_seh(
 extern "win64" fn fault_entry(rec: *mut u8, ctx: *mut Context) -> ! {
     // Capture les derniers appels d'API HLE *avant* le passage dans les handlers SEH du titre
     // (ex. Breakpad/minidump qui noie sinon le tampon circulaire avec des centaines de memcpy/HTTP).
-    let pre_seh_calls = crate::trampoline::recent_api_calls(80);
+    let pre_seh_calls = crate::trampoline::recent_api_calls(40);
+    let pre_seh_sig_calls = crate::trampoline::recent_significant_api_calls(120);
     if let Some(d) = exception_dispatcher() {
         // SAFETY: `rec` et `ctx` ont été construits par `try_redirect_to_seh` ; le dispatcher
         // ne revient que si l'exception n'est gérée par personne.
@@ -312,11 +313,22 @@ extern "win64" fn fault_entry(rec: *mut u8, ctx: *mut Context) -> ! {
         ],
         |msg| {
             append_detailed_regs(msg, &regs);
+            if !pre_seh_sig_calls.is_empty() {
+                use std::fmt::Write as _;
+                let _ = writeln!(
+                    msg,
+                    "Appels d'API significatifs avant la faute (avant SEH, {} ; le plus récent en bas) :",
+                    pre_seh_sig_calls.len()
+                );
+                for call in &pre_seh_sig_calls {
+                    let _ = writeln!(msg, "  {call}");
+                }
+            }
             if !pre_seh_calls.is_empty() {
                 use std::fmt::Write as _;
                 let _ = writeln!(
                     msg,
-                    "Appels d'API HLE juste avant la faute (avant SEH, {} ; le plus récent en bas) :",
+                    "Appels d'API HLE juste avant la faute (brut avant SEH, {} ; le plus récent en bas) :",
                     pre_seh_calls.len()
                 );
                 for call in &pre_seh_calls {

@@ -67,7 +67,11 @@ pub fn decide_present_sync(
     interval_us: u32,
     threshold_percent: f32,
 ) -> PresentSync {
-    if !(threshold_percent > 0.0) || late_by_us == 0 || interval_us == 0 {
+    if !threshold_percent.is_finite()
+        || threshold_percent <= 0.0
+        || late_by_us == 0
+        || interval_us == 0
+    {
         return PresentSync::VBlank;
     }
     let scanned = 100.0 * ((late_by_us % u64::from(interval_us)) as f64) / f64::from(interval_us);

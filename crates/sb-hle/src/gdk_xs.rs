@@ -20,7 +20,7 @@ use sb_common::abi::{
 };
 use sb_common::{ffi_guard, sb_debug, sb_info, sb_stub, sb_trace, sb_warn};
 use sb_gpu::{GpuContext, Sdl3Lib, UnifiedMemoryManager};
-use sb_loader::{init_thread_teb, module_manager};
+use sb_loader::{ImportSymbol, init_thread_teb, module_manager};
 use sb_runtime::profile::LocalUserProfile;
 
 use crate::com::{
@@ -229,21 +229,34 @@ pub fn bink_exports() -> HashMap<&'static str, usize> {
 
 // ---------- xmem.dll (Mémoire unifiée zéro-copie Vulkan) ----------
 
-/// Adresse de l'export `__XMemAllocationHooks__` du titre (structure `{AllocHook, FreeHook,
-/// pContext}`). Sur console, `xmem.dll` lit cet export et délègue chaque `XMemAlloc` au dispatcher
-/// installé par le titre (qui remplit l'arène du gestionnaire mémoire du jeu).
-const XMEM_HOOKS_EXPORT: usize = 0x146844380;
+/// Résout dynamiquement l'export `__XMemAllocationHooks__` du module PE principal
+/// (structure `{AllocHook, FreeHook, pContext}`). Sur console, `xmem.dll` lit cet export et
+/// délègue chaque `XMemAlloc` au dispatcher installé par le titre.
+fn lookup_xmem_alloc_hook() -> Option<usize> {
+    let mm = module_manager();
+    let main_base = mm.main_module_base();
+    if main_base == 0 {
+        return None;
+    }
+    let hooks_addr = mm.get_proc_address(
+        main_base,
+        &ImportSymbol::Name("__XMemAllocationHooks__".to_string()),
+    )?;
+    mm.find_by_address(hooks_addr)?;
+    // SAFETY: `hooks_addr` provient de la table d'exports du module principal chargé en mémoire.
+    let alloc_hook = unsafe { ptr::read_unaligned(hooks_addr as *const usize) };
+    if alloc_hook != 0 && mm.find_by_address(alloc_hook).is_some() {
+        Some(alloc_hook)
+    } else {
+        None
+    }
+}
 
 extern "win64" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     ffi_guard!(CHANNEL, "XMemAlloc", ptr::null_mut(), {
-        // SAFETY: image du titre mappée en-process à sa base préférée (delta 0) ; lecture d'un
-        // pointeur de 8 octets dans sa section export.
-        let alloc_hook = unsafe { ptr::read_unaligned(XMEM_HOOKS_EXPORT as *const usize) };
-        // Le hook doit être une adresse de code dans l'image du titre (base 0x140000000).
-        let in_image = (0x140000000..0x14c000000).contains(&alloc_hook);
-        if in_image {
+        if let Some(alloc_hook) = lookup_xmem_alloc_hook() {
             // SAFETY: `alloc_hook` est le dispatcher d'alloc du titre (`extern "win64"`), renseigné
-            // par son propre code via `__XMemAllocationHooks__`.
+            // par son propre code via `__XMemAllocationHooks__` dans un module PE chargé.
             let hook: extern "win64" fn(usize, u64) -> *mut c_void =
                 unsafe { core::mem::transmute(alloc_hook) };
             let p = hook(size, attributes);
@@ -1215,16 +1228,27 @@ fn xmem_region_for(st: &XmemState, addr: usize, len: usize) -> Option<(usize, Xm
     (end <= base + region.size).then_some((base, *region))
 }
 
+/// Vrai si `[addr, addr + len)` appartient entièrement à une réservation `XMemVirtualAlloc`.
+pub(crate) fn is_xmem_range(addr: usize, len: usize) -> bool {
+    let st = XMEM_STATE.lock();
+    xmem_region_for(&st, addr, len).is_some()
+}
+
 /// Vrai si `addr` appartient à une réservation `XMemVirtualAlloc` (mémoire fournie par le titre).
 pub(crate) fn is_xmem_address(addr: usize) -> bool {
-    let st = XMEM_STATE.lock();
-    xmem_region_for(&st, addr, 1).is_some()
+    is_xmem_range(addr, 1)
 }
 
 /// Réserve de test : une région XMem de `size` octets, pour les tests des autres modules.
 #[cfg(test)]
 pub(crate) fn xmem_test_region(size: usize) -> usize {
     XMemVirtualAlloc(ptr::null_mut(), size, MEM_RESERVE, 0x2, 0x04) as usize
+}
+
+/// Région XMem commise (RW) pour les tests vérifiant les écritures directes en mémoire unifiée.
+#[cfg(test)]
+pub(crate) fn xmem_test_committed_region(size: usize) -> usize {
+    XMemVirtualAlloc(ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, 0x2, 0x04) as usize
 }
 
 /// Remplace une page par une réserve sans accès (décommit d'une vue physique).

@@ -140,10 +140,8 @@ pub fn dxbc_checksum(blob: &[u8]) -> [u32; 4] {
     let bits = n.wrapping_mul(8);
     let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
     let full = (data.len() / 64) * 64;
-    for chunk in data[..full].chunks_exact(64) {
-        let mut blk = [0u8; 64];
-        blk.copy_from_slice(chunk);
-        md5_block(&mut state, &bytes_to_u32x16(&blk));
+    for chunk in data[..full].as_chunks::<64>().0 {
+        md5_block(&mut state, &bytes_to_u32x16(chunk));
     }
     let left = data.len() - full;
     let mut blk = [0u8; 64];

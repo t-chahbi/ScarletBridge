@@ -34,10 +34,6 @@ use crate::com::{
     ComHeader, Guid, VtblSlot, com_add_ref, com_query_interface_list, com_release, vslot,
 };
 use crate::frame_pacer::FramePacer;
-use crate::gfx10_descriptors::{
-    self, BufferDesc, ImageDesc, ImageType, OobSelect, apply_d3d12_component_mapping,
-    dxgi_to_gfx10_format,
-};
 use crate::root_signature::{
     DescriptorRange as RsDescriptorRange, ParsedRootSignature, RootParam as RsRootParam,
     RootParamKind, StaticSampler as RsStaticSampler, clear_xbox_root_sig_flags, parse_rts0,
@@ -865,8 +861,8 @@ struct SharedD3D12State {
     native_images: native::ImageCache,
     // Cadencement d'images console (`SetFrameIntervalX` / `WaitFrameEventX` / `PresentX`).
     frame_interval_us: AtomicU32,
-    next_frame_token: AtomicU64,
     present_count: AtomicU64,
+    pacer: Mutex<FramePacer>,
     start_instant: Instant,
     /// `true` lorsque le périphérique a été créé via `D3D12XboxCreateDevice` (ou a reçu un
     /// appel console `slot 48`) : les files de commandes démarrent alors directement dans le
@@ -883,18 +879,11 @@ impl SharedD3D12State {
             descriptors: Mutex::new(HashMap::new()),
             native_images: Mutex::new(HashMap::new()),
             frame_interval_us: AtomicU32::new(16_667),
-            // 0 est réservé (`D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL`) : commence à 1.
-            next_frame_token: AtomicU64::new(1),
             present_count: AtomicU64::new(0),
+            pacer: Mutex::new(FramePacer::new()),
             start_instant: Instant::now(),
             is_console_device: AtomicBool::new(false),
         }
-    }
-
-    fn alloc_frame_token(&self) -> u64 {
-        let raw = self.next_frame_token.fetch_add(1, Ordering::AcqRel);
-        let masked = raw & 0x0000_FFFF_FFFF_FFFF;
-        if masked == 0 { 1 } else { masked }
     }
 
     fn elapsed_ns(&self) -> u64 {
@@ -1992,11 +1981,19 @@ struct D3D12PsoVtbl {
 #[repr(C)]
 struct D3D12PsoObject {
     header: ComHeader,
+    /// En-tête inline console (`+0x10..+0x30`, 32 octets) copié dans la liste de commandes lors
+    /// des fast-paths inline Xbox : mis à zéro afin de ne jamais exposer de pointeurs Rust.
+    console_inline_pad: [u8; 32],
     pipeline_id: usize,
     is_compute: bool,
     /// Métadonnées des shaders `SBR2` (chemin natif RDNA 2) ; `None` pour DXBC/DXIL.
     native: Option<Arc<native::NativePso>>,
 }
+
+const _: () = {
+    assert!(offset_of!(D3D12PsoObject, console_inline_pad) == 0x10);
+    assert!(offset_of!(D3D12PsoObject, pipeline_id) >= 0x30);
+};
 
 extern "win64" fn pso_qi(
     this: *mut ComHeader,
@@ -2008,8 +2005,37 @@ extern "win64" fn pso_qi(
         this,
         riid,
         ppv,
-        &[IID_ID3D12PIPELINESTATE],
+        &[
+            IID_ID3D12PIPELINESTATE,
+            IID_ID3D12PAGEABLE,
+            IID_ID3D12DEVICECHILD,
+            IID_ID3D12OBJECT,
+        ],
     )
+}
+
+/// Slot 11 console sur `ID3D12PipelineState` : taille de scratch compute (mesurée sur
+/// `amd_fidelityfx_upscaler_xbox.dll` : `(0, 0, &pBlob)` où `*pBlob->GetBufferPointer()` est un
+/// `u32` en KiB ; `0` désactive le tampon scratch console, nos shaders SPIR-V utilisant leur
+/// propre mémoire privée).
+extern "win64" fn pso_slot11_get_scratch_blob(
+    _this: *mut D3D12PsoObject,
+    _a2: usize,
+    _a3: usize,
+    out_blob: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ID3D12PipelineState::slot11", E_UNEXPECTED, {
+        if out_blob.is_null() {
+            return E_POINTER;
+        }
+        let blob = Box::new(D3DBlobObject {
+            header: ComHeader::new((&raw const D3D_BLOB_VTBL).cast()),
+            data: vec![0u8; 4],
+        });
+        // SAFETY: `out_blob` vérifié non-nul.
+        unsafe { *out_blob = Box::into_raw(blob).cast() };
+        S_OK
+    })
 }
 
 const fn build_pso_vtbl() -> D3D12PsoVtbl {
@@ -2018,6 +2044,7 @@ const fn build_pso_vtbl() -> D3D12PsoVtbl {
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
     fill_d3d12_child_slots(&mut slots);
+    slots[11] = vslot(pso_slot11_get_scratch_blob as *const c_void);
     D3D12PsoVtbl { slots }
 }
 
@@ -3881,6 +3908,7 @@ const fn build_console_cmdlist_vtbl() -> D3D12CmdListVtbl {
     slots[48] = vslot(cmdlist_ia_set_vertex_buffers as *const c_void);
     slots[51] = vslot(cmdlist_clear_dsv as *const c_void);
     slots[52] = vslot(cmdlist_clear_rtv as *const c_void);
+    slots[61] = vslot(cmdlist_noop_void as *const c_void); // ExecuteIndirect (console)
     // Extensions console Xbox Series X.
     slots[70] = vslot(cmdlist_noop_void as *const c_void); // OMSetDepthBounds
     slots[71] = vslot(cmdlist_write_value32 as *const c_void);
@@ -3888,7 +3916,7 @@ const fn build_console_cmdlist_vtbl() -> D3D12CmdListVtbl {
     slots[73] = vslot(cmdlist_wait_value32 as *const c_void);
     slots[74] = vslot(cmdlist_wait_value64 as *const c_void);
     slots[75] = vslot(cmdlist_noop_void as *const c_void); // SetPixelShaderDepthOrderX
-    slots[80] = vslot(cmdlist_noop_void as *const c_void); // ExecuteIndirect
+    slots[80] = vslot(cmdlist_noop_void as *const c_void); // DispatchX / ExecuteIndirect
     slots[83] = vslot(cmdlist_copy_texture_region as *const c_void); // CopyTextureRegionX (ancien)
     slots[85] = vslot(cmdlist_copy_texture_region as *const c_void); // CopyTextureRegionX (nouveau)
     slots[108] = vslot(cmdlist_noop_void as *const c_void); // ResolveSubresourceRegion
@@ -3896,6 +3924,7 @@ const fn build_console_cmdlist_vtbl() -> D3D12CmdListVtbl {
     slots[131] = vslot(cmdlist_noop_void as *const c_void); // Réglage console
     slots[132] = vslot(cmdlist_noop_void as *const c_void); // Réglage console
     slots[139] = vslot(cmdlist_reset as *const c_void); // Reset (console)
+    slots[141] = vslot(cmdlist_noop_void as *const c_void); // SetComputeScratchX (FSR/console)
     slots[142] = vslot(cmdlist_noop_void as *const c_void); // Réglage / marqueur console
     slots[146] = vslot(cmdlist_noop_void as *const c_void); // Barrier (enhanced)
     slots[148] = vslot(cmdlist_allocate_upload_memory as *const c_void); // AllocateUploadMemory
@@ -4476,7 +4505,9 @@ extern "win64" fn queue_present_x(
         if let Err(err) = renderer.present_to_surface() {
             sb_warn!(CHANNEL, "PresentX present_to_surface: {err}");
         }
-        let frame_no = q.shared.present_count.fetch_add(1, Ordering::AcqRel) + 1;
+        let now_us = q.shared.elapsed_us();
+        let (frame_no, _sync) = q.shared.pacer.lock().commit_present(now_us, token, 0.0);
+        q.shared.present_count.store(frame_no, Ordering::Release);
         sb_debug!(
             CHANNEL,
             "ID3D12CommandQueue::PresentX(frame #{frame_no}, planes={plane_count}, token={token:#x}) -> S_OK"
@@ -4844,6 +4875,7 @@ extern "win64" fn device_create_graphics_pso(
                         (&raw const D3D12_PSO_VTBL).cast(),
                         "ID3D12PipelineState",
                     )),
+                    console_inline_pad: [0u8; 32],
                     pipeline_id,
                     is_compute: false,
                     native: None,
@@ -4898,6 +4930,7 @@ extern "win64" fn device_create_compute_pso(
                         (&raw const D3D12_PSO_VTBL).cast(),
                         "ID3D12PipelineState",
                     )),
+                    console_inline_pad: [0u8; 32],
                     pipeline_id,
                     is_compute: true,
                     native: None,
@@ -5092,8 +5125,16 @@ extern "win64" fn device_create_command_list(
 static DESC_HEAP_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Écrit un emplacement de descripteur (32 octets) à `dest` s'il est dans un tas de descripteurs
-/// connu. Renvoie `false` (rien d'écrit) sinon.
-fn write_descriptor_slot(dest: usize, slot: &crate::d3d12_views::SlotBytes) -> bool {
+/// connu ou dans une plage XMem valide (descripteurs CPU « staging » console).
+///
+/// Lorsque `dest` est en XMem hors `DESC_HEAP_RANGES` et que `compact_len < 32` (V#/S# de 16
+/// octets) avec des octets non nuls dans `dest[compact_len..32]`, seuls `compact_len` octets sont
+/// écrits afin de ne pas écraser un champ adjacent du titre.
+fn write_descriptor_slot_compact(
+    dest: usize,
+    slot: &crate::d3d12_views::SlotBytes,
+    compact_len: usize,
+) -> bool {
     let n = crate::d3d12_views::SLOT_BYTES;
     if dest == 0 {
         return false;
@@ -5102,13 +5143,48 @@ fn write_descriptor_slot(dest: usize, slot: &crate::d3d12_views::SlotBytes) -> b
         .lock()
         .iter()
         .any(|&(b, l)| dest >= b && l >= n && dest - b <= l - n);
-    if !known {
-        return false;
+    if known {
+        // SAFETY: `dest..dest+32` est inclus dans une zone de tas de descripteurs (mapping RW du
+        // bridge ou réservation XMem fournie par le titre), vérifiée juste au-dessus.
+        unsafe { ptr::copy_nonoverlapping(slot.as_ptr(), dest as *mut u8, n) };
+        return true;
     }
-    // SAFETY: `dest..dest+32` est inclus dans une zone de tas de descripteurs (mapping RW du
-    // bridge ou réservation XMem fournie par le titre), vérifiée juste au-dessus.
-    unsafe { ptr::copy_nonoverlapping(slot.as_ptr(), dest as *mut u8, n) };
-    true
+    let write_max = compact_len.min(n).max(1);
+    if crate::gdk_xs::is_xmem_range(dest, n) {
+        let before = sb_loader::trampoline::peek_memory(dest, n);
+        if before.len() == n {
+            let len = if write_max < n && before[write_max..].iter().any(|&b| b != 0) {
+                write_max
+            } else {
+                n
+            };
+            static LOGGED_XMEM: AtomicU32 = AtomicU32::new(0);
+            if LOGGED_XMEM.fetch_add(1, Ordering::Relaxed) < 4 {
+                sb_info!(
+                    CHANNEL,
+                    "write_descriptor_slot XMem hors-tas : dest={dest:#x}, len={len}o, avant={before:02x?}, ecrit={:02x?}",
+                    &slot[..len]
+                );
+            }
+            // SAFETY: `[dest, dest + n)` est dans une réservation XMem mappée RW et vérifiée
+            // lisible sur toute sa longueur via `peek_memory`.
+            unsafe { ptr::copy_nonoverlapping(slot.as_ptr(), dest as *mut u8, len) };
+            return true;
+        }
+    }
+    static LOGGED_DROP: AtomicU32 = AtomicU32::new(0);
+    if LOGGED_DROP.fetch_add(1, Ordering::Relaxed) < 4 {
+        sb_warn!(
+            CHANNEL,
+            "write_descriptor_slot ignoré (hors tas et hors XMem) : dest={dest:#x}"
+        );
+    }
+    false
+}
+
+/// Écrit un emplacement de descripteur (32 octets) à `dest`.
+fn write_descriptor_slot(dest: usize, slot: &crate::d3d12_views::SlotBytes) -> bool {
+    write_descriptor_slot_compact(dest, slot, crate::d3d12_views::SLOT_BYTES)
 }
 
 /// Lit `len` octets d'un descripteur de vue. `Ok(None)` si le pointeur est NUL (vue par défaut),
@@ -5164,24 +5240,28 @@ extern "win64" fn device_create_descriptor_heap(
     let count = u64::from(d.num_descriptors.max(1));
     let mut base = NEXT_DESC_HANDLE.fetch_add(count * 32, Ordering::Relaxed) as usize;
     let mut provided = false;
-    // Variante console : le descripteur est suivi (à partir de l'octet 16) d'une adresse de mémoire
-    // fournie par le titre, et celui-ci vérifie que le handle CPU de début du tas la reprend
-    // exactement (assertion `int3` sinon). On adopte donc la première adresse située dans une réservation XMem.
+    // Variante console : l'extension `D3D12_DESCRIPTOR_HEAP_DESC` place l'adresse fournie par le
+    // titre exactement à l'octet 16 (`pMemory`, alignée sur une page 4 KiB dans une réservation
+    // XMem de taille suffisante). Ne jamais balayer au-delà de l'octet 24 : un descripteur PC de
+    // 16 octets sur la pile est suivi de variables locales (ex. pointeur `this` du contexte de
+    // rendu), qui seraient sinon écrasées par `CreateConstantBufferView` / `Create*View`.
     if !desc.is_null() {
-        let raw = sb_loader::trampoline::peek_memory(desc as usize, 64);
+        let raw = sb_loader::trampoline::peek_memory(desc as usize, 32);
         let mut given = 0usize;
-        for chunk in raw.get(16..).unwrap_or(&[]).as_chunks::<8>().0 {
-            let v = u64::from_le_bytes(*chunk) as usize;
-            if v >= 0x1_0000 && crate::gdk_xs::is_xmem_address(v) {
+        if let Some(slot16) = raw.get(16..24)
+            && let Ok(arr) = <[u8; 8]>::try_from(slot16)
+        {
+            let v = u64::from_le_bytes(arr) as usize;
+            let need = (count as usize).saturating_mul(32);
+            if v >= 0x1_0000 && (v & 0xFFF) == 0 && crate::gdk_xs::is_xmem_range(v, need) {
                 given = v;
-                break;
             }
         }
         static LOGGED: AtomicU32 = AtomicU32::new(0);
         if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
             sb_info!(
                 CHANNEL,
-                "CreateDescriptorHeap : type={} n={} drapeaux={:#x} masque={:#x}, octets 16..64={:02x?} -> adresse fournie {given:#x}",
+                "CreateDescriptorHeap : type={} n={} drapeaux={:#x} masque={:#x}, octets 16..32={:02x?} -> adresse fournie {given:#x}",
                 d.heap_type,
                 d.num_descriptors,
                 d.flags,
@@ -5214,6 +5294,13 @@ extern "win64" fn device_create_descriptor_heap(
         }
     }
     DESC_HEAP_RANGES.lock().push((base, count as usize * 32));
+    sb_debug!(
+        CHANNEL,
+        "CreateDescriptorHeap -> type={} n={} flags={:#x} base={base:#x} provided={provided}",
+        d.heap_type,
+        d.num_descriptors,
+        d.flags
+    );
     let heap = Box::new(D3D12DescHeapObject {
         header: ComHeader::new(traced_vtbl(
             (&raw const D3D12_DESC_HEAP_VTBL).cast(),
@@ -5418,6 +5505,14 @@ extern "win64" fn device_create_root_signature(
         } else if &bytes[0..4] == b"DXBC"
             && let Ok(sig) = crate::root_signature::parse_rts0(bytes)
         {
+            for p in &sig.params {
+                let reg = if p.kind == RootParamKind::Table {
+                    0
+                } else {
+                    p.shader_register
+                };
+                param_registers.push(reg);
+            }
             layout = native::RootSigLayout::from_params(
                 sig.params.iter().map(|p| (p.kind, p.num_values)).collect(),
             )
@@ -5448,14 +5543,17 @@ extern "win64" fn device_create_cbv(
     desc: *const D3D12ConstantBufferViewDesc,
     dest_descriptor: usize,
 ) {
-    if this.is_null()
-        || desc.is_null()
-        || sb_loader::trampoline::peek_memory(
-            desc as usize,
-            size_of::<D3D12ConstantBufferViewDesc>(),
-        )
+    if this.is_null() {
+        return;
+    }
+    if desc.is_null() {
+        let zero = [0u8; crate::d3d12_views::SLOT_BYTES];
+        write_descriptor_slot_compact(dest_descriptor, &zero, 16);
+        return;
+    }
+    if sb_loader::trampoline::peek_memory(desc as usize, size_of::<D3D12ConstantBufferViewDesc>())
         .len()
-            != size_of::<D3D12ConstantBufferViewDesc>()
+        != size_of::<D3D12ConstantBufferViewDesc>()
     {
         return;
     }
@@ -5484,9 +5582,17 @@ extern "win64" fn device_create_cbv(
             size: d.size_in_bytes,
         },
     );
-    write_descriptor_slot(
-        dest_descriptor,
-        &crate::d3d12_views::cbv_slot(d.buffer_location, d.size_in_bytes),
+    let slot = if d.buffer_location == 0 || d.size_in_bytes == 0 {
+        [0u8; crate::d3d12_views::SLOT_BYTES]
+    } else {
+        crate::d3d12_views::cbv_slot(d.buffer_location, d.size_in_bytes)
+    };
+    let wrote = write_descriptor_slot_compact(dest_descriptor, &slot, 16);
+    sb_debug!(
+        CHANNEL,
+        "ID3D12Device::CreateConstantBufferView(va={:#x}, size={:#x}, dest={dest_descriptor:#x}) -> wrote={wrote}",
+        d.buffer_location,
+        d.size_in_bytes
     );
 }
 
@@ -5503,7 +5609,15 @@ extern "win64" fn device_create_srv(
     desc: *const c_void,
     dest_descriptor: usize,
 ) {
-    if this.is_null() || !is_d3d12_resource(resource as usize) {
+    if this.is_null() {
+        return;
+    }
+    if resource.is_null() || resource as usize == 0xFFFF_FFFF {
+        let zero = [0u8; crate::d3d12_views::SLOT_BYTES];
+        write_descriptor_slot(dest_descriptor, &zero);
+        return;
+    }
+    if !is_d3d12_resource(resource as usize) {
         return;
     }
     // SAFETY: `this` et `resource` vérifiés (objet `ID3D12Resource` du bridge).
@@ -5530,7 +5644,15 @@ extern "win64" fn device_create_uav(
     desc: *const c_void,
     dest_descriptor: usize,
 ) {
-    if this.is_null() || !is_d3d12_resource(resource as usize) {
+    if this.is_null() {
+        return;
+    }
+    if resource.is_null() || resource as usize == 0xFFFF_FFFF {
+        let zero = [0u8; crate::d3d12_views::SLOT_BYTES];
+        write_descriptor_slot(dest_descriptor, &zero);
+        return;
+    }
+    if !is_d3d12_resource(resource as usize) {
         return;
     }
     // SAFETY: `this` et `resource` vérifiés (objet `ID3D12Resource` du bridge).
@@ -5558,6 +5680,11 @@ extern "win64" fn device_create_rtv(
     desc: *const c_void,
     dest_descriptor: usize,
 ) {
+    if resource.is_null() || resource as usize == 0xFFFF_FFFF {
+        let zero = [0u8; crate::d3d12_views::SLOT_BYTES];
+        write_descriptor_slot(dest_descriptor, &zero);
+        return;
+    }
     if is_d3d12_resource(resource as usize) {
         write_resource_view(
             resource,
@@ -5575,6 +5702,11 @@ extern "win64" fn device_create_dsv(
     desc: *const c_void,
     dest_descriptor: usize,
 ) {
+    if resource.is_null() || resource as usize == 0xFFFF_FFFF {
+        let zero = [0u8; crate::d3d12_views::SLOT_BYTES];
+        write_descriptor_slot(dest_descriptor, &zero);
+        return;
+    }
     if is_d3d12_resource(resource as usize) {
         write_resource_view(
             resource,
@@ -5597,7 +5729,7 @@ extern "win64" fn device_create_sampler(
     }
     let bytes = sb_loader::trampoline::peek_memory(desc as usize, 52);
     if let Some(slot) = crate::d3d12_views::sampler_slot(&bytes) {
-        write_descriptor_slot(dest_descriptor, &slot);
+        write_descriptor_slot_compact(dest_descriptor, &slot, 16);
     }
 }
 
@@ -5697,6 +5829,16 @@ extern "win64" fn device_create_heap(
     })
 }
 
+/// Nettoie un `D3D12_RESOURCE_DESC` console : les dispositions Xbox (`0x101` tuilé, etc.) et
+/// bits de drapeaux console hauts (`>= 0x10000`) sont ramenés à des valeurs PC/Vulkan sûres.
+fn sanitize_console_resource_desc(mut d: D3D12ResourceDesc) -> D3D12ResourceDesc {
+    if d.layout > 3 {
+        d.layout = if d.dimension == 1 { 1 } else { 0 };
+    }
+    d.flags &= 0xFFFF;
+    d
+}
+
 #[allow(clippy::too_many_arguments)]
 extern "win64" fn device_create_committed_resource(
     _this: *mut D3D12DeviceObject,
@@ -5712,7 +5854,7 @@ extern "win64" fn device_create_committed_resource(
         return E_POINTER;
     }
     // SAFETY: `desc` vérifié non-nul.
-    let d = unsafe { *desc };
+    let d = sanitize_console_resource_desc(unsafe { ptr::read_unaligned(desc) });
     let res = alloc_d3d12_resource(d, false);
     // SAFETY: `out_resource` vérifié non-nul.
     unsafe {
@@ -6080,10 +6222,42 @@ fn try_read_guid(addr: usize) -> Option<Guid> {
     Some(unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<Guid>()) })
 }
 
+/// Extrait l'adresse virtuelle GPU placée en XMem pour `ID3D12Device::slot 70` (variante console
+/// `CreatePlacementShaderResourceView`).
+///
+/// Disposition ABI console confirmée :
+/// - `a2` = `const D3D12_RESOURCE_DESC*` (56 octets)
+/// - `a3` = `D3D12_SHADER_RESOURCE_VIEW_DESC` (40 octets) suivi à `+0x28` (`[40..48]`) de
+///   `D3D12_GPU_VIRTUAL_ADDRESS` (alignement arbitraire, ex. sous-tampons alignés sur 64 octets).
+/// - `a4` = `D3D12_CPU_DESCRIPTOR_HANDLE` de destination.
+fn extract_slot70_placed_va(
+    d: &D3D12ResourceDesc,
+    desc_addr: usize,
+    view_addr: usize,
+    view_full: Option<&[u8]>,
+) -> u64 {
+    if let Some(vb) = view_full {
+        // Ne pas lire dans `desc` si `desc` chevauche `[view_addr + 40, view_addr + 48)`.
+        let collides_desc = desc_addr > view_addr && desc_addr - view_addr < 48;
+        if !collides_desc && vb.len() >= 48 {
+            let v = u64::from_le_bytes([
+                vb[40], vb[41], vb[42], vb[43], vb[44], vb[45], vb[46], vb[47],
+            ]);
+            if v >= 0x1_0000 && crate::gdk_xs::is_xmem_address(v as usize) {
+                return v;
+            }
+        }
+    }
+    if d.alignment >= 0x1_0000 && crate::gdk_xs::is_xmem_address(d.alignment as usize) {
+        return d.alignment;
+    }
+    0
+}
+
 /// Slot 70 du périphérique **console** : sur console Xbox Series X, sert à créer une vue
-/// (SRV/UAV) directement depuis un `D3D12_RESOURCE_DESC*` en `a2` vers un descripteur en `a4`
-/// (sans allouer de ressource), ou une ressource si une paire `(REFIID == IID_ID3D12Resource, ppv)`
-/// est fournie dans `a3..=a8`.
+/// (SRV) directement depuis `(D3D12_RESOURCE_DESC*, D3D12_SHADER_RESOURCE_VIEW_DESC + GPU VA à
+/// +0x28, D3D12_CPU_DESCRIPTOR_HANDLE)` sans allouer d'`ID3D12Resource`, ou une ressource si une
+/// paire `(REFIID == IID_ID3D12Resource, ppv)` est fournie dans `a3..=a8`.
 #[allow(clippy::too_many_arguments)]
 extern "win64" fn device_slot70(
     _this: *mut D3D12DeviceObject,
@@ -6095,13 +6269,14 @@ extern "win64" fn device_slot70(
     a7: usize,
     a8: usize,
 ) -> HResult {
+    let desc_addr = desc as usize;
     if desc.is_null()
-        || sb_loader::trampoline::peek_memory(desc as usize, size_of::<D3D12ResourceDesc>()).len()
+        || sb_loader::trampoline::peek_memory(desc_addr, size_of::<D3D12ResourceDesc>()).len()
             != size_of::<D3D12ResourceDesc>()
     {
         return E_POINTER;
     }
-    // SAFETY: `desc` vérifié lisible via `peek_memory`.
+    // SAFETY: `desc` vérifié lisible sur `size_of::<D3D12ResourceDesc>()` octets via `peek_memory`.
     let d = unsafe { ptr::read_unaligned(desc) };
     let tail = [a3, a4, a5, a6, a7, a8];
     for i in 0..tail.len() - 1 {
@@ -6128,14 +6303,50 @@ extern "win64" fn device_slot70(
             }
         }
     }
-    sb_debug!(
-        CHANNEL,
-        "slot 70 : vue console depuis descripteur (dim={}, w={}, h={}, fmt={}, view_desc={a3:#x}, dest={a4:#x}) -> S_OK",
-        d.dimension,
-        d.width,
-        d.height,
-        d.format
-    );
+    let view_full = if a3 >= 0x1_0000 {
+        let b = sb_loader::trampoline::peek_memory(a3, 48);
+        if b.is_empty() { None } else { Some(b) }
+    } else {
+        None
+    };
+    let placed_va = extract_slot70_placed_va(&d, desc_addr, a3, view_full.as_deref());
+    let mut wrote = false;
+    if placed_va != 0 && a4 != 0 {
+        let clean_d = sanitize_console_resource_desc(d);
+        let rv = crate::d3d12_views::ResourceView {
+            desc: &clean_d,
+            address: placed_va,
+        };
+        if let Some(slot) = crate::d3d12_views::srv_slot(&rv, view_full.as_deref()) {
+            let compact = if clean_d.dimension == 1 {
+                16
+            } else {
+                crate::d3d12_views::SLOT_BYTES
+            };
+            wrote = write_descriptor_slot_compact(a4, &slot, compact);
+        }
+    }
+    static LOGGED_VIEW: AtomicU32 = AtomicU32::new(0);
+    if LOGGED_VIEW.fetch_add(1, Ordering::Relaxed) < 4 {
+        sb_info!(
+            CHANNEL,
+            "slot 70 : SRV mémoire placée (dim={}, w={}, h={}, fmt={}, flags={:#x}, va={placed_va:#x}, dest={a4:#x}, wrote={wrote}) -> S_OK",
+            d.dimension,
+            d.width,
+            d.height,
+            d.format,
+            d.flags
+        );
+    } else {
+        sb_debug!(
+            CHANNEL,
+            "slot 70 : SRV mémoire placée (dim={}, w={}, h={}, fmt={}, va={placed_va:#x}, dest={a4:#x}, wrote={wrote}) -> S_OK",
+            d.dimension,
+            d.width,
+            d.height,
+            d.format
+        );
+    }
     S_OK
 }
 
@@ -6165,7 +6376,7 @@ extern "win64" fn device_slot127(
         return E_POINTER;
     }
     // SAFETY: `desc` est un `D3D12ResourceDesc` valide fourni par le titre.
-    let d = unsafe { *desc };
+    let d = sanitize_console_resource_desc(unsafe { ptr::read_unaligned(desc) });
     let res = alloc_d3d12_resource(d, false);
     // SAFETY: `ppv` vérifié non-nul ; `res` est un objet `ID3D12Resource` du bridge.
     unsafe { *ppv = res.cast() };
@@ -6543,6 +6754,7 @@ extern "win64" fn device_create_derived_pso(
                 (&raw const D3D12_PSO_VTBL).cast(),
                 "ID3D12PipelineState",
             )),
+            console_inline_pad: [0u8; 32],
             pipeline_id,
             is_compute,
             native: None,
@@ -6612,6 +6824,7 @@ fn create_console_pso_multi_arg(
             (&raw const D3D12_PSO_VTBL).cast(),
             "ID3D12PipelineState",
         )),
+        console_inline_pad: [0u8; 32],
         pipeline_id: 0,
         is_compute,
         native: None,
@@ -6664,6 +6877,8 @@ extern "win64" fn device_deserialize_graphics_pso_x(
 }
 
 /// Slot 67 console : `DeserializeComputePipelineStateX(..., riid, ppvPipelineState)`.
+/// Inspecte le préfixe FSPX (`root_signature` à `+0x00`, paires `kind0/1/6/7` à `+0x08..+0x48`)
+/// lorsqu'il est mappé, puis crée l'objet `ID3D12PipelineState`.
 #[allow(clippy::too_many_arguments)]
 extern "win64" fn device_deserialize_compute_pso_x(
     _this: *mut D3D12DeviceObject,
@@ -6675,6 +6890,34 @@ extern "win64" fn device_deserialize_compute_pso_x(
     a7: usize,
 ) -> HResult {
     ffi_guard!(CHANNEL, "DeserializeComputePipelineStateX", E_UNEXPECTED, {
+        if a2 >= 0x1_0000 {
+            let hdr = sb_loader::trampoline::peek_memory(a2, 0x48);
+            if hdr.len() == 0x48 {
+                let rd64 = |o: usize| {
+                    u64::from_le_bytes([
+                        hdr[o],
+                        hdr[o + 1],
+                        hdr[o + 2],
+                        hdr[o + 3],
+                        hdr[o + 4],
+                        hdr[o + 5],
+                        hdr[o + 6],
+                        hdr[o + 7],
+                    ])
+                };
+                let k0_sz = rd64(0x10);
+                let k1_sz = rd64(0x20);
+                let k6_sz = rd64(0x30);
+                let k7_sz = rd64(0x40);
+                if k6_sz > 0 && k6_sz < 16 * 1024 * 1024 {
+                    sb_debug!(
+                        CHANNEL,
+                        "DeserializeComputePipelineStateX FSPX(rs={:#x}, kind0={k0_sz}o, kind1={k1_sz}o, kind6={k6_sz}o, kind7={k7_sz}o)",
+                        rd64(0x00)
+                    );
+                }
+            }
+        }
         static LOGGED: AtomicU32 = AtomicU32::new(0);
         create_console_pso_multi_arg(
             "DeserializeComputePipelineStateX",
@@ -6708,11 +6951,17 @@ extern "win64" fn device_set_frame_interval_x(
         dev.shared
             .frame_interval_us
             .store(clamped, Ordering::Release);
+        let now_us = dev.shared.elapsed_us();
+        let hr = dev
+            .shared
+            .pacer
+            .lock()
+            .set_frame_interval(now_us, clamped, period.max(1), flags);
         sb_debug!(
             CHANNEL,
-            "ID3D12Device::SetFrameIntervalX(interval_us={clamped}, period={period}, flags={flags:#x}) -> S_OK"
+            "ID3D12Device::SetFrameIntervalX(interval_us={clamped}, period={period}, flags={flags:#x}) -> {hr:#x}"
         );
-        S_OK
+        hr
     })
 }
 
@@ -6728,6 +6977,15 @@ extern "win64" fn device_schedule_frame_event_x(
         if this.is_null() {
             return E_INVALIDARG;
         }
+        // SAFETY: `this` vérifié non-nul.
+        let dev = unsafe { &*this };
+        let now_us = dev.shared.elapsed_us();
+        let _ = dev.shared.pacer.lock().schedule_frame_event(
+            now_us,
+            event_type,
+            offset_us.min(u64::from(u32::MAX)) as u32,
+            flags,
+        );
         if !ancillary.is_null() {
             // SAFETY: `ancillary` pointe vers un `D3D12XboxFrameObjectList` valide.
             let list = unsafe { ptr::read_unaligned(ancillary) };
@@ -6768,7 +7026,11 @@ extern "win64" fn device_wait_frame_event_x(
         }
         // SAFETY: `this` vérifié non-nul.
         let dev = unsafe { &*this };
-        let token = dev.shared.alloc_frame_token();
+        let now_us = dev.shared.elapsed_us();
+        let token = match dev.shared.pacer.lock().wait_frame_event(now_us, event_type) {
+            Ok(tok) => tok,
+            Err(hr) => return hr,
+        };
         if !out_token.is_null() {
             // SAFETY: `out_token` vérifié non-nul.
             unsafe { ptr::write_unaligned(out_token, token) };
@@ -6784,7 +7046,7 @@ extern "win64" fn device_wait_frame_event_x(
 /// Slot 81 console : `GetFrameStatisticsX(token, typeMask, pInOutCount, pStats)`.
 extern "win64" fn device_get_frame_statistics_x(
     this: *mut D3D12DeviceObject,
-    _token: u64,
+    token: u64,
     type_mask: u32,
     in_out_count: *mut u32,
     stats: *mut D3D12XboxFrameStatistics,
@@ -6798,31 +7060,32 @@ extern "win64" fn device_get_frame_statistics_x(
         }
         // SAFETY: `this` et `in_out_count` vérifiés non-nuls.
         let dev = unsafe { &*this };
-        let cap = unsafe { ptr::read_unaligned(in_out_count) };
+        let cap = unsafe { ptr::read_unaligned(in_out_count) } as usize;
+        let now_us = dev.shared.elapsed_us();
+        let records = dev
+            .shared
+            .pacer
+            .lock()
+            .get_statistics(now_us, token, type_mask);
         if cap == 0 || stats.is_null() {
             // SAFETY: `in_out_count` vérifié non-nul.
-            unsafe { ptr::write_unaligned(in_out_count, 1) };
+            unsafe { ptr::write_unaligned(in_out_count, records.len().max(1) as u32) };
             return S_OK;
         }
-        let now_us = dev.shared.elapsed_us();
-        let interval = u64::from(dev.shared.frame_interval_us.load(Ordering::Acquire));
-        let stat_type = if type_mask != 0 {
-            1u32 << type_mask.trailing_zeros()
-        } else {
-            1
-        };
-        let rec = D3D12XboxFrameStatistics {
-            stat_type,
-            _pad0: 0,
-            reserved: 0,
-            origin_time_us: now_us,
-            flip_time_us: now_us.saturating_add(interval),
-        };
-        // SAFETY: `stats` vérifié non-nul et `cap >= 1`.
-        unsafe {
-            ptr::write_unaligned(stats, rec);
-            ptr::write_unaligned(in_out_count, 1);
+        let n = cap.min(records.len());
+        for (i, r) in records.iter().take(n).enumerate() {
+            let rec = D3D12XboxFrameStatistics {
+                stat_type: r.stat_type,
+                _pad0: r.plane_index,
+                reserved: r.token,
+                origin_time_us: r.origin_time_us,
+                flip_time_us: r.flip_time_us,
+            };
+            // SAFETY: `stats` vérifié non-nul et `i < cap`.
+            unsafe { ptr::write_unaligned(stats.add(i), rec) };
         }
+        // SAFETY: `in_out_count` vérifié non-nul.
+        unsafe { ptr::write_unaligned(in_out_count, n as u32) };
         S_OK
     })
 }
@@ -6875,7 +7138,7 @@ extern "win64" fn device_create_placed_resource_x(
             return E_POINTER;
         }
         // SAFETY: `desc` vérifié non-nul.
-        let d = unsafe { ptr::read_unaligned(desc) };
+        let d = sanitize_console_resource_desc(unsafe { ptr::read_unaligned(desc) });
         let byte_len = compute_resource_byte_len(d);
         let addr = gpu_va as usize;
         let res = if addr >= 0x1_0000 && sb_loader::trampoline::peek_memory(addr, 1).len() == 1 {
@@ -7065,7 +7328,7 @@ pub(crate) extern "win64" fn D3D12GetDebugInterface(
 
 pub(crate) extern "win64" fn D3D12SerializeRootSignature(
     desc: *const c_void,
-    _version: u32,
+    version: u32,
     out_blob: *mut *mut c_void,
     out_error_blob: *mut *mut c_void,
 ) -> HResult {
@@ -7079,37 +7342,168 @@ pub(crate) extern "win64" fn D3D12SerializeRootSignature(
         if out_blob.is_null() {
             return E_POINTER;
         }
-        let mut data = Vec::from(*b"SBRS");
+        let ver = version.clamp(1, 3);
+        let use_v11 = ver >= 2;
+        let use_v12_samplers = ver >= 3;
+        let mut parsed = ParsedRootSignature {
+            version: ver,
+            flags: 0,
+            params: Vec::new(),
+            static_samplers: Vec::new(),
+        };
         if !desc.is_null() {
             // SAFETY: `desc` pointe vers un `D3D12RootSignatureDesc` valide.
-            let rs_desc = unsafe { &*(desc.cast::<D3D12RootSignatureDesc>()) };
-            let n = (rs_desc.num_parameters as usize).min(32);
+            let rs_desc = unsafe { ptr::read_unaligned(desc.cast::<D3D12RootSignatureDesc>()) };
+            parsed.flags = clear_xbox_root_sig_flags(rs_desc.flags);
+            let n = (rs_desc.num_parameters as usize).min(64);
             if n > 0 && !rs_desc.parameters.is_null() {
-                data.extend_from_slice(&(n as u32).to_le_bytes());
                 // SAFETY: `parameters[..n]` valide.
                 let params = unsafe { std::slice::from_raw_parts(rs_desc.parameters, n) };
                 for p in params {
-                    let shader_reg = if p.parameter_type == 0 { 0 } else { p.data0 };
-                    data.extend_from_slice(&shader_reg.to_le_bytes());
+                    match p.parameter_type {
+                        0 => {
+                            let nranges = (p.data0 as usize).min(1024);
+                            let rptr = p.data2 as usize;
+                            let mut ranges = Vec::with_capacity(nranges);
+                            if nranges > 0 && rptr >= 0x1_0000 {
+                                let stride = if use_v11 {
+                                    size_of::<D3D12DescriptorRange1Abi>()
+                                } else {
+                                    size_of::<D3D12DescriptorRangeAbi>()
+                                };
+                                if sb_loader::trampoline::peek_memory(rptr, nranges * stride).len()
+                                    == nranges * stride
+                                {
+                                    for j in 0..nranges {
+                                        if use_v11 {
+                                            // SAFETY: vérifié lisible via `peek_memory`.
+                                            let r = unsafe {
+                                                ptr::read_unaligned(
+                                                    (rptr as *const D3D12DescriptorRange1Abi)
+                                                        .add(j),
+                                                )
+                                            };
+                                            ranges.push(RsDescriptorRange {
+                                                range_type: r.range_type,
+                                                num_descriptors: r.num_descriptors,
+                                                base_shader_register: r.base_shader_register,
+                                                register_space: r.register_space,
+                                                flags: r.flags,
+                                                offset_in_table: r.offset_in_table,
+                                            });
+                                        } else {
+                                            // SAFETY: vérifié lisible via `peek_memory`.
+                                            let r = unsafe {
+                                                ptr::read_unaligned(
+                                                    (rptr as *const D3D12DescriptorRangeAbi).add(j),
+                                                )
+                                            };
+                                            ranges.push(RsDescriptorRange {
+                                                range_type: r.range_type,
+                                                num_descriptors: r.num_descriptors,
+                                                base_shader_register: r.base_shader_register,
+                                                register_space: r.register_space,
+                                                flags: 0,
+                                                offset_in_table: r.offset_in_table,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            let first_reg = ranges.first().map_or(0, |r| r.base_shader_register);
+                            parsed.params.push(RsRootParam {
+                                kind: RootParamKind::Table,
+                                visibility: p.shader_visibility,
+                                shader_register: first_reg,
+                                register_space: 0,
+                                num_values: 0,
+                                descriptor_flags: 0,
+                                ranges,
+                            });
+                        }
+                        1 => {
+                            parsed.params.push(RsRootParam {
+                                kind: RootParamKind::Constants,
+                                visibility: p.shader_visibility,
+                                shader_register: p.data0,
+                                register_space: p.data1,
+                                num_values: (p.data2 & 0xFFFF_FFFF) as u32,
+                                descriptor_flags: 0,
+                                ranges: Vec::new(),
+                            });
+                        }
+                        2..=4 => {
+                            let kind = match p.parameter_type {
+                                2 => RootParamKind::Cbv,
+                                3 => RootParamKind::Srv,
+                                _ => RootParamKind::Uav,
+                            };
+                            parsed.params.push(RsRootParam {
+                                kind,
+                                visibility: p.shader_visibility,
+                                shader_register: p.data0,
+                                register_space: p.data1,
+                                num_values: 0,
+                                descriptor_flags: if use_v11 {
+                                    (p.data2 & 0xFFFF_FFFF) as u32
+                                } else {
+                                    0
+                                },
+                                ranges: Vec::new(),
+                            });
+                        }
+                        _ => {}
+                    }
                 }
-                // Extension (lue par `CreateRootSignature`) : nature et nombre de dwords de chaque
-                // paramètre, pour le compactage user-SGPR du chemin natif RDNA 2. Les lecteurs
-                // anciens ne lisent que les `n` registres ci-dessus.
-                for p in params {
-                    let num_values = if p.parameter_type == 1 {
-                        (p.data2 & 0xFFFF_FFFF) as u32
-                    } else {
-                        0
-                    };
-                    data.extend_from_slice(&p.parameter_type.to_le_bytes());
-                    data.extend_from_slice(&num_values.to_le_bytes());
-                }
-            } else {
-                data.extend_from_slice(&0u32.to_le_bytes());
             }
-        } else {
-            data.extend_from_slice(&0u32.to_le_bytes());
+            let ns = (rs_desc.num_static_samplers as usize).min(256);
+            if ns > 0 && !rs_desc.static_samplers.is_null() {
+                let sptr = rs_desc.static_samplers as usize;
+                let stride = if use_v12_samplers {
+                    size_of::<D3D12StaticSamplerDesc1Abi>()
+                } else {
+                    size_of::<D3D12StaticSamplerDescAbi>()
+                };
+                if sb_loader::trampoline::peek_memory(sptr, ns * stride).len() == ns * stride {
+                    for j in 0..ns {
+                        let (base, sflags) = if use_v12_samplers {
+                            // SAFETY: vérifié lisible via `peek_memory`.
+                            let s = unsafe {
+                                ptr::read_unaligned(
+                                    (sptr as *const D3D12StaticSamplerDesc1Abi).add(j),
+                                )
+                            };
+                            (s.base, s.flags)
+                        } else {
+                            // SAFETY: vérifié lisible via `peek_memory`.
+                            let s = unsafe {
+                                ptr::read_unaligned(
+                                    (sptr as *const D3D12StaticSamplerDescAbi).add(j),
+                                )
+                            };
+                            (s, 0)
+                        };
+                        parsed.static_samplers.push(RsStaticSampler {
+                            filter: base.filter,
+                            address_u: base.address_u,
+                            address_v: base.address_v,
+                            address_w: base.address_w,
+                            mip_lod_bias: base.mip_lod_bias,
+                            max_anisotropy: base.max_anisotropy,
+                            comparison_func: base.comparison_func,
+                            border_color: base.border_color,
+                            min_lod: base.min_lod,
+                            max_lod: base.max_lod,
+                            shader_register: base.shader_register,
+                            register_space: base.register_space,
+                            visibility: base.shader_visibility,
+                            flags: sflags,
+                        });
+                    }
+                }
+            }
         }
+        let data = serialize_rts0_dxbc(&parsed);
         let blob = Box::new(D3DBlobObject {
             header: ComHeader::new((&raw const D3D_BLOB_VTBL).cast()),
             data,
@@ -7474,8 +7868,8 @@ pub(crate) extern "win64" fn D3D10CreateBlob(
 
 /// `HRESULT D3D12CreateRootSignatureDeserializer(pSrcData, SrcDataSizeInBytes, pInterface, ppDeserializer)`.
 pub(crate) extern "win64" fn D3D12CreateRootSignatureDeserializer(
-    _src_data: *const c_void,
-    _src_len: usize,
+    src_data: *const c_void,
+    src_len: usize,
     _riid: *const Guid,
     out_deserializer: *mut *mut c_void,
 ) -> HResult {
@@ -7487,33 +7881,31 @@ pub(crate) extern "win64" fn D3D12CreateRootSignatureDeserializer(
             if out_deserializer.is_null() {
                 return E_POINTER;
             }
-            let obj = Box::new(D3D12RootSigDeserObject {
-                header: ComHeader::new((&raw const D3D12_ROOTSIG_DESER_VTBL).cast()),
-                desc: D3D12VersionedRootSignatureDesc {
+            let parsed = if !src_data.is_null() && src_len >= 4 {
+                // SAFETY: `src_data[..src_len]` est le blob de signature racine passé par le titre.
+                let bytes = unsafe { std::slice::from_raw_parts(src_data.cast::<u8>(), src_len) };
+                parse_rts0(bytes).unwrap_or_else(|_| ParsedRootSignature {
                     version: 1,
-                    _pad0: 0,
-                    desc: D3D12RootSignatureDesc {
-                        num_parameters: 0,
-                        _pad0: 0,
-                        parameters: ptr::null(),
-                        num_static_samplers: 0,
-                        _pad1: 0,
-                        static_samplers: ptr::null(),
-                        flags: 0,
-                        _pad2: 0,
-                    },
-                },
-                _owned_params: Vec::new(),
-                _owned_ranges_v10: Vec::new(),
-                _owned_ranges_v11: Vec::new(),
-                _owned_samplers_v10: Vec::new(),
-                _owned_samplers_v12: Vec::new(),
-            });
+                    flags: 0,
+                    params: Vec::new(),
+                    static_samplers: Vec::new(),
+                })
+            } else {
+                ParsedRootSignature {
+                    version: 1,
+                    flags: 0,
+                    params: Vec::new(),
+                    static_samplers: Vec::new(),
+                }
+            };
+            let nparams = parsed.params.len();
+            let nsamplers = parsed.static_samplers.len();
+            let obj = D3D12RootSigDeserObject::from_parsed(&parsed);
             // SAFETY: `out_deserializer` vérifié non-nul.
             unsafe { *out_deserializer = Box::into_raw(obj).cast() };
             sb_debug!(
                 CHANNEL,
-                "D3D12CreateRootSignatureDeserializer(len={_src_len}) -> S_OK"
+                "D3D12CreateRootSignatureDeserializer(len={src_len}, params={nparams}, samplers={nsamplers}) -> S_OK"
             );
             S_OK
         }
@@ -7831,6 +8223,35 @@ mod xbox_ext_tests {
             S_OK
         );
         assert_ne!(heap_get_cpu_start(out2.cast()), 0x1234);
+
+        // Pointeur XMem non aligné sur 4 KiB à l'octet 16 -> ignoré (ne pas écraser une structure).
+        let unaligned_addr = region + 0x340;
+        let unaligned: [u64; 3] = [1 << 32, 0, unaligned_addr as u64];
+        let mut out3: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            device_create_descriptor_heap(
+                core::ptr::null_mut(),
+                unaligned.as_ptr().cast(),
+                core::ptr::null(),
+                &mut out3
+            ),
+            S_OK
+        );
+        assert_ne!(heap_get_cpu_start(out3.cast()), unaligned_addr);
+
+        // Pointeur XMem aligné mais situé à l'octet 24+ (variable de pile voisine) -> ignoré.
+        let stale_stack: [u64; 4] = [1 << 32, 0, 0, given as u64];
+        let mut out4: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            device_create_descriptor_heap(
+                core::ptr::null_mut(),
+                stale_stack.as_ptr().cast(),
+                core::ptr::null(),
+                &mut out4
+            ),
+            S_OK
+        );
+        assert_ne!(heap_get_cpu_start(out4.cast()), given);
     }
 
     /// Chaque vtable D3D12 / DXGI couvre `VT_PAD_LEN` slots : un titre qui appelle une méthode
@@ -8898,20 +9319,13 @@ extern "win64" fn dxgi_device_qi(
     )
 }
 
-/// `IDXGIDevice::GetParent(riid, ppParent)` : l'objet parent (l'adaptateur).
+/// `IDXGIDevice::GetParent(riid, ppParent)` : renvoie un adaptateur DXGI valide.
 extern "win64" fn dxgi_device_get_parent(
     this: *mut DxgiDeviceObject,
-    riid: *const Guid,
+    _riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> HResult {
-    if ppv.is_null() {
-        return E_POINTER;
-    }
-    // SAFETY: `ppv` vérifié non-nul ; aucune adaptation en place, on renvoie null.
-    unsafe { *ppv = ptr::null_mut() };
-    let _ = (this, riid);
-    sb_debug!("dxgi", "IDXGIDevice::GetParent -> S_OK (ppv=null)");
-    S_OK
+    dxgi_device_get_adapter(this, ppv)
 }
 
 /// `IDXGIDevice::GetAdapter` : renvoie un adaptateur DXGI minimal (le titre s'en sert pour
@@ -9353,13 +9767,31 @@ extern "win64" fn dxgi_output_console_slot21(
     S_OK
 }
 
+/// `IDXGIAdapter::GetParent(riid, ppParent)` : renvoie une fabrique `IDXGIFactory4`.
+extern "win64" fn dxgi_adapter_get_parent(
+    _this: *mut DxgiAdapterObject,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    CreateDXGIFactory1(riid, ppv)
+}
+
+/// `IDXGIOutput::GetParent(riid, ppParent)` : renvoie un `IDXGIAdapter`.
+extern "win64" fn dxgi_output_get_parent(
+    _this: *mut DxgiOutputObject,
+    _riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    dxgi_device_get_adapter(ptr::null_mut(), ppv)
+}
+
 const fn build_dxgi_adapter_vtbl() -> DxgiAdapterVtbl {
     let mut slots = UNIMPL_SLOTS;
     slots[0] = vslot(dxgi_adapter_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
     fill_dxgi_object_slots(&mut slots);
-    slots[6] = vslot(noop_ok as *const c_void); // GetParent
+    slots[6] = vslot(dxgi_adapter_get_parent as *const c_void);
     slots[7] = vslot(dxgi_adapter_enum_outputs as *const c_void);
     slots[8] = vslot(dxgi_adapter_get_desc as *const c_void);
     slots[9] = vslot(dxgi_adapter_check_interface_support as *const c_void);
@@ -9374,7 +9806,7 @@ const fn build_dxgi_output_vtbl() -> DxgiOutputVtbl {
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
     fill_dxgi_object_slots(&mut slots);
-    slots[6] = vslot(noop_ok as *const c_void); // GetParent
+    slots[6] = vslot(dxgi_output_get_parent as *const c_void);
     slots[7] = vslot(dxgi_output_get_desc as *const c_void);
     slots[8] = vslot(dxgi_output_get_display_mode_list as *const c_void);
     slots[10] = vslot(noop_ok as *const c_void); // WaitForVBlank
@@ -10468,5 +10900,443 @@ mod tests {
             S_OK
         );
         assert_eq!((c_mode.width, c_mode.height), (3840, 2160));
+    }
+
+    #[test]
+    fn rts0_roundtrip_pso_slot11_alloc_slot9_and_extended_iids() {
+        let _guard = D3D_TEST_SERIAL.lock();
+
+        // 1. Sérialisation -> Désérialisation RTS0 avec nettoyage du drapeau haut Xbox (0x03000000).
+        let params = [
+            D3D12RootParameter {
+                parameter_type: 2, // CBV
+                _pad0: 0,
+                data0: 1, // b1
+                data1: 0,
+                data2: 0,
+                shader_visibility: 0,
+                _pad1: 0,
+            },
+            D3D12RootParameter {
+                parameter_type: 1, // 32-bit constants
+                _pad0: 0,
+                data0: 2, // b2
+                data1: 0,
+                data2: 4, // 4 dwords
+                shader_visibility: 1,
+                _pad1: 0,
+            },
+        ];
+        let rs_desc = D3D12RootSignatureDesc {
+            num_parameters: params.len() as u32,
+            _pad0: 0,
+            parameters: params.as_ptr(),
+            num_static_samplers: 0,
+            _pad1: 0,
+            static_samplers: ptr::null(),
+            flags: 0x0300_0001,
+            _pad2: 0,
+        };
+        let mut blob_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            D3D12SerializeRootSignature(
+                (&raw const rs_desc).cast(),
+                1,
+                &mut blob_ptr,
+                ptr::null_mut()
+            ),
+            S_OK
+        );
+        assert!(!blob_ptr.is_null());
+        // SAFETY: `blob_ptr` provient de `D3D12SerializeRootSignature`.
+        let blob = unsafe { &*(blob_ptr.cast::<D3DBlobObject>()) };
+        assert_eq!(&blob.data[0..4], b"DXBC");
+
+        let mut deser_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            D3D12CreateRootSignatureDeserializer(
+                blob.data.as_ptr().cast(),
+                blob.data.len(),
+                &IID_ID3D12ROOTSIGNATUREDESERIALIZER,
+                &mut deser_ptr
+            ),
+            S_OK
+        );
+        let got_desc = rootsig_deser_get_desc(deser_ptr.cast());
+        assert!(!got_desc.is_null());
+        // SAFETY: `got_desc` retourné par `rootsig_deser_get_desc`.
+        let got = unsafe { &*got_desc };
+        assert_eq!(got.num_parameters, 2);
+        assert_eq!(got.flags, 1, "octet haut Xbox effacé");
+        assert!(!got.parameters.is_null());
+        // SAFETY: `got.num_parameters == 2`.
+        let got_params = unsafe { std::slice::from_raw_parts(got.parameters, 2) };
+        assert_eq!((got_params[0].parameter_type, got_params[0].data0), (2, 1));
+        assert_eq!(
+            (
+                got_params[1].parameter_type,
+                got_params[1].data0,
+                got_params[1].data2
+            ),
+            (1, 2, 4)
+        );
+
+        // 2. Device IIDs 5..10 + CommandList IIDs 3..7 + CommandAllocator::slot 9 + PSO::slot 11.
+        let mut dev_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            D3D12CreateDevice(ptr::null_mut(), 0xc200, &IID_ID3D12DEVICE, &mut dev_ptr),
+            S_OK
+        );
+        for iid in [
+            IID_ID3D12DEVICE5,
+            IID_ID3D12DEVICE8,
+            IID_ID3D12DEVICE9,
+            IID_ID3D12DEVICE10,
+        ] {
+            let mut iface: *mut c_void = ptr::null_mut();
+            assert_eq!(device_qi(dev_ptr.cast(), &iid, &mut iface), S_OK);
+            assert_eq!(iface, dev_ptr);
+        }
+
+        let mut alloc_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_allocator(
+                dev_ptr.cast(),
+                0,
+                &IID_ID3D12COMMANDALLOCATOR,
+                &mut alloc_ptr
+            ),
+            S_OK
+        );
+        assert_eq!(
+            alloc_slot9_set_callback(alloc_ptr.cast(), 0x1455_5DF10, 0x7F08_0000_1234, 0),
+            S_OK
+        );
+        // SAFETY: `alloc_ptr` est un `D3D12CmdAllocObject`.
+        let alloc_obj = unsafe { &*(alloc_ptr.cast::<D3D12CmdAllocObject>()) };
+        assert_eq!(alloc_obj.oom_callback.load(Ordering::Acquire), 0x1455_5DF10);
+        assert_eq!(
+            alloc_obj.oom_context.load(Ordering::Acquire),
+            0x7F08_0000_1234
+        );
+
+        let mut cl_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_list(
+                dev_ptr.cast(),
+                0,
+                0,
+                alloc_ptr.cast(),
+                ptr::null_mut(),
+                &IID_ID3D12GRAPHICSCOMMANDLIST,
+                &mut cl_ptr
+            ),
+            S_OK
+        );
+        for iid in [
+            IID_ID3D12COMMANDLIST,
+            IID_ID3D12GRAPHICSCOMMANDLIST4,
+            IID_ID3D12GRAPHICSCOMMANDLIST6,
+            IID_ID3D12GRAPHICSCOMMANDLIST7,
+        ] {
+            let mut iface: *mut c_void = ptr::null_mut();
+            assert_eq!(cmdlist_qi(cl_ptr.cast(), &iid, &mut iface), S_OK);
+            assert_eq!(iface, cl_ptr);
+        }
+
+        let mut pso_ptr: *mut c_void = ptr::null_mut();
+        let pso_iid = IID_ID3D12PIPELINESTATE;
+        assert_eq!(
+            device_deserialize_compute_pso_x(
+                dev_ptr.cast(),
+                0,
+                (&raw const pso_iid) as usize,
+                (&raw mut pso_ptr) as usize,
+                0,
+                0,
+                0
+            ),
+            S_OK
+        );
+        let mut scratch_blob: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            pso_slot11_get_scratch_blob(pso_ptr.cast(), 0, 0, &mut scratch_blob),
+            S_OK
+        );
+        assert!(!scratch_blob.is_null());
+        // SAFETY: `scratch_blob` provient de `pso_slot11_get_scratch_blob`.
+        let sb = unsafe { &*(scratch_blob.cast::<D3DBlobObject>()) };
+        assert_eq!(sb.data, [0, 0, 0, 0]);
+
+        // 3. FramePacer via `SetFrameIntervalX` -> `WaitFrameEventX` -> `GetFrameStatisticsX`.
+        assert_eq!(
+            device_set_frame_interval_x(dev_ptr.cast(), ptr::null_mut(), 16_667, 2, 0),
+            S_OK
+        );
+        assert_eq!(
+            device_schedule_frame_event_x(dev_ptr.cast(), 0, 0, ptr::null(), 0),
+            S_OK
+        );
+        let mut tok = 0u64;
+        assert_eq!(
+            device_wait_frame_event_x(dev_ptr.cast(), 0, 0, ptr::null(), 0, &mut tok),
+            S_OK
+        );
+        assert!(tok >= 1);
+        let mut stat_count = 2u32;
+        let mut stats = [D3D12XboxFrameStatistics::default(); 2];
+        assert_eq!(
+            device_get_frame_statistics_x(
+                dev_ptr.cast(),
+                tok,
+                0x18,
+                &mut stat_count,
+                stats.as_mut_ptr()
+            ),
+            S_OK
+        );
+        assert_eq!(stat_count, 2);
+        assert_eq!(stats[0].reserved, tok);
+    }
+
+    #[test]
+    fn cbv_xmem_staging_and_null_srv_zeroing() {
+        let _guard = D3D_TEST_SERIAL.lock();
+        let mut dev_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            D3D12CreateDevice(ptr::null_mut(), 0xC100, &IID_ID3D12DEVICE, &raw mut dev_ptr),
+            S_OK
+        );
+        let dev = dev_ptr.cast::<D3D12DeviceObject>();
+
+        // 1. CBV écrit dans un emplacement staging XMem (hors `DESC_HEAP_RANGES`).
+        let xmem_base = crate::gdk_xs::xmem_test_committed_region(4096);
+        assert_ne!(xmem_base, 0);
+        // SAFETY: `xmem_base` est une plage RW de 4096 octets allouée par `xmem_test_region`.
+        unsafe {
+            ptr::write_bytes(xmem_base as *mut u8, 0, 128);
+            // Cas A : octets 16..32 nuls -> écriture complète de 32 octets.
+            let cbv = D3D12ConstantBufferViewDesc {
+                buffer_location: 0x0000_7ef0_dc82_ff20,
+                size_in_bytes: 256,
+                _pad: 0,
+            };
+            device_create_cbv(dev, &raw const cbv, xmem_base);
+            let slot_a = std::slice::from_raw_parts(xmem_base as *const u8, 32);
+            let expected = crate::d3d12_views::cbv_slot(cbv.buffer_location, cbv.size_in_bytes);
+            assert_eq!(slot_a, &expected);
+
+            // Cas B : octets 16..32 non nuls -> seul le V# de 16 octets est écrit (sentinelle intacte).
+            let slot_b_addr = xmem_base + 64;
+            ptr::write_bytes((slot_b_addr + 16) as *mut u8, 0xA5, 16);
+            device_create_cbv(dev, &raw const cbv, slot_b_addr);
+            let slot_b = std::slice::from_raw_parts(slot_b_addr as *const u8, 32);
+            assert_eq!(&slot_b[..16], &expected[..16]);
+            assert!(slot_b[16..].iter().all(|&b| b == 0xA5));
+
+            // 2. SRV avec ressource NULL -> remet à zéro les 32 octets de l'emplacement.
+            device_create_srv(dev, ptr::null_mut(), ptr::null(), xmem_base);
+            let zeroed = std::slice::from_raw_parts(xmem_base as *const u8, 32);
+            assert!(zeroed.iter().all(|&b| b == 0));
+
+            // 3. `slot 70` (SRV mémoire placée) : écrit un V# GFX10 non nul avec l'adresse placée.
+            let placed_va = (xmem_base + 512) as u64;
+            let placed_res = D3D12ResourceDesc {
+                dimension: 1,
+                alignment: placed_va,
+                width: 6144,
+                height: 1,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: 0,
+                layout: 1,
+                ..D3D12ResourceDesc::default()
+            };
+            let mut srv_desc = [0u8; 40];
+            srv_desc[0..4].copy_from_slice(&39u32.to_le_bytes()); // DXGI_FORMAT_R32_TYPELESS
+            srv_desc[4..8].copy_from_slice(&1u32.to_le_bytes()); // BUFFER
+            srv_desc[8..12].copy_from_slice(&0x1688u32.to_le_bytes());
+            srv_desc[24..28].copy_from_slice(&(6144u32 / 4).to_le_bytes());
+            let slot70_dest = xmem_base + 128;
+            ptr::write_bytes(slot70_dest as *mut u8, 0, 32);
+            assert_eq!(
+                device_slot70(
+                    dev,
+                    &raw const placed_res,
+                    srv_desc.as_ptr() as usize,
+                    slot70_dest,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                S_OK
+            );
+            let written = std::slice::from_raw_parts(slot70_dest as *const u8, 16);
+            assert!(written.iter().any(|&b| b != 0));
+            let lo = u32::from_le_bytes([written[0], written[1], written[2], written[3]]) as u64;
+            let hi = (u32::from_le_bytes([written[4], written[5], written[6], written[7]]) & 0xFFFF)
+                as u64;
+            assert_eq!(lo | (hi << 32), placed_va);
+        }
+    }
+
+    #[test]
+    fn slot70_extracts_placed_va_at_view_desc_offset_40() {
+        let xmem_base = crate::gdk_xs::xmem_test_committed_region(0x10000);
+        assert_ne!(xmem_base, 0);
+
+        let dev = ptr::null_mut();
+        // 1. Buffer SRV aligné sur 256 octets : adresse placée en `view_desc[40..48]`.
+        let buf_va = (xmem_base + 0x1000) as u64;
+        let buf_desc = D3D12ResourceDesc {
+            dimension: 1,
+            alignment: 0,
+            width: 6144,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            layout: 1,
+            ..D3D12ResourceDesc::default()
+        };
+        let mut buf_view = [0u8; 48];
+        buf_view[0..4].copy_from_slice(&39u32.to_le_bytes());
+        buf_view[4..8].copy_from_slice(&1u32.to_le_bytes());
+        buf_view[8..12].copy_from_slice(&0x1688u32.to_le_bytes());
+        buf_view[24..28].copy_from_slice(&(6144u32 / 4).to_le_bytes());
+        buf_view[40..48].copy_from_slice(&buf_va.to_le_bytes());
+        let dest_buf = xmem_base + 0x200;
+        // SAFETY: `dest_buf` est dans une région XMem commise de 64 Kio.
+        unsafe {
+            ptr::write_bytes(dest_buf as *mut u8, 0, 32);
+            assert_eq!(
+                device_slot70(
+                    dev,
+                    &raw const buf_desc,
+                    buf_view.as_ptr() as usize,
+                    dest_buf,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                S_OK
+            );
+            let w = std::slice::from_raw_parts(dest_buf as *const u8, 16);
+            let lo = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as u64;
+            let hi = (u32::from_le_bytes([w[4], w[5], w[6], w[7]]) & 0xFFFF) as u64;
+            assert_eq!(lo | (hi << 32), buf_va);
+        }
+
+        // 2. Sous-tampon aligné sur 64 octets (`+0x1340`, `w=320`) : accepté sans filtre 256o.
+        let sub_va = (xmem_base + 0x1340) as u64;
+        assert_ne!(sub_va & 0xFF, 0);
+        let sub_desc = D3D12ResourceDesc {
+            width: 320,
+            ..buf_desc
+        };
+        let mut sub_view = buf_view;
+        sub_view[24..28].copy_from_slice(&(320u32 / 4).to_le_bytes());
+        sub_view[40..48].copy_from_slice(&sub_va.to_le_bytes());
+        let dest_sub = xmem_base + 0x220;
+        // SAFETY: `dest_sub` est dans la région XMem commise.
+        unsafe {
+            ptr::write_bytes(dest_sub as *mut u8, 0, 32);
+            assert_eq!(
+                device_slot70(
+                    dev,
+                    &raw const sub_desc,
+                    sub_view.as_ptr() as usize,
+                    dest_sub,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                S_OK
+            );
+            let w = std::slice::from_raw_parts(dest_sub as *const u8, 16);
+            let lo = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as u64;
+            let hi = (u32::from_le_bytes([w[4], w[5], w[6], w[7]]) & 0xFFFF) as u64;
+            assert_eq!(lo | (hi << 32), sub_va);
+        }
+
+        // 3. Texture 2D SRV (flags console 0x300000 assainis) : T# 32 octets avec `tex_va >> 8`.
+        let tex_va = (xmem_base + 0x2000) as u64;
+        let tex_desc = D3D12ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 256,
+            height: 128,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 61,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            layout: 0,
+            flags: 0x30_0000,
+            ..D3D12ResourceDesc::default()
+        };
+        let mut tex_view = [0u8; 48];
+        tex_view[0..4].copy_from_slice(&61u32.to_le_bytes());
+        tex_view[4..8].copy_from_slice(&4u32.to_le_bytes()); // TEXTURE2D
+        tex_view[8..12].copy_from_slice(&0x1688u32.to_le_bytes());
+        tex_view[20..24].copy_from_slice(&1u32.to_le_bytes()); // MipLevels = 1
+        tex_view[40..48].copy_from_slice(&tex_va.to_le_bytes());
+        let dest_tex = xmem_base + 0x240;
+        // SAFETY: `dest_tex` est dans la région XMem commise.
+        unsafe {
+            ptr::write_bytes(dest_tex as *mut u8, 0, 32);
+            assert_eq!(
+                device_slot70(
+                    dev,
+                    &raw const tex_desc,
+                    tex_view.as_ptr() as usize,
+                    dest_tex,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                S_OK
+            );
+            let w = std::slice::from_raw_parts(dest_tex as *const u8, 32);
+            let w0 = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as u64;
+            let w1 = (u32::from_le_bytes([w[4], w[5], w[6], w[7]]) & 0xFF) as u64;
+            assert_eq!(w0 | (w1 << 32), tex_va >> 8);
+        }
+
+        // 4. `a5` contenant un pointeur XMem résiduel n'est jamais adopté si `view_desc[40..48]==0`.
+        let mut zero_va_view = buf_view;
+        zero_va_view[40..48].fill(0);
+        let dest_untouched = xmem_base + 0x280;
+        // SAFETY: `dest_untouched` est dans la région XMem commise.
+        unsafe {
+            ptr::write_bytes(dest_untouched as *mut u8, 0xCC, 32);
+            assert_eq!(
+                device_slot70(
+                    dev,
+                    &raw const buf_desc,
+                    zero_va_view.as_ptr() as usize,
+                    dest_untouched,
+                    xmem_base + 0x3000,
+                    0,
+                    0,
+                    0,
+                ),
+                S_OK
+            );
+            let w = std::slice::from_raw_parts(dest_untouched as *const u8, 32);
+            assert!(w.iter().all(|&b| b == 0xCC));
+        }
+
+        // 5. Garde anti-débordement : si `desc` chevauche `view_desc + 40..48`, retourne 0.
+        assert_eq!(
+            extract_slot70_placed_va(&buf_desc, 0x2000 + 40, 0x2000, Some(&buf_view)),
+            0
+        );
     }
 }

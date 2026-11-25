@@ -233,6 +233,7 @@ pub fn api_trace_mode() -> ApiTraceMode {
 }
 
 const TRACE_RING: usize = 1024;
+const TRACE_SIG_RING: usize = 256;
 const TRACE_STRIDE: usize = 192;
 const TRACE_POOL_SIZE: usize = 1024 * 1024;
 
@@ -320,14 +321,89 @@ fn text_preview(addr: usize) -> Option<(u8, String)> {
 
 static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
 static TRACE_SLOTS: OnceLock<Vec<TraceSlot>> = OnceLock::new();
+static TRACE_SIG_SEQ: AtomicU64 = AtomicU64::new(0);
+static TRACE_SIG_SLOTS: OnceLock<Vec<TraceSlot>> = OnceLock::new();
 static TRACE_NAMES: OnceLock<RwLock<Vec<(String, String)>>> = OnceLock::new();
 
 fn trace_slots() -> &'static Vec<TraceSlot> {
     TRACE_SLOTS.get_or_init(|| (0..TRACE_RING).map(|_| TraceSlot::default()).collect())
 }
 
+fn trace_sig_slots() -> &'static Vec<TraceSlot> {
+    TRACE_SIG_SLOTS.get_or_init(|| (0..TRACE_SIG_RING).map(|_| TraceSlot::default()).collect())
+}
+
 fn trace_names() -> &'static RwLock<Vec<(String, String)>> {
     TRACE_NAMES.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Vrai pour les appels très fréquents (CRT mémoire/chaînes, synchro, compteurs) qui noient le
+/// tampon circulaire principal avant une faute.
+fn is_noisy_trace_api(sym: &str) -> bool {
+    matches!(
+        sym,
+        "memcpy"
+            | "memmove"
+            | "memset"
+            | "memcmp"
+            | "strcmp"
+            | "strncmp"
+            | "strlen"
+            | "wcslen"
+            | "_wcsnicmp"
+            | "_stricmp"
+            | "strchr"
+            | "EnterCriticalSection"
+            | "LeaveCriticalSection"
+            | "TryEnterCriticalSection"
+            | "WaitForSingleObject"
+            | "WaitForSingleObjectEx"
+            | "ReleaseMutex"
+            | "ReleaseSemaphore"
+            | "SetEvent"
+            | "ResetEvent"
+            | "AcquireSRWLockExclusive"
+            | "AcquireSRWLockShared"
+            | "ReleaseSRWLockExclusive"
+            | "ReleaseSRWLockShared"
+            | "WakeByAddressSingle"
+            | "WakeByAddressAll"
+            | "WaitOnAddress"
+            | "QueryPerformanceCounter"
+            | "Sleep"
+            | "SwitchToThread"
+            | "TlsGetValue"
+            | "TlsSetValue"
+            | "GetCurrentThreadId"
+            | "GetCurrentProcessorNumber"
+            | "GetLastError"
+            | "SetLastError"
+    )
+}
+
+fn write_trace_slot(slot: &TraceSlot, seq: u64, stub_id: u64, ret: u64, a: &[u64]) {
+    slot.id.store(stub_id, Ordering::Relaxed);
+    slot.ret.store(ret, Ordering::Relaxed);
+    for (dst, v) in slot.args.iter().zip(a) {
+        dst.store(*v, Ordering::Relaxed);
+    }
+    for (i, v) in a.iter().enumerate() {
+        let words = &slot.preview[i];
+        match text_preview(*v as usize) {
+            Some((kind, text)) => {
+                let bytes = text.as_bytes();
+                let len = bytes.len().min(PREVIEW_BYTES);
+                words[0].store(u64::from(kind) | ((len as u64) << 8), Ordering::Relaxed);
+                for (w, chunk) in words[1..].iter().zip(bytes[..len].chunks(8)) {
+                    let mut b = [0u8; 8];
+                    b[..chunk.len()].copy_from_slice(chunk);
+                    w.store(u64::from_le_bytes(b), Ordering::Relaxed);
+                }
+            }
+            None => words[0].store(0, Ordering::Relaxed),
+        }
+    }
+    slot.seq.store(seq, Ordering::Release);
 }
 
 /// Backtrace invité du premier appel à une API « de fin » (installation d'un filtre d'exception,
@@ -454,47 +530,41 @@ extern "win64" fn api_trace_dispatch(stub_id: u64, regs: *const u64) {
         // SAFETY: `regs` pointe vers 4 `u64` écrits par le thunk juste avant l'appel.
         let a = unsafe { core::slice::from_raw_parts(regs, 4) };
         let seq = TRACE_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
-        let slot = &trace_slots()[(seq as usize) % TRACE_RING];
-        slot.id.store(stub_id, Ordering::Relaxed);
         // SAFETY: le thunk range `regs` à `rsp+0x20` d'un cadre de 0x88 octets : l'adresse de retour
         // de l'appelant est à `rsp+0x88`, soit `regs + 0x68`.
         let ret = unsafe { regs.byte_add(0x68).read() };
-        slot.ret.store(ret, Ordering::Relaxed);
-        for (dst, v) in slot.args.iter().zip(a) {
-            dst.store(*v, Ordering::Relaxed);
-        }
-        // Aperçu des chaînes pointées, capturé maintenant : le tampon peut être réécrit plus tard.
-        for (i, v) in a.iter().enumerate() {
-            let words = &slot.preview[i];
-            match text_preview(*v as usize) {
-                Some((kind, text)) => {
-                    let bytes = text.as_bytes();
-                    let len = bytes.len().min(PREVIEW_BYTES);
-                    words[0].store(u64::from(kind) | ((len as u64) << 8), Ordering::Relaxed);
-                    for (w, chunk) in words[1..].iter().zip(bytes[..len].chunks(8)) {
-                        let mut b = [0u8; 8];
-                        b[..chunk.len()].copy_from_slice(chunk);
-                        w.store(u64::from_le_bytes(b), Ordering::Relaxed);
-                    }
-                }
-                None => words[0].store(0, Ordering::Relaxed),
+        write_trace_slot(
+            &trace_slots()[(seq as usize) % TRACE_RING],
+            seq,
+            stub_id,
+            ret,
+            a,
+        );
+        if let Some(names) = trace_names().try_read()
+            && let Some((dll, sym)) = names.get(stub_id as usize)
+        {
+            if !is_noisy_trace_api(sym) {
+                let sseq = TRACE_SIG_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+                write_trace_slot(
+                    &trace_sig_slots()[(sseq as usize) % TRACE_SIG_RING],
+                    sseq,
+                    stub_id,
+                    ret,
+                    a,
+                );
+            }
+            if api_trace_mode() == ApiTraceMode::Live {
+                sb_info!(
+                    "api",
+                    "{dll}!{sym}({:#x}, {:#x}, {:#x}, {:#x})",
+                    a[0],
+                    a[1],
+                    a[2],
+                    a[3]
+                );
             }
         }
         capture_fatal_path(stub_id, ret, regs as usize + 0x70);
-        slot.seq.store(seq, Ordering::Release);
-        if api_trace_mode() == ApiTraceMode::Live
-            && let Some(names) = trace_names().try_read()
-            && let Some((dll, sym)) = names.get(stub_id as usize)
-        {
-            sb_info!(
-                "api",
-                "{dll}!{sym}({:#x}, {:#x}, {:#x}, {:#x})",
-                a[0],
-                a[1],
-                a[2],
-                a[3]
-            );
-        }
     })
 }
 
@@ -583,21 +653,23 @@ pub fn allocate_trace_thunk(dll: &str, symbol: &str, target: usize) -> usize {
     slot_ptr as usize
 }
 
-/// Derniers appels d'API tracés (les plus anciens en premier), au plus `max`, formatés
-/// `dll!symbole(a1, a2, a3, a4)`. Vide si le traceur est désactivé. Lecture sans verrou bloquant
-/// (utilisable depuis un handler de signal).
-pub fn recent_api_calls(max: usize) -> Vec<String> {
-    let Some(slots) = TRACE_SLOTS.get() else {
-        return Vec::new();
-    };
+fn read_trace_ring(
+    slots: &[TraceSlot],
+    seq_counter: &AtomicU64,
+    ring_len: usize,
+    max: usize,
+) -> Vec<String> {
     let Some(names) = TRACE_NAMES.get().and_then(|n| n.try_read()) else {
         return Vec::new();
     };
-    let last = TRACE_SEQ.load(Ordering::Acquire);
-    let first = last.saturating_sub(max.min(TRACE_RING) as u64 - 1).max(1);
+    let last = seq_counter.load(Ordering::Acquire);
+    if last == 0 {
+        return Vec::new();
+    }
+    let first = last.saturating_sub(max.min(ring_len) as u64 - 1).max(1);
     let mut out = Vec::new();
     for seq in first..=last {
-        let slot = &slots[(seq as usize) % TRACE_RING];
+        let slot = &slots[(seq as usize) % ring_len];
         if slot.seq.load(Ordering::Acquire) != seq {
             continue; // entrée écrasée ou en cours d'écriture
         }
@@ -632,6 +704,24 @@ pub fn recent_api_calls(max: usize) -> Vec<String> {
         out.push(format!("#{seq} {dll}!{sym}({}){from}", args.join(", ")));
     }
     out
+}
+
+/// Derniers appels d'API tracés (les plus anciens en premier), au plus `max`, formatés
+/// `dll!symbole(a1, a2, a3, a4)`. Vide si le traceur est désactivé. Lecture sans verrou bloquant
+/// (utilisable depuis un handler de signal).
+pub fn recent_api_calls(max: usize) -> Vec<String> {
+    let Some(slots) = TRACE_SLOTS.get() else {
+        return Vec::new();
+    };
+    read_trace_ring(slots, &TRACE_SEQ, TRACE_RING, max)
+}
+
+/// Derniers appels d'API significatifs (hors CRT mémoire/chaînes et synchro), au plus `max`.
+pub fn recent_significant_api_calls(max: usize) -> Vec<String> {
+    let Some(slots) = TRACE_SIG_SLOTS.get() else {
+        return Vec::new();
+    };
+    read_trace_ring(slots, &TRACE_SIG_SEQ, TRACE_SIG_RING, max)
 }
 
 /// Vrai si `addr` est un trampoline JIT de symbole non implémenté (déjà tracé par lui-même).
