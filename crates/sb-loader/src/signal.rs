@@ -151,10 +151,11 @@ fn fatal_fault_report(
         "\n==================== [ScarletBridge FAULT] ====================\n\
          Signal   : {sig_name} ({sig})\n\
          RIP      : {rip:#018x} ({location})\n\
-         FaultAddr: {fault_addr:#018x}\n\
+         FaultAddr: {fault_addr:#018x}  [{}]\n\
          RSP      : {rsp:#018x}   RAX: {rax:#018x}\n\
          RCX (a1) : {rcx:#018x}   RDX (a2): {rdx:#018x}\n\
-         R8  (a3) : {r8:#018x}   R9  (a4): {r9:#018x}\n"
+         R8  (a3) : {r8:#018x}   R9  (a4): {r9:#018x}\n",
+        describe_mapping(fault_addr)
     );
     if sig == libc::SIGTRAP {
         msg.push_str(
@@ -324,6 +325,33 @@ fn append_detailed_state(msg: &mut String, ucontext: *mut libc::c_void) {
     append_detailed_regs(msg, &regs);
 }
 
+/// Décrit la région `[start, end)` de `/proc/self/maps` contenant `addr`
+/// (`start-end perms offset dev inode path`), ou `"non mappée"`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn describe_mapping(addr: usize) -> String {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return "? (/proc/self/maps illisible)".to_string();
+    };
+    for line in maps.lines() {
+        let Some((range, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+        if addr >= start && addr < end {
+            return format!("{range} {rest}");
+        }
+    }
+    "non mappée".to_string()
+}
+
 /// Registres nécessaires au rapport détaillé (issus d'un `ucontext_t` ou d'un `CONTEXT`).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 struct Regs {
@@ -381,6 +409,14 @@ fn append_detailed_regs(msg: &mut String, regs: &Regs) {
         let _ = writeln!(msg);
     }
 
+    // Contexte d'exécution : TEB/GS du thread fautif et régions `mmap` concernées. Un thread qui
+    // exécute du code invité sans `TEB` ScarletBridge hérite du `GS` de son créateur : ses accès
+    // `gs:[...]` (StackLimit, LastError, TLS) lisent alors le TEB d'un autre thread.
+    let _ = write!(msg, "{}", crate::teb::describe_current_teb());
+    if rsp != 0 {
+        let _ = writeln!(msg, "Map RSP  : {}", describe_mapping(rsp));
+    }
+
     if rsp != 0 && rsp.is_multiple_of(8) {
         let _ = writeln!(msg, "Pile     : (RSP+0x00..)");
         for i in 0..8usize {
@@ -392,6 +428,71 @@ fn append_detailed_regs(msg: &mut String, regs: &Regs) {
                 .map(|l| format!("  <- {l}"))
                 .unwrap_or_default();
             let _ = writeln!(msg, "  [rsp+{:#04x}] {v:#018x}{loc}", i * 8);
+        }
+    }
+
+    // Backtrace invitée `.pdata` (jusqu'à 16 trames) lorsque RIP appartient à un module PE chargé.
+    if module_manager().describe_address(rip).is_some() && rsp != 0 && rsp.is_multiple_of(8) {
+        let _ = writeln!(msg, "Backtrace invitée (.pdata) :");
+        // SAFETY: `Context` est une structure POD Win64.
+        let mut uw: crate::unwind::Context = unsafe { std::mem::zeroed() };
+        uw.rip = r.rip;
+        uw.rsp = r.rsp;
+        uw.rax = r.rax;
+        uw.rbx = r.rbx;
+        uw.rbp = r.rbp;
+        uw.rsi = r.rsi;
+        uw.rdi = r.rdi;
+        uw.r10 = r.r10;
+        uw.r11 = r.r11;
+        uw.r12 = r.r12;
+        uw.r13 = r.r13;
+        uw.r14 = r.r14;
+        uw.r15 = r.r15;
+        uw.eflags = r.efl as u32;
+        for frame in 0..16usize {
+            let pc = uw.rip as usize;
+            let Some(desc) = module_manager().describe_address(pc) else {
+                break;
+            };
+            let _ = writeln!(msg, "  #{frame:<2} {pc:#018x} ({desc})  rsp={:#x}", uw.rsp);
+            let prev_rsp = uw.rsp;
+            let step_pc = if frame == 0 { pc } else { pc.saturating_sub(1) };
+            let advanced = if let Some((base, func)) = crate::unwind::lookup_function_entry(step_pc)
+            {
+                if uw.rsp < 0x1_0000
+                    || !uw.rsp.is_multiple_of(8)
+                    || crate::trampoline::peek_memory(uw.rsp as usize, 16).len() != 16
+                {
+                    false
+                } else {
+                    // SAFETY: `func` provient de `.pdata` de `base` et `uw.rsp` est lisible.
+                    unsafe { crate::unwind::virtual_unwind(0, base, step_pc, func, &mut uw, None) }
+                        .is_some()
+                }
+            } else {
+                // Fonction feuille sans entrée `.pdata` : adresse de retour à `[rsp]`.
+                let ret_bytes = crate::trampoline::peek_memory(uw.rsp as usize, 8);
+                if ret_bytes.len() == 8 {
+                    uw.rip = u64::from_le_bytes([
+                        ret_bytes[0],
+                        ret_bytes[1],
+                        ret_bytes[2],
+                        ret_bytes[3],
+                        ret_bytes[4],
+                        ret_bytes[5],
+                        ret_bytes[6],
+                        ret_bytes[7],
+                    ]);
+                    uw.rsp = uw.rsp.saturating_add(8);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !advanced || uw.rip == 0 || uw.rsp <= prev_rsp {
+                break;
+            }
         }
     }
 

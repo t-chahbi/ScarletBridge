@@ -562,6 +562,10 @@ pub(crate) unsafe fn dispatch_exception(rec: *mut ExceptionRecord, ctx: *mut Con
                 (*ctx).rip,
                 &(&(*rec).exception_information)[..((*rec).number_parameters as usize).min(4)]
             );
+            seh_trace!(
+                "  thread : {}",
+                sb_loader::teb::describe_current_teb().trim_end()
+            );
         }
         seh_trace!(
             "dispatch code={:#010x} flags={:#x} rip={:#x} rsp={:#x}",
@@ -579,8 +583,22 @@ pub(crate) unsafe fn dispatch_exception(rec: *mut ExceptionRecord, ctx: *mut Con
         let mut new: Context = root;
         for _ in 0..MAX_FRAMES {
             let Some(info) = unwind_frame(UNW_FLAG_EHANDLER, &cur, &mut new) else {
+                seh_trace!(
+                    "  remontée interrompue : pc={:#x} rsp={:#x} (aucune trame .pdata/hôte) hôte={}",
+                    cur.rip,
+                    cur.rsp,
+                    sb_loader::signal::describe_host_address(cur.rip as usize)
+                        .unwrap_or_else(|| "?".to_string())
+                );
                 break;
             };
+            seh_trace!(
+                "  trame pc={:#x} rsp={:#x} handler={:#x} hop_hote={}",
+                info.control_pc,
+                cur.rsp,
+                info.handler,
+                info.host_hop
+            );
             if info.handler != 0 {
                 let mut disp = DispatcherContext {
                     control_pc: info.control_pc,

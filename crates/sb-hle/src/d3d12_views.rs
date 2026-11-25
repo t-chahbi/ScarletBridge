@@ -764,6 +764,7 @@ pub fn tile_subresource(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::d3d12_xs::{D3D12ResourceDesc, DxgiSampleDesc, texture_row_layout};
@@ -773,7 +774,7 @@ mod tests {
 
     fn words(slot: &SlotBytes) -> [u32; 8] {
         let mut w = [0u32; 8];
-        for (i, c) in slot.chunks_exact(4).enumerate() {
+        for (i, c) in slot.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
         }
         w

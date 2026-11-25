@@ -1,6 +1,8 @@
 //! Tests des vues de descripteurs écrites en mémoire matérielle (V#/T#/S#), des copies de
 //! descripteurs et du (dé)tuilage des copies de ressources (`d3d12_xs`).
 
+#![allow(clippy::unwrap_used)]
+
 use super::*;
 use crate::d3d12_views::SLOT_BYTES;
 use crate::gfx10_descriptors::{
@@ -46,7 +48,7 @@ fn read_slot(addr: usize) -> [u8; SLOT_BYTES] {
 
 fn words(b: &[u8; SLOT_BYTES]) -> [u32; 8] {
     let mut w = [0u32; 8];
-    for (i, c) in b.chunks_exact(4).enumerate() {
+    for (i, c) in b.as_chunks::<4>().0.iter().enumerate() {
         w[i] = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
     }
     w
@@ -203,7 +205,7 @@ fn views_write_hardware_words_beside_the_binding_table() {
 fn views_outside_a_descriptor_heap_are_not_written() {
     let _serial = crate::d3d12_xs::test_serial();
     let Some(dev) = make_device() else { return };
-    let guard = vec![0xA5u8; 128];
+    let guard = [0xA5u8; 128];
     let dest = guard.as_ptr() as usize;
     let cbv = D3D12ConstantBufferViewDesc {
         buffer_location: 0x1000,

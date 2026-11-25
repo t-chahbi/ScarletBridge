@@ -251,6 +251,26 @@ fn mimg_and_exp_fields() {
 }
 
 #[test]
+fn v_nop_e64_with_literal_preamble_decodes_three_words() {
+    // Préambule RDNA 2 console : `v_nop_e64` (VOP3 opcode 0x180, src2=0xff -> littéral 32 bits)
+    // suivi de `s_inst_prefetch 3` et `s_endpgm`.
+    let words = [
+        0xd580_0000u32,
+        0x03fe_0100,
+        0x0000_0ac0,
+        0xbfa0_0003,
+        0xbf81_0000,
+    ];
+    let stream = decode_stream(&words, WaveSize::W32).expect("v_nop_e64 + s_inst_prefetch");
+    assert_eq!(stream.len(), 3);
+    assert_eq!(stream[0].inst.name, "v_nop_e64");
+    assert_eq!(stream[0].inst.base_name(), "v_nop");
+    assert_eq!(stream[0].inst.words, 3);
+    assert_eq!(stream[1].inst.name, "s_inst_prefetch");
+    assert_eq!(stream[2].inst.name, "s_endpgm");
+}
+
+#[test]
 fn inline_constants_decode_and_print() {
     let i = dec(vec_of("v_mov_b32_e32 v0, 1.0").words, WaveSize::W32);
     assert_eq!(i.srcs()[0].src, Src::InlineFloat(242));

@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 const ARCH_SET_GS: libc::c_long = 0x1001;
+const ARCH_GET_GS: libc::c_long = 0x1004;
 
 /// Process Environment Block Windows x86-64 minimal (offsets MSVC vérifiés).
 #[repr(C, align(64))]
@@ -146,6 +147,113 @@ struct ThreadTeb {
     teb: Box<Teb>,
     /// Tampons `.tls` alloués spécifiquement pour ce thread (libérés automatiquement à la fin du thread).
     owned_tls_blocks: Vec<Box<[u8]>>,
+}
+
+/// Base du segment `GS` du thread courant, lue via `arch_prctl(ARCH_GET_GS)`.
+///
+/// Retourne `None` si l'appel échoue (plateforme non Linux, sandbox). Utilisé par le rapport de
+/// crash pour vérifier qu'un thread exécutant du code invité possède bien un `TEB` ScarletBridge.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn gs_base() -> Option<usize> {
+    let mut base: usize = 0;
+    // SAFETY: `ARCH_GET_GS` écrit un `unsigned long` dans le pointeur fourni.
+    let rc = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_GET_GS, &mut base) };
+    if rc == 0 { Some(base) } else { None }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn gs_base() -> Option<usize> {
+    None
+}
+
+/// Décrit le `TEB` actif du thread courant pour le rapport de crash.
+///
+/// L'hôte n'expose pas de moyen sûr de lire une adresse arbitraire depuis un handler de signal :
+/// on passe par `process_vm_readv` sur soi-même, qui échoue proprement (`EFAULT`) au lieu de
+/// déclencher un second `SIGSEGV` si l'adresse n'est pas mappée.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn describe_current_teb() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let gs = gs_base().unwrap_or(0);
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+    let _ = write!(out, "GSBase   : {gs:#018x}  tid={tid}");
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")) {
+        let _ = write!(out, "  comm={}", comm.trim_end());
+    }
+    let _ = writeln!(out);
+    if gs == 0 {
+        let _ = writeln!(
+            out,
+            "TEB      : ABSENT (GS base nulle : ce thread n'a jamais appelé init_thread_teb)"
+        );
+        return out;
+    }
+    match read_process_memory(gs, 0x70) {
+        Some(buf) if buf.len() >= 0x70 => {
+            let q = |off: usize| {
+                u64::from_ne_bytes([
+                    buf[off],
+                    buf[off + 1],
+                    buf[off + 2],
+                    buf[off + 3],
+                    buf[off + 4],
+                    buf[off + 5],
+                    buf[off + 6],
+                    buf[off + 7],
+                ]) as usize
+            };
+            let self_ptr = q(0x30);
+            let _ = writeln!(
+                out,
+                "TEB      : self={self_ptr:#018x} stack_base={:#018x} stack_limit={:#018x} peb={:#018x}{}",
+                q(0x08),
+                q(0x10),
+                q(0x60),
+                if self_ptr == gs {
+                    ""
+                } else {
+                    "  (self != GSBase : TEB invalide)"
+                }
+            );
+        }
+        _ => {
+            let _ = writeln!(out, "TEB      : illisible à GSBase {gs:#018x}");
+        }
+    }
+    out
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn describe_current_teb() -> String {
+    String::new()
+}
+
+/// Lecture mémoire sans risque de faute (`process_vm_readv` sur le processus courant).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn read_process_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let local = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: len,
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: len,
+    };
+    // SAFETY: les deux `iovec` sont valides ; `process_vm_readv` ne fait que copier.
+    let n = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+    if n < 0 {
+        None
+    } else {
+        buf.truncate(n as usize);
+        Some(buf)
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn read_process_memory(_addr: usize, _len: usize) -> Option<Vec<u8>> {
+    None
 }
 
 thread_local! {

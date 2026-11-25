@@ -744,6 +744,7 @@ pub static VOP3: &[OpDef] = &[
     (0x176, "v_mad_u64_u32", "D2 EM A1 B1 C2"),
     (0x177, "v_mad_i64_i32", "D2 EM A1 B1 C2"),
     (0x178, "v_xor3_b32", "D1 A1 B1 C1"),
+    (0x180, "v_nop_e64", ""),
     (0x181, "v_mov_b32_e64", "D1 A1"),
     (0x183, "v_cvt_i32_f64_e64", "D1 A2"),
     (0x184, "v_cvt_f64_i32_e64", "D2 A1"),

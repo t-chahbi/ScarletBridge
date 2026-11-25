@@ -24,8 +24,9 @@ pub use decode::{Decoded, decode, decode_stream};
 pub use disasm::{disassemble, disassemble_stream, format_operand};
 pub use inst::{DecodeError, Encoding, Ext, Instruction, Mods, Operand, Src, WaveSize};
 pub use translate::{
-    BindingUse, ProgramInfo, Resource, ResourceKind, ResourceLoc, SgprInit, Stage, TranslateConfig,
-    TranslateError, TranslatedProgram, VgprInit, translate_program,
+    BindingUse, DescriptorTable, ProgramInfo, Resource, ResourceKind, ResourceLoc, SgprInit, Stage,
+    TableBindingUse, TranslateConfig, TranslateError, TranslatedProgram, VgprInit,
+    translate_program,
 };
 
 #[cfg(test)]

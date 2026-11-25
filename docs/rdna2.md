@@ -146,6 +146,33 @@ Mesure par `translator_coverage_report` (une instruction synthétique par opcode
 Toute instruction non traduite → `TranslateError::Unsupported(mnémonique)` ; descripteur non
 configuré → `TranslateError::Unresolved` ; jamais de devinette silencieuse.
 
+### Tables de descripteurs et pointeurs symboliques
+
+* `TranslateConfig::tables: Vec<DescriptorTable { sgpr, set, binding_base, buffer_stride }>` déclare
+  « paire de SGPR de user data `sgpr` = adresse d'une table de descripteurs ». Chaque paire SGPR de
+  64 bits est suivie comme **(origine symbolique, offset constant)** : `s_mov_b32/b64`,
+  `s_add_u32`/`s_add_i32`/`s_sub_u32` + `s_addc_u32` avec constante inline ou littérale, `s_addk_i32`
+  (tout autre écriture, p. ex. `s_lshl_b64` ou un add d'un SGPR, **efface** le suivi).
+* `s_load_dwordx{1,2,4,8,16}` d'une base `table + offset constant` (immédiat, soffset inline/littéral/
+  null) marque les SGPR de destination comme *mots de descripteur* `(table, octet)`. Leur nature est
+  décidée à l'usage : V# (4 dwords : `buffer_*`, `tbuffer_*`, `s_buffer_load_*`), T# (8 dwords :
+  `image_*`), S# (4 dwords : `image_sample*`/`gather4`/`get_lod`). `s_buffer_load_dwordx16` est supporté.
+* Chaque entrée utilisée reçoit la liaison **`(set, binding_base + offset / 16)`** ; l'offset doit
+  être un multiple de 16. Les entrées sont listées dans `ProgramInfo::table_bindings`
+  (`table_sgpr, byte_offset, kind, set, binding`) : un même `(table, offset)` = une seule liaison
+  (rechargé deux fois → même liaison) ; une même entrée utilisée avec deux natures est refusée.
+  2D, 2D array, 3D, cube (T#), V# (buffers) et S# peuvent cohabiter dans une même table ; le type
+  d'image vient de la dimension de l'instruction.
+* Les `Resource` explicites (`Sgprs`/`Table`/`Pointer`) restent prioritaires. Un V# de table suppose
+  `buffer_stride` pour `idxen` (les mots du V# ne sont jamais lus par le traducteur).
+* **Erreurs** : toute ressource non résolue nomme l'instruction, le SGPR, l'origine symbolique
+  connue ou non, la dernière instruction qui a écrit le SGPR et les tables/pointeurs déclarés ;
+  un offset non constant (SGPR) est refusé en citant l'instruction. Un pointeur de buffer
+  (`ResourceLoc::Pointer`) charge toujours des **données** (`s_load_*` vers SGPR) ; une table ne
+  charge que des descripteurs (ses mots lus valent 0 en tant que données).
+* Hôte : `NativeShader::discover_table_resources(&[table_sgpr])` traduit et retourne les
+  `NativeResource::Table` utilisées (pour construire un conteneur SBR2).
+
 ### Prérequis Vulkan des nouvelles fonctions
 
 | Fonction | Prérequis |
@@ -209,7 +236,11 @@ configuré → `TranslateError::Unresolved` ; jamais de devinette silencieuse.
   * MIMG en CS (échantillonnage `lz/l/o/d`, d16, gather4 (4 texels), load, tfe, resinfo, store,
     atomiques r32ui) sur une texture 2×2 ;
   * DPP / SDWA (16 segments, wave32 et wave64, **oracle = lecture du guide ISA**, pas le matériel) ;
-  * contrôle de bornes, stores octet/short de buffer.
+  * contrôle de bornes, stores octet/short de buffer ;
+  * tables de descripteurs : `s_load_dwordx16` à offsets constants (dont base `s_add_u32 + s_addc_u32`
+    et réutilisation d'une entrée), 8 V# distincts ; deux textures + sampler + images de stockage
+    (`image_store`, `image_atomic_add`) issues de la même table, une liaison par entrée.
+* `ps_table_views` (PS : S#, T# 2D / 2D array / 3D / cube et V# dans une table) : `spirv-val`.
 * `ps_mimg_ext` (PS : `_b _c _cl _d_cl _o _c_l`, gather `_c_o`, `get_lod`, a16, tfe, d16, 3D, cube,
   1D array, MSAA load) n'est validé que par `spirv-val` (pas rendu sur GPU).
 * Non exécuté sur GPU : `ps_kill` (`v_cmpx` + `OpKill`, validé seulement par `spirv-val`),

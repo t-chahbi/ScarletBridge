@@ -68,6 +68,7 @@ const G_FIND_UMSB: u32 = 75;
 impl Tr<'_> {
     /// Point d'entrée : traduit une instruction décodée.
     pub(crate) fn translate_inst(&mut self, i: &Instruction) -> TResult<()> {
+        self.cur_name = i.name;
         match i.encoding {
             Encoding::Sop1 | Encoding::Sop2 | Encoding::Sopk | Encoding::Sopc => self.salu(i),
             Encoding::Sopp => self.sopp(i),
@@ -460,7 +461,48 @@ impl Tr<'_> {
             ("s_getpc_b64", _, _) => return unsupported(i),
             _ => return self.salu_ext32(i, name, &dst, &srcs),
         };
-        self.write_s(&dst, r)
+        let new_alias = match (name, dst.src) {
+            ("s_mov_b32", Src::Sgpr(d)) => match srcs.first().map(|o| o.src) {
+                Some(Src::Sgpr(s)) => Some((d, self.sgpr_alias.get(&s).copied().unwrap_or((s, 0)))),
+                _ => None,
+            },
+            ("s_add_u32" | "s_add_i32", Src::Sgpr(d)) => {
+                let imm_of = |s: Src| match s {
+                    Src::InlineInt(v) => Some(i64::from(v)),
+                    Src::Literal(v) => Some(i64::from(v)),
+                    _ => None,
+                };
+                match (srcs.first().map(|o| o.src), srcs.get(1).map(|o| o.src)) {
+                    (Some(Src::Sgpr(s)), Some(other)) | (Some(other), Some(Src::Sgpr(s))) => {
+                        imm_of(other).map(|k| {
+                            let (orig, off) = self.sgpr_alias.get(&s).copied().unwrap_or((s, 0));
+                            (d, (orig, off.saturating_add(k)))
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            ("s_sub_u32" | "s_sub_i32", Src::Sgpr(d)) => {
+                // pointeur - constante (la constante est le second opérande)
+                match (srcs.first().map(|o| o.src), srcs.get(1).map(|o| o.src)) {
+                    (Some(Src::Sgpr(s)), Some(Src::InlineInt(k))) => {
+                        let (orig, off) = self.sgpr_alias.get(&s).copied().unwrap_or((s, 0));
+                        Some((d, (orig, off.saturating_sub(i64::from(k)))))
+                    }
+                    (Some(Src::Sgpr(s)), Some(Src::Literal(k))) => {
+                        let (orig, off) = self.sgpr_alias.get(&s).copied().unwrap_or((s, 0));
+                        Some((d, (orig, off.saturating_sub(i64::from(k)))))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        self.write_s(&dst, r)?;
+        if let Some((d, target)) = new_alias {
+            self.sgpr_alias.insert(d, target);
+        }
+        Ok(())
     }
 
     /// `s_bfe_*` : `src1[4:0]` = offset, `src1[22:16]` = largeur.
@@ -562,7 +604,19 @@ impl Tr<'_> {
             }
             _ => return unsupported(i),
         };
-        self.write_s(&dst, r)
+        let addk_alias = if name == "s_addk_i32"
+            && let Src::Sgpr(d) = dst.src
+        {
+            let (orig, off) = self.sgpr_alias.get(&d).copied().unwrap_or((d, 0));
+            Some((d, (orig, off.saturating_add(i64::from(sext as i32)))))
+        } else {
+            None
+        };
+        self.write_s(&dst, r)?;
+        if let Some((d, target)) = addk_alias {
+            self.sgpr_alias.insert(d, target);
+        }
+        Ok(())
     }
 
     /// Opérations 64 bits scalaires de type masque/logique (composante par composante).
@@ -631,7 +685,25 @@ impl Tr<'_> {
             }
             _ => return unsupported(i),
         };
-        self.write_s_pair(dst, lo, hi)
+        let mov64_alias = if base == "s_mov"
+            && let (Src::Sgpr(d), Some(Src::Sgpr(s))) = (dst.src, srcs.first().map(|o| o.src))
+        {
+            let orig_lo = self.sgpr_alias.get(&s).copied().unwrap_or((s, 0));
+            let orig_hi = self
+                .sgpr_alias
+                .get(&(s.saturating_add(1)))
+                .copied()
+                .unwrap_or((s.saturating_add(1), 0));
+            Some((d, orig_lo, orig_hi))
+        } else {
+            None
+        };
+        self.write_s_pair(dst, lo, hi)?;
+        if let Some((d, orig_lo, orig_hi)) = mov64_alias {
+            self.sgpr_alias.insert(d, orig_lo);
+            self.sgpr_alias.insert(d.saturating_add(1), orig_hi);
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ VALU

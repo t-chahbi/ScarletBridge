@@ -21,8 +21,10 @@ use crate::gfx10_descriptors::{
     decode_sampler,
 };
 use crate::root_signature::{ParsedRootSignature, RootParam, RootParamKind, pack_user_sgprs};
+use sb_gpu::rdna2::{Decoded, Encoding, Src, WaveSize, decode, decode_stream};
 use sb_gpu::rdna2_native::{
-    NativeResourceKind, NativeResourceLoc, NativeShader, NativeShaderMeta, is_native_container,
+    MAX_RESOURCES, NativeResource, NativeResourceKind, NativeResourceLoc, NativeShader,
+    NativeShaderMeta, NativeStage, is_native_container,
 };
 use sb_gpu::renderer::{
     NativeBinding, NativeDispatchCmd, NativeDrawCmd, NativeSamplerDesc, NativeStageState,
@@ -68,6 +70,16 @@ impl RootSigLayout {
         };
         let (first_sgpr, _) = pack_user_sgprs(&sig).ok()?;
         Some(Self { params, first_sgpr })
+    }
+
+    /// Premier user-SGPR (paire 64 bits) de chaque paramètre de type table de descripteurs.
+    pub fn table_sgprs(&self) -> Vec<u8> {
+        self.params
+            .iter()
+            .zip(&self.first_sgpr)
+            .filter(|((kind, _), _)| *kind == RootParamKind::Table)
+            .filter_map(|(_, &first)| u8::try_from(first).ok())
+            .collect()
     }
 
     /// Décode `D3D12_ROOT_PARAMETER_TYPE` (0 = table, 1 = constantes, 2 = CBV, 3 = SRV, 4 = UAV).
@@ -298,6 +310,484 @@ pub(crate) fn create_native_compute_pso(
                 "CreateComputePipelineState (Rdna2Native) échoué : {e}"
             );
             E_FAIL
+        }
+    }
+}
+
+// ==================== Compilation FSPX RDNA 2 -> SPIR-V ====================
+
+/// Opcode `s_endpgm` en RDNA 2 (SOPP 0x01).
+const RDNA2_S_ENDPGM: u32 = 0xbf81_0000;
+/// Opcode `s_code_end` utilisé comme remplissage de ligne de cache après `s_endpgm`.
+const RDNA2_S_CODE_END: u32 = 0xbf9f_0000;
+/// Opcode `s_nop 0` utilisé comme remplissage.
+const RDNA2_S_NOP_0: u32 = 0xbf80_0000;
+
+fn is_isa_trailer_pad(w: u32) -> bool {
+    w == 0 || w == RDNA2_S_CODE_END || w == RDNA2_S_NOP_0
+}
+
+fn bytes_prefix_u32(bytes: &[u8], max_words: usize) -> Vec<u32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .take(max_words)
+        .copied()
+        .map(u32::from_le_bytes)
+        .collect()
+}
+
+/// Extrait un flux d'instructions RDNA 2 valide depuis un bloc binaire `kind6` FSPX en
+/// supprimant l'éventuel remplissage de fin de ligne de cache (`0x0`, `s_code_end`, `s_nop`)
+/// après le dernier `s_endpgm`.
+pub(crate) fn extract_rdna2_code_words(raw: &[u8]) -> Result<Vec<u32>, String> {
+    if raw.len() < 4 || !raw.len().is_multiple_of(4) {
+        return Err(format!("taille ISA invalide ({} octets)", raw.len()));
+    }
+    let words: Vec<u32> = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(u32::from_le_bytes)
+        .collect();
+    let mut pc = 0usize;
+    let mut last_endpgm_end: Option<usize> = None;
+    while pc < words.len() {
+        match decode(&words[pc..], WaveSize::W32) {
+            Ok(inst) => {
+                let len = usize::from(inst.words);
+                let next = pc + len;
+                if words[pc] == RDNA2_S_ENDPGM || inst.name == "s_endpgm" {
+                    last_endpgm_end = Some(next);
+                }
+                pc = next;
+            }
+            Err(err) => {
+                if let Some(end) = last_endpgm_end {
+                    return Ok(words[..end].to_vec());
+                }
+                return Err(format!("décodage RDNA 2 échoué au mot #{pc} : {err}"));
+            }
+        }
+    }
+    if let Some(end) = last_endpgm_end
+        && words[end..].iter().all(|&w| is_isa_trailer_pad(w))
+    {
+        return Ok(words[..end].to_vec());
+    }
+    Ok(words)
+}
+
+/// Déduit `(num_user_sgprs, resources)` pour un shader compute RDNA 2 depuis la `RootSigLayout`
+/// (lorsqu'elle est disponible) et les accès `s_load_*` + `MUBUF`/`MIMG` décodés, y compris les
+/// pointeurs 32→64 bits élargis par `s_mov_b32 s<dst>, s<user> ; s_mov_b32 s<dst+1>, <const>`.
+pub(crate) fn infer_compute_resources(
+    insts: &[Decoded],
+    layout: Option<&RootSigLayout>,
+) -> (u32, Vec<NativeResource>) {
+    let mut resources: Vec<NativeResource> = Vec::new();
+    let mut num_user_sgprs: u32 = 0;
+
+    if let Some(l) = layout {
+        for (i, &(kind, n_vals)) in l.params.iter().enumerate() {
+            let Some(&first_u32) = l.first_sgpr.get(i) else {
+                continue;
+            };
+            let width = match kind {
+                RootParamKind::Constants => n_vals.max(1),
+                RootParamKind::Table
+                | RootParamKind::Cbv
+                | RootParamKind::Srv
+                | RootParamKind::Uav => 2,
+            };
+            num_user_sgprs = num_user_sgprs.max(first_u32.saturating_add(width));
+            let first = first_u32 as u8;
+            if matches!(
+                kind,
+                RootParamKind::Cbv | RootParamKind::Srv | RootParamKind::Uav
+            ) {
+                let loc = NativeResourceLoc::Pointer { sgpr: first };
+                if resources.len() < MAX_RESOURCES && !resources.iter().any(|r| r.loc == loc) {
+                    resources.push(NativeResource {
+                        kind: NativeResourceKind::Buffer { stride: 4 },
+                        loc,
+                    });
+                }
+            }
+        }
+    }
+
+    // Repère les SGPR consommés comme descripteurs `V#`/`T#`/`S#` par MUBUF/MTBUF/MIMG/s_buffer_load.
+    let mut sampler_sgprs: Vec<u8> = Vec::new();
+    let mut desc_sgprs: Vec<u8> = Vec::new();
+    let mut note_desc = |s: u8| {
+        if !desc_sgprs.contains(&s) {
+            desc_sgprs.push(s);
+        }
+    };
+    for d in insts {
+        match d.inst.encoding {
+            Encoding::Mimg => {
+                if let Some(Src::Sgpr(s)) = d.inst.operands.get(2).map(|o| o.src) {
+                    note_desc(s);
+                }
+                if let Some(Src::Sgpr(s)) = d.inst.operands.get(3).map(|o| o.src) {
+                    note_desc(s);
+                    if !sampler_sgprs.contains(&s) {
+                        sampler_sgprs.push(s);
+                    }
+                }
+            }
+            Encoding::Mubuf | Encoding::Mtbuf => {
+                if let Some(Src::Sgpr(s)) = d.inst.operands.get(2).map(|o| o.src) {
+                    note_desc(s);
+                }
+            }
+            Encoding::Smem if d.inst.name.starts_with("s_buffer_load") => {
+                if let Some(Src::Sgpr(s)) = d.inst.operands.get(1).map(|o| o.src) {
+                    note_desc(s);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Suit les alias `s_mov_b32` / `s_mov_b64` et résout chaque `s_load_*`.
+    let mut alias: HashMap<u8, u8> = HashMap::new();
+    for d in insts {
+        if d.inst.name == "s_mov_b32"
+            && let (Some(Src::Sgpr(dst)), Some(Src::Sgpr(src))) = (
+                d.inst.operands.first().map(|o| o.src),
+                d.inst.operands.get(1).map(|o| o.src),
+            )
+        {
+            let orig = alias.get(&src).copied().unwrap_or(src);
+            alias.insert(dst, orig);
+            continue;
+        }
+        if d.inst.name == "s_mov_b64"
+            && let (Some(Src::Sgpr(dst)), Some(Src::Sgpr(src))) = (
+                d.inst.operands.first().map(|o| o.src),
+                d.inst.operands.get(1).map(|o| o.src),
+            )
+        {
+            let orig_lo = alias.get(&src).copied().unwrap_or(src);
+            let orig_hi = alias
+                .get(&src.saturating_add(1))
+                .copied()
+                .unwrap_or(src.saturating_add(1));
+            alias.insert(dst, orig_lo);
+            alias.insert(dst.saturating_add(1), orig_hi);
+            continue;
+        }
+        if d.inst.encoding != Encoding::Smem || !d.inst.name.starts_with("s_load_") {
+            // Toute autre écriture scalaire invalide l'alias du SGPR destination.
+            if d.inst.n_dst > 0
+                && let Some(op) = d.inst.operands.first()
+                && let Src::Sgpr(dst) = op.src
+            {
+                for k in dst..dst.saturating_add(op.width.max(1)) {
+                    alias.remove(&k);
+                }
+            }
+            continue;
+        }
+        let Some(Src::Sgpr(dst_sgpr)) = d.inst.operands.first().map(|o| o.src) else {
+            continue;
+        };
+        let Some(Src::Sgpr(base_sgpr)) = d.inst.operands.get(1).map(|o| o.src) else {
+            continue;
+        };
+        let origin = alias.get(&base_sgpr).copied().unwrap_or(base_sgpr);
+        if usize::from(origin) + 2 > USER_DWORDS {
+            continue;
+        }
+        let is_x4 = d.inst.name == "s_load_dwordx4";
+        let is_x8 = d.inst.name == "s_load_dwordx8";
+        let is_desc_load = (is_x4 || is_x8)
+            && (desc_sgprs.contains(&dst_sgpr)
+                || (is_x8 && desc_sgprs.contains(&dst_sgpr.saturating_add(4))));
+
+        if is_desc_load {
+            let dyn_off = d.inst.operands.get(2).map(|o| o.src);
+            let const_off = match dyn_off {
+                None | Some(Src::Null | Src::Off | Src::InlineInt(0)) => {
+                    if d.inst.mods.offset >= 0 {
+                        d.inst.mods.offset as u32
+                    } else {
+                        continue;
+                    }
+                }
+                Some(Src::InlineInt(v)) if v >= 0 && d.inst.mods.offset == 0 => v as u32,
+                _ => continue,
+            };
+            num_user_sgprs = num_user_sgprs.max(u32::from(origin) + 2);
+            let kind = if is_x8 {
+                NativeResourceKind::Image
+            } else if sampler_sgprs.contains(&dst_sgpr) {
+                NativeResourceKind::Sampler
+            } else {
+                NativeResourceKind::Buffer { stride: 4 }
+            };
+            let loc = NativeResourceLoc::Table {
+                table_sgpr: origin,
+                byte_offset: const_off,
+            };
+            // Un même SGPR ne peut pas être simultanément `Pointer` et `Table` : si le shader
+            // charge des descripteurs depuis `origin`, supprimer un éventuel `Pointer(origin)`
+            // générique ajouté depuis `RootSigLayout`.
+            resources.retain(|r| r.loc != NativeResourceLoc::Pointer { sgpr: origin });
+            if resources.len() < MAX_RESOURCES && !resources.iter().any(|r| r.loc == loc) {
+                resources.push(NativeResource { kind, loc });
+            }
+        } else {
+            // Lecture scalaire directe (`s_load_dword`, `s_load_dwordx2`, ou `x4` non-descripteur) :
+            // `origin` est un pointeur de tampon racine (`Pointer`).
+            let has_table = resources.iter().any(|r| {
+                matches!(
+                    r.loc,
+                    NativeResourceLoc::Table { table_sgpr, .. } if table_sgpr == origin
+                )
+            });
+            if !has_table {
+                num_user_sgprs = num_user_sgprs.max(u32::from(origin) + 2);
+                let loc = NativeResourceLoc::Pointer { sgpr: origin };
+                if resources.len() < MAX_RESOURCES && !resources.iter().any(|r| r.loc == loc) {
+                    resources.push(NativeResource {
+                        kind: NativeResourceKind::Buffer { stride: 4 },
+                        loc,
+                    });
+                }
+            }
+        }
+    }
+
+    (num_user_sgprs.clamp(2, USER_DWORDS as u32), resources)
+}
+
+/// Tables de descripteurs de la signature racine : les entrées V#/T#/S# réellement utilisées par
+/// le programme sont découvertes par le traducteur (suivi symbolique « base de table + offset
+/// constant » à travers `s_add_u32`/`s_addc_u32`/`s_mov_b32`/`s_mov_b64`, `s_load_dwordx{1..16}`,
+/// plusieurs T#/S# par table) et remplacent les ressources `Table`/`Pointer` de ces paires de
+/// SGPR. Échoue avec le message du traducteur (SGPR, instruction, table) si une base ou un offset
+/// n'est pas constant ; sans disposition de signature racine, rien n'est inventé ici.
+pub(crate) fn discover_root_tables(
+    meta: &mut NativeShaderMeta,
+    code: &[u32],
+    layout: Option<&RootSigLayout>,
+) -> Result<(), String> {
+    let Some(l) = layout else { return Ok(()) };
+    let tables = l.table_sgprs();
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let is_table = |s: u8| tables.contains(&s);
+    meta.resources.retain(|r| match r.loc {
+        NativeResourceLoc::Table { table_sgpr, .. } => !is_table(table_sgpr),
+        NativeResourceLoc::Pointer { sgpr } => !is_table(sgpr),
+        _ => true,
+    });
+    let found = NativeShader {
+        meta: meta.clone(),
+        code: code.to_vec(),
+    }
+    .discover_table_resources(&tables)
+    .map_err(|e| format!("tables de descripteurs (user-SGPR {tables:?}) : {e}"))?;
+    if meta.resources.len() + found.len() > MAX_RESOURCES {
+        return Err(format!(
+            "{} entrées de table + {} autres ressources > {MAX_RESOURCES} (limite SBR2)",
+            found.len(),
+            meta.resources.len()
+        ));
+    }
+    meta.resources.extend(found);
+    Ok(())
+}
+
+/// Registres matériels compute AMD RDNA 2 extraits du bloc `kind0` FSPX (28 octets = 7 dwords) :
+/// - mot 3 (`+0x0c`) : `COMPUTE_NUM_THREAD_X` (bits 0..15) | `COMPUTE_NUM_THREAD_Y` (bits 16..31)
+/// - mot 4 (`+0x10`) : `COMPUTE_NUM_THREAD_Z` (bits 0..15)
+/// - mot 6 (`+0x18`) : `COMPUTE_PGM_RSRC2` (`USER_SGPR` `[5:1]`, `TGID_X/Y/Z_EN` `[9:7]`,
+///   `TIDIG_COMP_CNT` `[12:11]`, `LDS_SIZE` `[23:15]` en blocs de 128 dwords)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FspxComputeRsrc {
+    pub local_size: [u32; 3],
+    pub user_sgprs: u32,
+    pub sys_sgpr_flags: u32,
+    pub num_input_vgprs: u32,
+    pub lds_dwords: u32,
+}
+
+pub(crate) fn parse_fspx_compute_rsrc(kind0: &[u8]) -> Option<FspxComputeRsrc> {
+    if kind0.len() < 28 {
+        return None;
+    }
+    let w = |i: usize| {
+        let o = i * 4;
+        u32::from_le_bytes([kind0[o], kind0[o + 1], kind0[o + 2], kind0[o + 3]])
+    };
+    let xy = w(3);
+    let tx = (xy & 0xFFFF).clamp(1, 1024);
+    let ty = ((xy >> 16) & 0xFFFF).clamp(1, 1024);
+    let tz = (w(4) & 0xFFFF).clamp(1, 1024);
+    if tx * ty * tz > 1024 {
+        return None;
+    }
+    let rsrc2 = w(6);
+    let user_sgprs = ((rsrc2 >> 1) & 0x1F).min(USER_DWORDS as u32);
+    let sys_sgpr_flags = (rsrc2 >> 7) & 0x7;
+    let tidig_comp_cnt = (rsrc2 >> 11) & 0x3;
+    let num_input_vgprs = (tidig_comp_cnt + 1).min(3);
+    // RDNA 2 : `LDS_SIZE` dans `COMPUTE_PGM_RSRC2[23:15]` en granulats de 128 dwords (512 octets).
+    let lds_dwords = ((rsrc2 >> 15) & 0x1FF) * 128;
+    Some(FspxComputeRsrc {
+        local_size: [tx, ty, tz],
+        user_sgprs,
+        sys_sgpr_flags,
+        num_input_vgprs,
+        lds_dwords,
+    })
+}
+
+/// Tente de compiler un descripteur FSPX Compute (`DeserializeComputePipelineStateX`, slot 67)
+/// vers un vrai `VkPipeline` Vulkan natif RDNA 2.
+///
+/// En cas d'échec (en-tête binaire inconnu ou opcode RDNA 2 non encore couvert), journalise un
+/// diagnostic compact sur les premiers appels et renvoie `None` afin que l'appelant bascule sans
+/// régression sur le PSO standard.
+pub(crate) fn try_compile_fspx_compute(
+    dev: &D3D12DeviceObject,
+    desc_addr: usize,
+) -> Option<(usize, Arc<NativePso>)> {
+    if desc_addr < 0x1_0000 {
+        return None;
+    }
+    let hdr = sb_loader::trampoline::peek_memory(desc_addr, 0x48);
+    if hdr.len() != 0x48 {
+        return None;
+    }
+    let rd64 = |o: usize| {
+        u64::from_le_bytes([
+            hdr[o],
+            hdr[o + 1],
+            hdr[o + 2],
+            hdr[o + 3],
+            hdr[o + 4],
+            hdr[o + 5],
+            hdr[o + 6],
+            hdr[o + 7],
+        ]) as usize
+    };
+    let rs_ptr = rd64(0x00);
+    let k0_ptr = rd64(0x08);
+    let k0_sz = rd64(0x10);
+    let k1_ptr = rd64(0x18);
+    let k1_sz = rd64(0x20);
+    let k6_ptr = rd64(0x28);
+    let k6_sz = rd64(0x30);
+    let k7_sz = rd64(0x40);
+
+    if k6_ptr < 0x1_0000 || !(4..=2 * 1024 * 1024).contains(&k6_sz) {
+        return None;
+    }
+    let k6 = sb_loader::trampoline::peek_memory(k6_ptr, k6_sz);
+    if k6.len() != k6_sz {
+        return None;
+    }
+    let k0 = if k0_ptr >= 0x1_0000 && k0_sz > 0 {
+        sb_loader::trampoline::peek_memory(k0_ptr, k0_sz.min(64))
+    } else {
+        Vec::new()
+    };
+    let k1 = if k1_ptr >= 0x1_0000 && k1_sz > 0 {
+        sb_loader::trampoline::peek_memory(k1_ptr, k1_sz.min(64))
+    } else {
+        Vec::new()
+    };
+
+    let layout = if d3d_known_object_name(rs_ptr) == Some("ID3D12RootSignature") {
+        // SAFETY: `rs_ptr` validé comme `D3D12RootSigObject` créé par le bridge.
+        unsafe { (*(rs_ptr as *const D3D12RootSigObject)).layout.clone() }
+    } else {
+        None
+    };
+
+    let rsrc = parse_fspx_compute_rsrc(&k0);
+    let result: Result<(usize, Arc<NativePso>, usize, usize), String> = (|| {
+        let code = extract_rdna2_code_words(&k6)?;
+        let insts =
+            decode_stream(&code, WaveSize::W32).map_err(|e| format!("decode_stream : {e}"))?;
+        let (inferred_sgprs, resources) = infer_compute_resources(&insts, layout.as_deref());
+        let mut meta = NativeShaderMeta::new(NativeStage::Compute, 32);
+        if let Some(r) = rsrc {
+            meta.local_size = r.local_size;
+            meta.num_user_sgprs = r.user_sgprs.max(inferred_sgprs).min(USER_DWORDS as u32);
+            meta.num_input_vgprs = r.num_input_vgprs;
+            meta.sys_sgpr_flags = r.sys_sgpr_flags;
+            meta.lds_dwords = r.lds_dwords;
+        } else {
+            meta.local_size = [64, 1, 1];
+            meta.num_user_sgprs = inferred_sgprs;
+            meta.num_input_vgprs = 3;
+            meta.sys_sgpr_flags = 0x7;
+        }
+        meta.resources = resources;
+        discover_root_tables(&mut meta, &code, layout.as_deref())?;
+        let n_res = meta.resources.len();
+        let n_words = code.len();
+        let sbr2 = NativeShader {
+            meta: meta.clone(),
+            code,
+        }
+        .to_bytes();
+        let mut renderer = dev.shared.renderer.lock();
+        let id = renderer
+            .create_native_compute_pipeline(&sbr2)
+            .map_err(|e| format!("Vulkan/SPIR-V : {e}"))?;
+        Ok((
+            id,
+            Arc::new(NativePso { stages: vec![meta] }),
+            n_words,
+            n_res,
+        ))
+    })();
+
+    static LOGGED_OK: AtomicU32 = AtomicU32::new(0);
+    static LOGGED_ERR: AtomicU32 = AtomicU32::new(0);
+    match result {
+        Ok((id, native, n_words, n_res)) => {
+            if LOGGED_OK.fetch_add(1, Ordering::Relaxed) < 5 {
+                sb_info!(
+                    CHANNEL,
+                    "FSPX Compute -> VkPipeline #{id} compilé nativement ({n_words} mots RDNA 2, {n_res} ressources, kind0={k0_sz}o, kind1={k1_sz}o, kind6={k6_sz}o, kind7={k7_sz}o)"
+                );
+            } else {
+                sb_debug!(
+                    CHANNEL,
+                    "FSPX Compute -> VkPipeline #{id} ({n_words} mots RDNA 2, {n_res} ressources)"
+                );
+            }
+            Some((id, native))
+        }
+        Err(reason) => {
+            if LOGGED_ERR.fetch_add(1, Ordering::Relaxed) < 4 {
+                let k0_w = bytes_prefix_u32(&k0, 8);
+                let k1_w = bytes_prefix_u32(&k1, 6);
+                let k6_w = bytes_prefix_u32(&k6, 12);
+                sb_info!(
+                    CHANNEL,
+                    "FSPX Compute repli non-natif (rs={rs_ptr:#x}, layout={}, kind0={k0_sz}o:{k0_w:x?}, kind1={k1_sz}o:{k1_w:x?}, kind6={k6_sz}o:{k6_w:x?}, kind7={k7_sz}o) : {reason}",
+                    layout.is_some()
+                );
+            } else {
+                sb_debug!(
+                    CHANNEL,
+                    "FSPX Compute repli non-natif (kind6={k6_sz}o) : {reason}"
+                );
+            }
+            None
         }
     }
 }
@@ -1370,6 +1860,332 @@ mod tests {
         assert!(
             p[0] == 0 && p[1].abs_diff(128) <= 1 && p[2] == 0 && p[3] == 255,
             "texture verte x teinte (0.5, 0.5, 1) : {p:?}"
+        );
+    }
+
+    #[test]
+    fn fspx_extract_trims_cacheline_padding() {
+        let padded: [u32; 7] = [
+            0xf408_0100,
+            0xfa00_0000,
+            0xbf81_0000, // s_endpgm
+            0xbf9f_0000, // s_code_end
+            0x0000_0000,
+            0xbf80_0000, // s_nop 0
+            0x0000_0000,
+        ];
+        let raw: Vec<u8> = padded.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let code = extract_rdna2_code_words(&raw).expect("ISA RDNA 2 valide");
+        assert_eq!(code, vec![0xf408_0100, 0xfa00_0000, 0xbf81_0000]);
+    }
+
+    #[test]
+    fn root_table_discovery_resolves_x16_loads_with_constant_pointer_offsets() {
+        // `cs_table_x16` de docs/rdna2.md (llvm-mc gfx1030, wave32), écrit à la main.
+        let code: Vec<u32> = vec![
+            0xf4100200, 0xfa000000, 0x8018c000, 0x82198001, 0xf410080c, 0xfa000010, 0xf4080c0c,
+            0xfa000040, 0xbf8cc07f, 0x34020082, 0xe0301000, 0x80030201, 0xe0301000, 0x80040301,
+            0xe0301000, 0x80050401, 0xe0301000, 0x80080501, 0xe0301000, 0x80090601, 0xe0301000,
+            0x800a0701, 0xe0301000, 0x800b0801, 0xe0301000, 0x800c0901, 0xbf8c3f70, 0xd543000a,
+            0x04091503, 0xd543000a, 0x0429ff04, 0x00000064, 0xd543000a, 0x0429ff05, 0x000003e8,
+            0xd543000a, 0x0429ff06, 0x00002710, 0xd543000a, 0x0429ff07, 0x000186a0, 0xd543000a,
+            0x0429ff08, 0x000f4240, 0x4a141509, 0xe0701000, 0x80020a01, 0xbf810000,
+        ];
+        let layout =
+            RootSigLayout::from_params(vec![(RootParamKind::Table, 0), (RootParamKind::Cbv, 0)])
+                .expect("2 paramètres");
+        assert_eq!(layout.table_sgprs(), vec![0]);
+        let mut meta = NativeShaderMeta::new(NativeStage::Compute, 32);
+        meta.num_user_sgprs = 4;
+        meta.num_input_vgprs = 3;
+        meta.local_size = [64, 1, 1];
+        discover_root_tables(&mut meta, &code, Some(&layout)).expect("découverte");
+        let offs: Vec<u32> = meta
+            .resources
+            .iter()
+            .map(|r| match r.loc {
+                NativeResourceLoc::Table {
+                    table_sgpr: 0,
+                    byte_offset,
+                } => byte_offset,
+                other => panic!("loc inattendue {other:?}"),
+            })
+            .collect();
+        assert_eq!(offs, vec![0x00, 0x10, 0x20, 0x30, 0x50, 0x60, 0x70, 0x80]);
+        assert!(
+            meta.resources
+                .iter()
+                .all(|r| matches!(r.kind, NativeResourceKind::Buffer { .. }))
+        );
+        // la configuration SBR2 résultante se traduit et a 8 liaisons distinctes
+        let t = NativeShader { meta, code }.translate().expect("traduction");
+        assert_eq!(
+            t.bindings
+                .iter()
+                .filter(|b| b.kind == "storage_buffer" && b.resource.is_some())
+                .count(),
+            8
+        );
+    }
+
+    #[test]
+    fn root_table_discovery_names_sgpr_and_instruction_on_dynamic_base() {
+        let code: Vec<u32> = vec![
+            0x80080200, 0x82098001, 0xf4080404, 0xfa000000, 0xbf8cc07f, 0xe0301000, 0x80040100,
+            0xbf810000,
+        ];
+        let layout = RootSigLayout::from_params(vec![
+            (RootParamKind::Table, 0),
+            (RootParamKind::Constants, 2),
+        ])
+        .expect("layout");
+        let mut meta = NativeShaderMeta::new(NativeStage::Compute, 32);
+        meta.num_user_sgprs = 4;
+        meta.num_input_vgprs = 3;
+        let e = discover_root_tables(&mut meta, &code, Some(&layout)).expect_err("base dynamique");
+        assert!(
+            e.contains("s_load_dwordx4") && e.contains("s_add_u32") && e.contains("s[8:9]"),
+            "{e}"
+        );
+        assert!(e.contains("user-SGPR [0]"), "{e}");
+    }
+
+    #[test]
+    fn root_table_discovery_without_layout_invents_nothing() {
+        let mut meta = NativeShaderMeta::new(NativeStage::Compute, 32);
+        discover_root_tables(&mut meta, &[0xbf810000], None).expect("sans signature : no-op");
+        assert!(meta.resources.is_empty());
+    }
+
+    #[test]
+    fn fspx_infer_compute_resources_root_and_table() {
+        let words: [u32; 11] = [
+            0xf40c_0200,
+            0xfa00_0000,
+            0xf408_0400,
+            0xfa00_0020,
+            0xf408_0500,
+            0xfa00_0040,
+            0xf080_0f08,
+            0x0082_0402,
+            0xe030_1000,
+            0x8005_0000, // buffer_load_dword v0, v0, s[20:23], 0 offen
+            0xbf81_0000,
+        ];
+        let insts = decode_stream(&words, WaveSize::W32).expect("decode");
+        let layout =
+            RootSigLayout::from_params(vec![(RootParamKind::Table, 1), (RootParamKind::Cbv, 0)])
+                .expect("layout");
+        let (n_sgpr, res) = infer_compute_resources(&insts, Some(&layout));
+        assert!(n_sgpr >= 4);
+        assert!(res.iter().any(|r| matches!(
+            r,
+            NativeResource {
+                kind: NativeResourceKind::Buffer { .. },
+                loc: NativeResourceLoc::Pointer { sgpr: 2 }
+            }
+        )));
+        assert!(res.iter().any(|r| matches!(
+            r,
+            NativeResource {
+                kind: NativeResourceKind::Image,
+                loc: NativeResourceLoc::Table {
+                    table_sgpr: 0,
+                    byte_offset: 0
+                }
+            }
+        )));
+        assert!(res.iter().any(|r| matches!(
+            r,
+            NativeResource {
+                kind: NativeResourceKind::Sampler,
+                loc: NativeResourceLoc::Table {
+                    table_sgpr: 0,
+                    byte_offset: 0x20
+                }
+            }
+        )));
+        assert!(res.iter().any(|r| matches!(
+            r,
+            NativeResource {
+                kind: NativeResourceKind::Buffer { .. },
+                loc: NativeResourceLoc::Table {
+                    table_sgpr: 0,
+                    byte_offset: 0x40
+                }
+            }
+        )));
+    }
+
+    #[test]
+    fn fspx_compute_rsrc_decodes_threads_and_pgm_rsrc2() {
+        // Registres matériels RDNA 2 : 8x8x1 threads, COMPUTE_PGM_RSRC2 = 0x0b8a
+        // (USER_SGPR=5, TGID_X/Y/Z_EN=0b111, TIDIG_COMP_CNT=1 -> 2 VGPR d'entrée, LDS=0).
+        let words: [u32; 7] = [
+            0x4005_cf00,
+            0x6c09_0102,
+            0,
+            0x0008_0008,
+            1,
+            0x402c_0343,
+            0x0b8a,
+        ];
+        let raw: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let r = parse_fspx_compute_rsrc(&raw).expect("kind0 valide");
+        assert_eq!(r.local_size, [8, 8, 1]);
+        assert_eq!(r.user_sgprs, 5);
+        assert_eq!(r.sys_sgpr_flags, 0x7);
+        assert_eq!(r.num_input_vgprs, 2);
+        assert_eq!(r.lds_dwords, 0);
+    }
+
+    #[test]
+    fn fspx_compute_compiles_end_to_end_to_vk_pipeline() {
+        let _serial = crate::d3d12_xs::test_serial();
+        let Some(dev) = make_device() else {
+            return;
+        };
+        let code_words: [u32; 7] = [
+            0xf408_0100,
+            0xfa00_0000,
+            0xbf8c_c07f,
+            0xe070_1000,
+            0x8001_0000,
+            0xbf81_0000,
+            0xbf9f_0000,
+        ];
+        let k6: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let k0 = [0u8; 28];
+        let k1 = [0u8; 20];
+        let rs = make_root_sig(dev, &[(0, 1)]);
+        #[repr(C)]
+        struct FspxDesc {
+            rs: usize,
+            k0_ptr: usize,
+            k0_sz: u64,
+            k1_ptr: usize,
+            k1_sz: u64,
+            k6_ptr: usize,
+            k6_sz: u64,
+            k7_ptr: usize,
+            k7_sz: u64,
+        }
+        let desc = FspxDesc {
+            rs: rs as usize,
+            k0_ptr: k0.as_ptr() as usize,
+            k0_sz: k0.len() as u64,
+            k1_ptr: k1.as_ptr() as usize,
+            k1_sz: k1.len() as u64,
+            k6_ptr: k6.as_ptr() as usize,
+            k6_sz: k6.len() as u64,
+            k7_ptr: 0,
+            k7_sz: 0,
+        };
+        let iid = IID_ID3D12PIPELINESTATE;
+        let mut pso_raw: *mut c_void = ptr::null_mut();
+        let hr = device_deserialize_compute_pso_x(
+            dev,
+            &raw const desc as usize,
+            (&raw const iid) as usize,
+            &raw mut pso_raw as usize,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(hr, S_OK);
+        assert!(!pso_raw.is_null());
+        // SAFETY: `pso_raw` est un `D3D12PsoObject` créé par `device_deserialize_compute_pso_x`.
+        let pso = unsafe { &*(pso_raw as *const D3D12PsoObject) };
+        assert!(pso.is_compute);
+        assert!(
+            pso.native.is_some(),
+            "le PSO FSPX compute doit être compilé en pipeline Vulkan natif RDNA 2"
+        );
+    }
+
+    #[test]
+    fn fspx_compute_widened_s_mov_b32_compiles_to_vk_pipeline() {
+        let _serial = crate::d3d12_xs::test_serial();
+        let Some(dev) = make_device() else {
+            return;
+        };
+        // Motif exact des shaders FSPX console :
+        //   v_nop_e64 (3 dwords avec littéral 32 bits)
+        //   s_inst_prefetch 3
+        //   s_mov_b32 s8, s4
+        //   s_mov_b32 s9, 0
+        //   s_load_dwordx4 s[12:15], s[8:9], 0x0
+        //   s_waitcnt lgkmcnt(0)
+        //   buffer_store_dword v0, v0, s[12:15], 0 offen
+        //   s_endpgm
+        let code_words: [u32; 12] = [
+            0xd580_0000,
+            0x03fe_0100,
+            0x0000_0ac0,
+            0xbfa0_0003,
+            0xbe88_0304, // s_mov_b32 s8, s4
+            0xbe89_0380, // s_mov_b32 s9, 0
+            0xf408_0304, // s_load_dwordx4 s[12:15], s[8:9], 0x0 (sbase=8/2=4, sdst=12)
+            0xfa00_0000,
+            0xbf8c_c07f, // s_waitcnt lgkmcnt(0)
+            0xe070_1000, // buffer_store_dword v0, v0, s[12:15], 0 offen (srsrc=12/4=3)
+            0x8003_0000,
+            0xbf81_0000, // s_endpgm
+        ];
+        let k6: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let k0_words: [u32; 7] = [
+            0x4005_cf00,
+            0x6c09_0102,
+            0,
+            0x0008_0008,
+            1,
+            0x402c_0343,
+            0x0b8a,
+        ];
+        let k0: Vec<u8> = k0_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let k1 = [0u8; 20];
+        let rs = make_root_sig(dev, &[(0, 1), (0, 1), (0, 1)]);
+        #[repr(C)]
+        struct FspxDesc {
+            rs: usize,
+            k0_ptr: usize,
+            k0_sz: u64,
+            k1_ptr: usize,
+            k1_sz: u64,
+            k6_ptr: usize,
+            k6_sz: u64,
+            k7_ptr: usize,
+            k7_sz: u64,
+        }
+        let desc = FspxDesc {
+            rs: rs as usize,
+            k0_ptr: k0.as_ptr() as usize,
+            k0_sz: k0.len() as u64,
+            k1_ptr: k1.as_ptr() as usize,
+            k1_sz: k1.len() as u64,
+            k6_ptr: k6.as_ptr() as usize,
+            k6_sz: k6.len() as u64,
+            k7_ptr: 0,
+            k7_sz: 0,
+        };
+        let iid = IID_ID3D12PIPELINESTATE;
+        let mut pso_raw: *mut c_void = ptr::null_mut();
+        let hr = device_deserialize_compute_pso_x(
+            dev,
+            &raw const desc as usize,
+            (&raw const iid) as usize,
+            &raw mut pso_raw as usize,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(hr, S_OK);
+        assert!(!pso_raw.is_null());
+        // SAFETY: `pso_raw` est un `D3D12PsoObject` créé par `device_deserialize_compute_pso_x`.
+        let pso = unsafe { &*(pso_raw as *const D3D12PsoObject) };
+        assert!(
+            pso.native.is_some(),
+            "le shader FSPX avec v_nop_e64 + s_mov_b32 s8, s4 doit compiler en VkPipeline natif"
         );
     }
 }

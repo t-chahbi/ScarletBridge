@@ -45,6 +45,21 @@ mots de user data de la commande. **Chaque étage reçoit le même tableau** (pa
 ses `num_user_sgprs` premiers mots. Côté Vulkan : SSBO `(set 0, binding 0)`, chargé par le prologue du shader
 (`SgprInit::UserData(i)`). Un shader dont les `s_load` visent `s[0:1] + offset` voit ainsi le contenu de la table.
 
+### 2 bis. Tables de descripteurs découvertes par le traducteur (compute natif)
+
+Pour un compute dont la signature racine est connue (`RootSigLayout`), les paramètres **table**
+(user-SGPR `first_sgpr[i]`, paire 64 bits) sont déclarés au traducteur (`TranslateConfig::tables`, voir
+`docs/rdna2.md`). `d3d12_native::discover_root_tables` traduit le programme une première fois et en
+tire la liste des entrées `(table, offset)` réellement utilisées (V#, T#, S#, y compris via
+`s_add_u32/s_addc_u32 + s_load_dwordx16`) ; chacune devient un `NativeResource` `Table` (liaison
+`base + indice`, comme avant) et remplace les ressources `Table`/`Pointer` heuristiques de ces SGPR.
+Les paramètres CBV/SRV/UAV racine restent des `Pointer` (données). Sans signature racine connue,
+l'ancienne inférence par motifs `s_load` est conservée (aucune information n'est inventée).
+Échecs : le message du traducteur est renvoyé tel quel avec la liste des user-SGPR de table
+(`tables de descripteurs (user-SGPR [0, 4]) : s_load_dwordx4 depuis s[8:9] (…)`) ; au-delà de 32
+entrées, `n entrées de table + m autres ressources > 32`. Une table dont les mots sont lus comme
+données (`s_load_dword` utilisé arithmétiquement) n'est pas supportée : ces mots valent 0.
+
 ## 3. V#, T#, S# : mots matériels → liaisons Vulkan
 
 Au `ExecuteCommandLists`, pour chaque ressource déclarée, le bridge lit les mots à l'adresse

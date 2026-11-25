@@ -90,6 +90,32 @@ fn config_for(p: &super::test_programs::Program) -> TranslateConfig {
             ];
             c
         }
+        "cs_table_x16"
+        | "cs_table_images"
+        | "err_dynamic_base"
+        | "err_dynamic_soffset"
+        | "err_not_loaded"
+        | "err_split_descriptor" => {
+            let mut c = cs_cfg(p);
+            c.resources.clear();
+            c.tables = vec![DescriptorTable {
+                sgpr: 0,
+                set: 0,
+                binding_base: 0,
+                buffer_stride: 0,
+            }];
+            c
+        }
+        "ps_table_views" => {
+            let mut c = TranslateConfig::new(Stage::Fragment, WaveSize::W32);
+            c.tables = vec![DescriptorTable {
+                sgpr: 0,
+                set: 0,
+                binding_base: 10,
+                buffer_stride: 16,
+            }];
+            c
+        }
         "ps_texture" => {
             let mut c = TranslateConfig::new(Stage::Fragment, WaveSize::W32);
             c.resources = vec![
@@ -231,7 +257,7 @@ fn translate(name: &str) -> TranslatedProgram {
 
 #[test]
 fn every_program_translates_and_validates() {
-    for p in PROGRAMS {
+    for p in PROGRAMS.iter().filter(|p| !p.name.starts_with("err_")) {
         translate(p.name);
     }
 }
@@ -725,4 +751,94 @@ fn ps_mimg_variants_translate_and_validate() {
         .filter(|b| b.kind == "sampled_image")
         .count();
     assert_eq!(sampled, 5, "2D, 3D, cube, 1D array, MSAA");
+}
+
+fn tb(t: &TranslatedProgram) -> Vec<(u32, &'static str, u32)> {
+    t.info
+        .table_bindings
+        .iter()
+        .map(|b| (b.byte_offset, b.kind, b.binding))
+        .collect()
+}
+
+#[test]
+fn table_x16_with_constant_pointer_offsets_gives_one_binding_per_entry() {
+    let t = translate("cs_table_x16");
+    let mut got = tb(&t);
+    got.sort_unstable();
+    let want: Vec<(u32, &str, u32)> = [
+        (0x00, 0),
+        (0x10, 1),
+        (0x20, 2),
+        (0x30, 3),
+        (0x50, 5),
+        (0x60, 6),
+        (0x70, 7),
+        (0x80, 8),
+    ]
+    .iter()
+    .map(|&(o, b)| (o, "storage_buffer", b))
+    .collect();
+    assert_eq!(
+        got, want,
+        "0x80 chargé deux fois (x16 puis x4) : une seule liaison"
+    );
+    assert!(
+        t.info
+            .table_bindings
+            .iter()
+            .all(|b| b.table_sgpr == 0 && b.set == 0)
+    );
+}
+
+#[test]
+fn table_with_2d_array_3d_cube_images_samplers_and_buffers() {
+    let t = translate("ps_table_views");
+    let mut got = tb(&t);
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![
+            (0x00, "sampler", 10),
+            (0x10, "sampled_image", 11),
+            (0x30, "sampled_image", 13),
+            (0x50, "sampled_image", 15),
+            (0x70, "sampled_image", 17),
+            (0x90, "storage_buffer", 19),
+        ]
+    );
+    let mut keys: Vec<(u32, u32)> = t.info.bindings.iter().map(|b| (b.set, b.binding)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys.len(), t.info.bindings.len(), "liaisons uniques");
+}
+
+fn tr_err(name: &str) -> String {
+    let p = program(name);
+    match translate_program(p.words, &config_for(p)) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("{name} devrait échouer"),
+    }
+}
+
+#[test]
+fn unresolved_resources_explain_why() {
+    let e = tr_err("err_dynamic_base");
+    assert!(
+        e.contains("s_load_dwordx4") && e.contains("s_add_u32"),
+        "{e}"
+    );
+    assert!(e.contains("s[8:9]") && e.contains("tables : s[0:1]"), "{e}");
+    let e = tr_err("err_dynamic_soffset");
+    assert!(
+        e.contains("s_load_dwordx4") && e.contains("non constant"),
+        "{e}"
+    );
+    let e = tr_err("err_not_loaded");
+    assert!(
+        e.contains("V#") && e.contains("s[16:19]") && e.contains("jamais chargé"),
+        "{e}"
+    );
+    let e = tr_err("err_split_descriptor");
+    assert!(e.contains("contigus") && e.contains("s[0:1]"), "{e}");
 }

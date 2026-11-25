@@ -4,7 +4,8 @@
 use super::inst::{Instruction, Operand, Src};
 use super::tables::TBUF_FORMATS;
 use super::translate::{
-    ResRef, ResourceKind, ResourceLoc, Stage, TResult, Tr, TranslateError, res_ref, unsupported,
+    DescKind, ResRef, ResourceKind, ResourceLoc, Stage, TResult, TableBindingUse, Tr,
+    TranslateError, res_ref, unsupported,
 };
 use crate::dxbc_to_spirv::spv::{Sc, Val};
 
@@ -59,17 +60,143 @@ impl Tr<'_> {
     }
 
     fn buffer_res(&mut self, o: &Operand) -> TResult<(ResRef, u32)> {
-        let n = Self::sgpr_index(o)?;
-        match self.res_map.get(&n).copied() {
-            Some(r) => match r.kind {
-                ResourceKind::Buffer { stride } => Ok((r, stride)),
-                _ => err(format!("s{n} ne désigne pas un buffer")),
-            },
-            None => err(format!(
-                "aucun descripteur de buffer connu dans s[{n}:{}]",
-                n + 3
-            )),
+        let r = self.resolve_desc(o, DescKind::Buffer)?;
+        match r.kind {
+            ResourceKind::Buffer { stride } => Ok((r, stride)),
+            _ => err(format!("{}: descripteur de buffer attendu", self.cur_name)),
         }
+    }
+
+    /// Explique pourquoi les SGPR `[n, n+words)` ne contiennent pas de descripteur résolu.
+    fn explain_sgpr(&self, n: u8, words: u8) -> String {
+        let mut why = Vec::new();
+        for k in n..n.saturating_add(words) {
+            let alias = self.sgpr_alias.get(&k);
+            let origin = self.desc_words.get(&k);
+            why.push(match (origin, alias) {
+                (Some((t, off)), _) => format!("s{k}=mot de table s[{t}:{}]+{off:#x}", t + 1),
+                (None, Some((o, a))) => format!("s{k}=alias de s{o}+{a:#x} (pas un descripteur)"),
+                (None, None) => match self.last_writer.get(&k) {
+                    Some(w) => {
+                        format!("s{k} écrit en dernier par `{w}` (valeur non constante/inconnue)")
+                    }
+                    None => format!("s{k} jamais chargé par un s_load depuis une table"),
+                },
+            });
+        }
+        let tables: Vec<String> = self
+            .cfg
+            .tables
+            .iter()
+            .map(|t| format!("s[{}:{}]", t.sgpr, t.sgpr + 1))
+            .collect();
+        format!(
+            "{} ; tables déclarées : {}",
+            why.join(", "),
+            if tables.is_empty() {
+                "aucune".into()
+            } else {
+                tables.join(" ")
+            }
+        )
+    }
+
+    /// Résout le descripteur de nature `kind` dont le premier SGPR est celui de `o` : ressource
+    /// déclarée (`Resource`), sinon entrée d'une table déclarée (`TranslateConfig::tables`) avec une
+    /// liaison attribuée automatiquement `(set, binding_base + offset/16)`.
+    pub(crate) fn resolve_desc(&mut self, o: &Operand, kind: DescKind) -> TResult<ResRef> {
+        let n = Self::sgpr_index(o)?;
+        let words = kind.dwords();
+        let ctx = self.cur_name;
+        if let Some(r) = self.res_map.get(&n).copied() {
+            let ok = matches!(
+                (r.kind, kind),
+                (ResourceKind::Buffer { .. }, DescKind::Buffer)
+                    | (ResourceKind::Image, DescKind::Image)
+                    | (ResourceKind::Sampler, DescKind::Sampler)
+            );
+            return if ok {
+                Ok(r)
+            } else {
+                err(format!(
+                    "{ctx} : s[{n}:{}] est un descripteur {:?} déclaré, {} attendu",
+                    n + words - 1,
+                    r.kind,
+                    kind.label()
+                ))
+            };
+        }
+        let Some(&(t, off)) = self.desc_words.get(&n) else {
+            return err(format!(
+                "{ctx} : {} dans s[{n}:{}] non résolu : {}",
+                kind.label(),
+                n + words - 1,
+                self.explain_sgpr(n, words)
+            ));
+        };
+        for j in 1..words {
+            if self.desc_words.get(&(n + j)) != Some(&(t, off + 4 * i64::from(j))) {
+                return err(format!(
+                    "{ctx} : {} dans s[{n}:{}] mal formé : les mots ne viennent pas d'offsets contigus de la table s[{t}:{}] ({})",
+                    kind.label(),
+                    n + words - 1,
+                    t + 1,
+                    self.explain_sgpr(n, words)
+                ));
+            }
+        }
+        let Some(tbl) = self.cfg.tables.iter().find(|x| x.sgpr == t).copied() else {
+            return err(format!("{ctx} : table s[{t}:{}] non déclarée", t + 1));
+        };
+        if off < 0 || off % 16 != 0 {
+            return err(format!(
+                "{ctx} : descripteur à l'offset {off:#x} de la table s[{t}:{}] : l'offset doit être un multiple de 16 positif",
+                t + 1
+            ));
+        }
+        let binding = tbl.binding_base + (off / 16) as u32;
+        let tag = match kind {
+            DescKind::Buffer => "storage_buffer",
+            DescKind::Image => "sampled_image",
+            DescKind::Sampler => "sampler",
+        };
+        if let Some(prev) = self
+            .info
+            .table_bindings
+            .iter()
+            .find(|b| b.table_sgpr == t && i64::from(b.byte_offset) == off)
+        {
+            let same = (prev.kind == "storage_buffer") == (kind == DescKind::Buffer)
+                && (prev.kind == "sampler") == (kind == DescKind::Sampler);
+            if !same {
+                return err(format!(
+                    "{ctx} : l'entrée {off:#x} de la table s[{t}:{}] est utilisée avec deux natures ({} puis {})",
+                    t + 1,
+                    prev.kind,
+                    tag
+                ));
+            }
+        } else {
+            self.info.table_bindings.push(TableBindingUse {
+                table_sgpr: t,
+                byte_offset: off as u32,
+                kind: tag,
+                set: tbl.set,
+                binding,
+            });
+        }
+        Ok(ResRef {
+            kind: match kind {
+                DescKind::Buffer => ResourceKind::Buffer {
+                    stride: tbl.buffer_stride,
+                },
+                DescKind::Image => ResourceKind::Image,
+                DescKind::Sampler => ResourceKind::Sampler,
+            },
+            set: tbl.set,
+            binding,
+            size: words,
+        })
     }
 
     // ------------------------------------------------------------ SMEM
@@ -96,19 +223,33 @@ impl Tr<'_> {
             let (r, _) = self.buffer_res(&base)?;
             return self.smem_read_words(r.set, r.binding, imm, soff, dcode, count);
         }
-        // s_load : base = paire de SGPR
+        // s_load : base = paire de SGPR (suivi symbolique `origine + offset constant` via
+        // `s_mov_b32/b64`, `s_add_u32`/`s_sub_u32` + `s_addc_u32`, `s_addk_i32`).
         let n = Self::sgpr_index(&base)?;
+        let (orig, add_off) = self.sgpr_alias.get(&n).copied().unwrap_or((n, 0));
+        let eff_imm = i64::from(imm).saturating_add(add_off);
+        // soffset constant (inline/littéral/null) ou inconnu
+        let const_soff: Option<i64> = if i.mods.smem_soffset {
+            match i.operands.get(2).map(|o| o.src) {
+                Some(Src::InlineInt(v)) => Some(i64::from(v)),
+                Some(Src::Literal(v)) => Some(i64::from(v)),
+                Some(Src::Null) => Some(0),
+                _ => None,
+            }
+        } else {
+            Some(0)
+        };
         let cfg = self.cfg;
         // 1. pointeur vers un buffer de données
         for r in &cfg.resources {
             if let (ResourceLoc::Pointer(p), ResourceKind::Buffer { .. }) = (r.loc, r.kind)
-                && p == n
+                && (p == n || p == orig)
             {
-                return self.smem_read_words(r.set, r.binding, imm, soff, dcode, count);
+                return self.smem_read_words(r.set, r.binding, eff_imm as i32, soff, dcode, count);
             }
         }
         // 2. table de descripteurs : on associe les SGPR de destination aux ressources chargées
-        let lo = i64::from(imm);
+        let lo = eff_imm.saturating_add(const_soff.unwrap_or(0));
         let hi = lo + 4 * count as i64;
         let mut found = false;
         self.clobber(dcode, count);
@@ -120,19 +261,92 @@ impl Tr<'_> {
             {
                 let sz = i64::from(res_ref(r).size) * 4;
                 let off = i64::from(byte_offset);
-                if table_sgpr == n && off >= lo && off + sz <= hi && soff.is_none() {
+                if (table_sgpr == n || table_sgpr == orig)
+                    && off >= lo
+                    && off + sz <= hi
+                    && const_soff.is_some()
+                {
                     let sgpr = dcode + ((off - lo) / 4) as usize;
                     self.res_map.insert(sgpr as u8, res_ref(r));
                     found = true;
                 }
             }
         }
+        // 3. table déclarée (`TranslateConfig::tables`) : les mots chargés sont des mots de
+        //    descripteurs ; leur nature (V#/T#/S#) est décidée à l'usage.
+        if let Some(tbl) = cfg.tables.iter().find(|t| t.sgpr == orig || t.sgpr == n) {
+            let Some(cs) = const_soff else {
+                return err(format!(
+                    "{name} depuis s[{n}:{}] (base = table s[{}:{}] + {add_off:#x}, imm={imm:#x}) : offset SGPR/non constant (soffset={:?}), impossible de choisir l'entrée de table",
+                    n + 1,
+                    tbl.sgpr,
+                    tbl.sgpr + 1,
+                    i.operands.get(2).map(|o| o.src)
+                ));
+            };
+            let start = eff_imm.saturating_add(cs);
+            if start < 0 || start % 4 != 0 {
+                return err(format!(
+                    "{name} depuis la table s[{}:{}] : offset {start} invalide (doit être positif et multiple de 4)",
+                    tbl.sgpr,
+                    tbl.sgpr + 1
+                ));
+            }
+            for k in 0..count {
+                let code = dcode + k;
+                if let Ok(c8) = u8::try_from(code) {
+                    self.desc_words.insert(c8, (tbl.sgpr, start + 4 * k as i64));
+                }
+                let v = self.cu(0);
+                let var = self.svar(code);
+                self.store_u32(var, v);
+            }
+            return Ok(());
+        }
         if found {
             return Ok(());
         }
+        let writer = |t: &Self, r: u8| {
+            t.last_writer
+                .get(&r)
+                .map_or("jamais écrit".to_string(), |w| {
+                    format!("écrit en dernier par `{w}`")
+                })
+        };
+        let ptrs: Vec<String> = cfg
+            .resources
+            .iter()
+            .filter_map(|r| match r.loc {
+                ResourceLoc::Pointer(p) => Some(format!("s[{p}:{}]", p + 1)),
+                _ => None,
+            })
+            .collect();
+        let tbls: Vec<String> = cfg
+            .tables
+            .iter()
+            .map(|t| format!("s[{}:{}]", t.sgpr, t.sgpr + 1))
+            .collect();
         err(format!(
-            "s_load depuis s[{n}:{}] : ni pointeur de buffer ni table de descripteurs configuré",
-            n + 1
+            "{name} depuis s[{n}:{}] (origine symbolique s{orig}{}, imm={imm:#x}, {count} dwords) : base ni pointeur de buffer ni table de descripteurs déclaré (s{n} {}, s{} {}; pointeurs : {}; tables : {})",
+            n + 1,
+            if orig == n && add_off == 0 {
+                " [aucun alias connu]".to_string()
+            } else {
+                format!(" + {add_off:#x}")
+            },
+            writer(self, n),
+            n + 1,
+            writer(self, n + 1),
+            if ptrs.is_empty() {
+                "aucun".into()
+            } else {
+                ptrs.join(" ")
+            },
+            if tbls.is_empty() {
+                "aucune".into()
+            } else {
+                tbls.join(" ")
+            },
         ))
     }
 
@@ -211,7 +425,9 @@ impl Tr<'_> {
             }
             if let Some(r) = idx_reg {
                 if stride == 0 {
-                    return err("accès idxen sur un buffer de stride 0");
+                    return err(format!(
+                        "{name} : accès idxen sur un buffer de stride 0 (déclarez `Resource::Buffer {{ stride }}` ou `DescriptorTable::buffer_stride`)"
+                    ));
                 }
                 let var = self.vvar(r);
                 let v = self.load_u32(var);

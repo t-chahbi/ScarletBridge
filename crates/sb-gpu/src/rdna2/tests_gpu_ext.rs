@@ -638,6 +638,34 @@ struct ImgRun {
     rgba: [[u8; 4]; 4],
 }
 
+/// Liaisons Vulkan des images de `run_img` (une seconde texture échantillonnée est optionnelle).
+#[derive(Clone, Copy)]
+struct ImgBind {
+    sampled: u32,
+    sampled2: Option<u32>,
+    sampler: u32,
+    r32: u32,
+    rgba: u32,
+}
+
+impl ImgBind {
+    const LEGACY: ImgBind = ImgBind {
+        sampled: 4,
+        sampled2: None,
+        sampler: 5,
+        r32: 6,
+        rgba: 7,
+    };
+}
+
+/// Contenu de la seconde texture (couleurs permutées).
+const TEXELS2: [[u8; 4]; 4] = [
+    [0, 255, 255, 255],
+    [255, 0, 255, 255],
+    [255, 255, 0, 255],
+    [0, 0, 255, 255],
+];
+
 const TEXELS: [[u8; 4]; 4] = [
     [255, 0, 0, 255],
     [0, 255, 0, 255],
@@ -646,7 +674,7 @@ const TEXELS: [[u8; 4]; 4] = [
 ];
 
 impl Gpu {
-    fn run_img(&self, spv: &[u32], subgroup: u32, words: usize) -> Option<ImgRun> {
+    fn run_img(&self, spv: &[u32], subgroup: u32, words: usize, b: ImgBind) -> Option<ImgRun> {
         // SAFETY: ressources créées puis détruites ici ; mémoire hôte lue après `queue_wait_idle`.
         unsafe {
             let d = &self.dev;
@@ -763,6 +791,15 @@ impl Gpu {
                     4,
                 );
             }
+            let (tex2, t2mem, t2view, t2pitch, t2p) =
+                mk_img(vk::Format::R8G8B8A8_UNORM, vk::ImageUsageFlags::SAMPLED)?;
+            for (k, t) in TEXELS2.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(
+                    t.as_ptr(),
+                    t2p.add((k / 2) * t2pitch + (k % 2) * 4),
+                    4,
+                );
+            }
             let (sa, samem, saview, sapitch, sap) =
                 mk_img(vk::Format::R32_UINT, vk::ImageUsageFlags::STORAGE)?;
             let (sb, sbmem, sbview, sbpitch, sbp) =
@@ -787,13 +824,16 @@ impl Gpu {
                     .descriptor_count(1)
                     .stage_flags(cs)
             };
-            let binds = [
+            let mut binds = vec![
                 bind(0, vk::DescriptorType::STORAGE_BUFFER),
-                bind(4, vk::DescriptorType::SAMPLED_IMAGE),
-                bind(5, vk::DescriptorType::SAMPLER),
-                bind(6, vk::DescriptorType::STORAGE_IMAGE),
-                bind(7, vk::DescriptorType::STORAGE_IMAGE),
+                bind(b.sampled, vk::DescriptorType::SAMPLED_IMAGE),
+                bind(b.sampler, vk::DescriptorType::SAMPLER),
+                bind(b.r32, vk::DescriptorType::STORAGE_IMAGE),
+                bind(b.rgba, vk::DescriptorType::STORAGE_IMAGE),
             ];
+            if let Some(s2) = b.sampled2 {
+                binds.push(bind(s2, vk::DescriptorType::SAMPLED_IMAGE));
+            }
             let dsl = d
                 .create_descriptor_set_layout(
                     &vk::DescriptorSetLayoutCreateInfo::default().bindings(&binds),
@@ -832,7 +872,7 @@ impl Gpu {
                     .descriptor_count(1),
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(1),
+                    .descriptor_count(2),
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::SAMPLER)
                     .descriptor_count(1),
@@ -861,6 +901,9 @@ impl Gpu {
             let ti = [vk::DescriptorImageInfo::default()
                 .image_view(tview)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let ti2 = [vk::DescriptorImageInfo::default()
+                .image_view(t2view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let si = [vk::DescriptorImageInfo::default().sampler(sampler)];
             let ai = [vk::DescriptorImageInfo::default()
                 .image_view(saview)
@@ -874,16 +917,17 @@ impl Gpu {
                     .dst_binding(b)
                     .descriptor_type(t)
             };
-            d.update_descriptor_sets(
-                &[
-                    w(0, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi),
-                    w(4, vk::DescriptorType::SAMPLED_IMAGE).image_info(&ti),
-                    w(5, vk::DescriptorType::SAMPLER).image_info(&si),
-                    w(6, vk::DescriptorType::STORAGE_IMAGE).image_info(&ai),
-                    w(7, vk::DescriptorType::STORAGE_IMAGE).image_info(&bi2),
-                ],
-                &[],
-            );
+            let mut writes = vec![
+                w(0, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi),
+                w(b.sampled, vk::DescriptorType::SAMPLED_IMAGE).image_info(&ti),
+                w(b.sampler, vk::DescriptorType::SAMPLER).image_info(&si),
+                w(b.r32, vk::DescriptorType::STORAGE_IMAGE).image_info(&ai),
+                w(b.rgba, vk::DescriptorType::STORAGE_IMAGE).image_info(&bi2),
+            ];
+            if let Some(s2) = b.sampled2 {
+                writes.push(w(s2, vk::DescriptorType::SAMPLED_IMAGE).image_info(&ti2));
+            }
+            d.update_descriptor_sets(&writes, &[]);
             let cp = d
                 .create_command_pool(
                     &vk::CommandPoolCreateInfo::default().queue_family_index(self.qfam),
@@ -926,6 +970,11 @@ impl Gpu {
             };
             barrier(
                 tex,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::SHADER_READ,
+            );
+            barrier(
+                tex2,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 vk::AccessFlags::SHADER_READ,
             );
@@ -986,7 +1035,12 @@ impl Gpu {
             d.destroy_pipeline_layout(pl, None);
             d.destroy_descriptor_set_layout(dsl, None);
             d.destroy_sampler(sampler, None);
-            for (img, mem, view) in [(tex, tmem, tview), (sa, samem, saview), (sb, sbmem, sbview)] {
+            for (img, mem, view) in [
+                (tex, tmem, tview),
+                (tex2, t2mem, t2view),
+                (sa, samem, saview),
+                (sb, sbmem, sbview),
+            ] {
                 d.destroy_image_view(view, None);
                 d.destroy_image(img, None);
                 d.unmap_memory(mem);
@@ -1036,7 +1090,7 @@ fn gpu_mimg_battery_sample_gather_load_store_atomic() {
         res(ResourceKind::Image, 7, 0x80),
     ];
     let t = translate_program(p.words, &cfg).unwrap_or_else(|e| panic!("cs_mimg_battery: {e}"));
-    let Some(o) = gpu.run_img(&t.words, 32, 64 * segs.len() + 64) else {
+    let Some(o) = gpu.run_img(&t.words, 32, 64 * segs.len() + 64, ImgBind::LEGACY) else {
         eprintln!("exécution GPU impossible : test ignoré");
         return;
     };
@@ -1232,5 +1286,131 @@ fn gpu_buffer_byte_and_short_stores() {
         assert_eq!(bytes[t], (0x41 + t) as u8, "buffer_store_byte {t}");
         let s = u16::from_le_bytes([bytes[256 + 2 * t], bytes[257 + 2 * t]]);
         assert_eq!(s, 0x41 + t as u16, "buffer_store_short {t}");
+    }
+}
+
+// ---------------------------------------------------------------------------- tables de descripteurs
+
+#[test]
+#[ignore = "nécessite un GPU Vulkan"]
+fn gpu_s_load_dwordx16_from_descriptor_table_with_constant_offsets() {
+    let Some(gpu) = Gpu::new() else {
+        eprintln!("aucun GPU Vulkan : test ignoré");
+        return;
+    };
+    let mut cfg = cs_cfg(WaveSize::W32);
+    cfg.tables = vec![DescriptorTable {
+        sgpr: 0,
+        set: 0,
+        binding_base: 0,
+        buffer_stride: 0,
+    }];
+    // liaisons attendues : entrées 0x00,0x10,0x20,0x30 -> 0..3 ; 0x50..0x80 -> 5..8 (4 inutilisée)
+    let moduli = [0u32, 0, 3, 4, 0, 5, 7, 8, 9];
+    let mut bufs: Vec<BufSpec> = Vec::new();
+    for (b, m) in moduli.iter().enumerate() {
+        let words: Vec<u32> = (0..64u32)
+            .map(|t| {
+                if b == 1 {
+                    t
+                } else if *m == 0 {
+                    0
+                } else {
+                    t % *m
+                }
+            })
+            .collect();
+        bufs.push(BufSpec { words, bda: false });
+    }
+    let Some(o) = run_named(&gpu, "cs_table_x16", cfg, &bufs, &[]) else {
+        return;
+    };
+    for t in 0..64u32 {
+        let want = t
+            + 10 * (t % 3)
+            + 100 * (t % 4)
+            + 1000 * (t % 5)
+            + 10_000 * (t % 7)
+            + 100_000 * (t % 8)
+            + 1_000_000 * (t % 9)
+            + (t % 9); // 0x80 relu une seconde fois par s_load_dwordx4 depuis s[24:25]+0x40
+        assert_eq!(o[0][t as usize], want, "lane {t}");
+    }
+}
+
+#[test]
+#[ignore = "nécessite un GPU Vulkan"]
+fn gpu_multiple_image_views_from_one_descriptor_table() {
+    let Some(gpu) = Gpu::new() else {
+        eprintln!("aucun GPU Vulkan : test ignoré");
+        return;
+    };
+    let p = prog("cs_table_images");
+    let mut cfg = cs_cfg(WaveSize::W32);
+    cfg.tables = vec![DescriptorTable {
+        sgpr: 0,
+        set: 0,
+        binding_base: 0,
+        buffer_stride: 0,
+    }];
+    let t = translate_program(p.words, &cfg).unwrap_or_else(|e| panic!("cs_table_images: {e}"));
+    let mut tbs: Vec<(u32, &str, u32)> = t
+        .info
+        .table_bindings
+        .iter()
+        .map(|b| (b.byte_offset, b.kind, b.binding))
+        .collect();
+    tbs.sort_unstable();
+    assert_eq!(
+        tbs,
+        vec![
+            (0x00, "storage_buffer", 0),
+            (0x10, "sampler", 1),
+            (0x20, "sampled_image", 2),
+            (0x40, "sampled_image", 4),
+            (0x60, "storage_image", 6),
+            (0x80, "storage_image", 8),
+        ]
+    );
+    let bind = ImgBind {
+        sampled: 2,
+        sampled2: Some(4),
+        sampler: 1,
+        r32: 6,
+        rgba: 8,
+    };
+    let Some(o) = gpu.run_img(&t.words, 32, 64 * 3 + 64, bind) else {
+        eprintln!("exécution GPU impossible : test ignoré");
+        return;
+    };
+    for tid in 0..64u32 {
+        let (x4, y4) = ((tid & 3) as f32, ((tid >> 2) & 3) as f32);
+        let (tx, ty) = (
+            (((x4 + 0.5) / 4.0) * 2.0) as usize,
+            (((y4 + 0.5) / 4.0) * 2.0) as usize,
+        );
+        let k = ty * 2 + tx;
+        assert_eq!(
+            f32::from_bits(o.buf[tid as usize]),
+            f32::from(TEXELS[k][0]) / 255.0,
+            "vue A (R) lane {tid}"
+        );
+        assert_eq!(
+            f32::from_bits(o.buf[64 + tid as usize]),
+            f32::from(TEXELS2[k][1]) / 255.0,
+            "vue B (G) lane {tid}"
+        );
+    }
+    let mut ret: Vec<u32> = o.buf[128..192].to_vec();
+    ret.sort_unstable();
+    assert_eq!(
+        ret,
+        (0..64).collect::<Vec<u32>>(),
+        "image_atomic_add (storage r32)"
+    );
+    assert_eq!(o.r32[0], 64);
+    for (k, px) in o.rgba.iter().enumerate() {
+        let (x, y) = ((k % 2) as u8, (k / 2) as u8);
+        assert_eq!(*px, [255 * x, 255 * y, 0, 255], "image_store texel {k}");
     }
 }

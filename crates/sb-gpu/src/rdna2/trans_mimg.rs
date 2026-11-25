@@ -11,7 +11,7 @@
 
 use super::inst::Instruction;
 use super::trans_mem::{err, vgpr_of};
-use super::translate::{BindingUse, ResourceKind, Stage, TResult, Tr, TranslateError, unsupported};
+use super::translate::{BindingUse, DescKind, Stage, TResult, Tr, TranslateError, unsupported};
 use crate::dxbc_to_spirv::spv::{Sc, Val};
 
 const OP_BFSEXT: u16 = 202;
@@ -251,22 +251,17 @@ impl Tr<'_> {
             regs: regs.into_iter(),
             name: name.to_string(),
         };
-        let rn = Self::sgpr_index(&rsrc)?;
-        let Some(res) = self
-            .res_map
-            .get(&rn)
-            .copied()
-            .filter(|r| r.kind == ResourceKind::Image)
-        else {
-            return err(format!("aucun T# connu dans s[{rn}:{}]", rn + 7));
-        };
+        let res = self.resolve_desc(&rsrc, DescKind::Image)?;
         let d0 = vgpr_of(&vdata)?;
         let f32t = self.spv.ty(Sc::F32, 1);
         let v4 = self.spv.ty(Sc::F32, 4);
+        let rw_storage = self.storage_images.get(&(res.set, res.binding)).copied();
         let storage = if is_store {
-            2
+            rw_storage.unwrap_or(2)
         } else if is_atomic {
             3
+        } else if is_load && name != "image_load_mip" {
+            rw_storage.unwrap_or(1)
         } else {
             1
         };
@@ -305,17 +300,32 @@ impl Tr<'_> {
                     args.push(mask);
                     args.extend(ops_ids);
                 }
-                let px = self.spv.emit(95, v4, &args);
+                let (opcode, res_ty, res_sc) = if storage >= 2 {
+                    self.spv.caps.insert(55); // StorageImageReadWithoutFormat
+                    if storage == 3 {
+                        (98, self.spv.ty(Sc::U32, 4), Sc::U32)
+                    } else {
+                        (98, v4, Sc::F32)
+                    }
+                } else {
+                    (95, v4, Sc::F32)
+                };
+                let px = self.spv.emit(opcode, res_ty, &args);
                 let comps: Vec<Val> = (0..4)
                     .map(|c| {
-                        self.spv.extract(
+                        let ex = self.spv.extract(
                             Val {
                                 id: px,
-                                sc: Sc::F32,
+                                sc: res_sc,
                                 n: 4,
                             },
                             c,
-                        )
+                        );
+                        if res_sc == Sc::U32 {
+                            self.spv.bitcast(ex, Sc::F32)
+                        } else {
+                            ex
+                        }
                     })
                     .collect();
                 self.write_image_result(i, d0, &comps);
@@ -557,15 +567,7 @@ impl Tr<'_> {
             None
         };
 
-        let sn = Self::sgpr_index(&ops[n - 1])?;
-        let Some(smp) = self
-            .res_map
-            .get(&sn)
-            .copied()
-            .filter(|r| r.kind == ResourceKind::Sampler)
-        else {
-            return err(format!("aucun S# connu dans s[{sn}:{}]", sn + 3));
-        };
+        let smp = self.resolve_desc(&ops[n - 1], DescKind::Sampler)?;
         let smp_var = self.sampler_var(smp.set, smp.binding);
         let samp_ty = self.spv.raw_type(26, &[]);
         let si_ty = self.spv.raw_type(27, &[img_ty]);

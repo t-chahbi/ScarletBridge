@@ -44,8 +44,8 @@
 use thiserror::Error;
 
 use crate::rdna2::{
-    ProgramInfo, Resource, ResourceKind, ResourceLoc, SgprInit, Stage, TranslateConfig, VgprInit,
-    WaveSize, translate_program,
+    DescriptorTable, ProgramInfo, Resource, ResourceKind, ResourceLoc, SgprInit, Stage,
+    TranslateConfig, VgprInit, WaveSize, translate_program,
 };
 
 pub const SBR2_MAGIC: [u8; 4] = *b"SBR2";
@@ -475,6 +475,55 @@ impl NativeShader {
             });
         }
         cfg
+    }
+
+    /// Découvre, par traduction, les entrées de **tables de descripteurs** (V#/T#/S#) que le
+    /// programme charge depuis les paires de SGPR `tables` (pointeurs de table de user data),
+    /// y compris à travers `s_add_u32/s_addc_u32`, `s_mov_b32/b64` et `s_load_dwordx16`.
+    /// Retourne une [`NativeResource`] `Table` par entrée `(table, offset)` réellement utilisée.
+    /// Les ressources déjà présentes dans `meta.resources` (pointeurs, SGPR) sont conservées pour
+    /// la traduction mais ne sont pas retournées. Une base ou un offset non constant fait échouer
+    /// avec un message qui nomme l'instruction et le SGPR.
+    pub fn discover_table_resources(
+        &self,
+        tables: &[u8],
+    ) -> Result<Vec<NativeResource>, NativeError> {
+        let mut cfg = self.translate_config();
+        cfg.tables = tables
+            .iter()
+            .map(|&sgpr| DescriptorTable {
+                sgpr,
+                set: 0,
+                binding_base: 1000,
+                buffer_stride: 4,
+            })
+            .collect();
+        let t = translate_program(&self.code, &cfg)
+            .map_err(|e| NativeError::Translate(e.to_string()))?;
+        let mut found: Vec<NativeResource> = t
+            .info
+            .table_bindings
+            .iter()
+            .map(|b| NativeResource {
+                kind: match b.kind {
+                    "sampled_image" | "storage_image" => NativeResourceKind::Image,
+                    "sampler" => NativeResourceKind::Sampler,
+                    _ => NativeResourceKind::Buffer { stride: 4 },
+                },
+                loc: NativeResourceLoc::Table {
+                    table_sgpr: b.table_sgpr,
+                    byte_offset: b.byte_offset,
+                },
+            })
+            .collect();
+        found.sort_by_key(|r| match r.loc {
+            NativeResourceLoc::Table {
+                table_sgpr,
+                byte_offset,
+            } => (table_sgpr, byte_offset),
+            _ => (u8::MAX, 0),
+        });
+        Ok(found)
     }
 
     /// Traduit le programme en SPIR-V et recense les liaisons Vulkan réellement utilisées.

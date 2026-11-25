@@ -3860,6 +3860,55 @@ const fn build_cmdlist_vtbl() -> D3D12CmdListVtbl {
 
 static D3D12_CMDLIST_VTBL: D3D12CmdListVtbl = build_cmdlist_vtbl();
 
+extern "win64" fn cmdlist_console_slot126(
+    _this: *mut D3D12CmdListObject,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+) -> HResult {
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 2 {
+        let p3 = peek_u64_words(a3, 4);
+        sb_info!(
+            CHANNEL,
+            "ID3D12GraphicsCommandList::slot126(a2={a2:#x}, a3={a3:#x}:{p3:x?}, a4={a4:#x})"
+        );
+    }
+    S_OK
+}
+
+extern "win64" fn cmdlist_console_slot131(
+    _this: *mut D3D12CmdListObject,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+) -> HResult {
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 2 {
+        sb_info!(
+            CHANNEL,
+            "ID3D12GraphicsCommandList::slot131(a2={a2:#x}, a3={a3:#x}, a4={a4:#x})"
+        );
+    }
+    S_OK
+}
+
+extern "win64" fn cmdlist_console_slot142(
+    _this: *mut D3D12CmdListObject,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+) -> HResult {
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 2 {
+        sb_info!(
+            CHANNEL,
+            "ID3D12GraphicsCommandList::slot142(a2={a2:#x}, a3={a3:#x}, a4={a4:#x})"
+        );
+    }
+    S_OK
+}
+
 /// Vtable `ID3D12GraphicsCommandList` **console Xbox Series X** (`d3d12_xs.h`) :
 /// décalage `+4` à partir de `SetDescriptorHeaps` (slot 32 au lieu de 28 sur PC), jusqu'à
 /// `ClearRenderTargetView` (slot 52 au lieu de 48), suivi des extensions console (`70..=148`).
@@ -3920,12 +3969,12 @@ const fn build_console_cmdlist_vtbl() -> D3D12CmdListVtbl {
     slots[83] = vslot(cmdlist_copy_texture_region as *const c_void); // CopyTextureRegionX (ancien)
     slots[85] = vslot(cmdlist_copy_texture_region as *const c_void); // CopyTextureRegionX (nouveau)
     slots[108] = vslot(cmdlist_noop_void as *const c_void); // ResolveSubresourceRegion
-    slots[126] = vslot(cmdlist_noop_void as *const c_void); // Réglage console
-    slots[131] = vslot(cmdlist_noop_void as *const c_void); // Réglage console
+    slots[126] = vslot(cmdlist_console_slot126 as *const c_void); // Réglage console
+    slots[131] = vslot(cmdlist_console_slot131 as *const c_void); // Réglage console
     slots[132] = vslot(cmdlist_noop_void as *const c_void); // Réglage console
     slots[139] = vslot(cmdlist_reset as *const c_void); // Reset (console)
     slots[141] = vslot(cmdlist_noop_void as *const c_void); // SetComputeScratchX (FSR/console)
-    slots[142] = vslot(cmdlist_noop_void as *const c_void); // Réglage / marqueur console
+    slots[142] = vslot(cmdlist_console_slot142 as *const c_void); // Réglage / marqueur console
     slots[146] = vslot(cmdlist_noop_void as *const c_void); // Barrier (enhanced)
     slots[148] = vslot(cmdlist_allocate_upload_memory as *const c_void); // AllocateUploadMemory
     D3D12CmdListVtbl { slots }
@@ -4062,7 +4111,17 @@ extern "win64" fn queue_execute_command_lists(
             if cl_ptr.is_null() {
                 continue;
             }
-            // SAFETY: `cl_ptr` est un `D3D12CmdListObject` valide.
+            if !matches!(
+                d3d_known_object_name(cl_ptr as usize),
+                Some("ID3D12GraphicsCommandList" | "ID3D12DmaCommandList")
+            ) {
+                sb_warn!(
+                    CHANNEL,
+                    "ExecuteCommandLists : élément non reconnu ignoré ({cl_ptr:p})"
+                );
+                continue;
+            }
+            // SAFETY: `cl_ptr` vérifié comme `D3D12CmdListObject` créé par le bridge.
             let cl = unsafe { &*cl_ptr };
             let ops = cl.ops.lock();
             for op in ops.iter() {
@@ -4543,6 +4602,40 @@ extern "win64" fn queue_get_desc(
     out_desc
 }
 
+/// Slot 35 console sur `ID3D12CommandQueue` : si `a3` pointe vers un tableau de listes de
+/// commandes du bridge, exécute `ExecuteCommandLists` ; sinon journalise les premiers appels et
+/// renvoie `S_OK` sans déréférencement risqué.
+extern "win64" fn queue_slot35_console(
+    this: *mut D3D12QueueObject,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ID3D12CommandQueue::slot35", E_UNEXPECTED, {
+        if a2 > 0 && a2 <= 64 && a3 >= 0x1_0000 {
+            let first_words = peek_u64_words(a3, 1);
+            if let Some(&first) = first_words.first()
+                && matches!(
+                    d3d_known_object_name(first as usize),
+                    Some("ID3D12GraphicsCommandList" | "ID3D12DmaCommandList")
+                )
+            {
+                queue_execute_command_lists(this, a2 as u32, a3 as *const *mut D3D12CmdListObject);
+                return S_OK;
+            }
+        }
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 2 {
+            let p3 = peek_u64_words(a3, 4);
+            sb_info!(
+                CHANNEL,
+                "ID3D12CommandQueue::slot35(a2={a2:#x}, a3={a3:#x}:{p3:x?}, a4={a4:#x}) -> S_OK"
+            );
+        }
+        S_OK
+    })
+}
+
 const fn build_queue_vtbl() -> D3D12QueueVtbl {
     let mut slots = UNIMPL_SLOTS;
     let mut pad = 0;
@@ -4567,7 +4660,7 @@ const fn build_queue_vtbl() -> D3D12QueueVtbl {
     slots[30] = vslot(queue_present_x as *const c_void); // PresentX (ancien layout)
     slots[31] = vslot(noop_ok as *const c_void); // CopyPageMappingsBatchX (nouveau layout)
     slots[32] = vslot(queue_present_x_newer as *const c_void); // PresentX (nouveau layout)
-    slots[35] = vslot(queue_execute_command_lists as *const c_void); // ExecuteCommandListsX (console)
+    slots[35] = vslot(queue_slot35_console as *const c_void); // ExecuteCommandListsX / console
     D3D12QueueVtbl { slots }
 }
 
@@ -6789,6 +6882,7 @@ extern "win64" fn device_create_compute_pso_console(
 fn create_console_pso_multi_arg(
     label: &str,
     is_compute: bool,
+    compiled: Option<(usize, Arc<native::NativePso>)>,
     logged: &AtomicU32,
     a2: usize,
     a3: usize,
@@ -6819,15 +6913,20 @@ fn create_console_pso_multi_arg(
     {
         return E_POINTER;
     }
+    let is_native = compiled.is_some();
+    let (pipeline_id, native) = match compiled {
+        Some((id, nat)) => (id, Some(nat)),
+        None => (0, None),
+    };
     let pso = Box::new(D3D12PsoObject {
         header: ComHeader::new(traced_vtbl(
             (&raw const D3D12_PSO_VTBL).cast(),
             "ID3D12PipelineState",
         )),
         console_inline_pad: [0u8; 32],
-        pipeline_id: 0,
+        pipeline_id,
         is_compute,
-        native: None,
+        native,
     });
     let raw = Box::into_raw(pso).cast::<c_void>();
     // SAFETY: `out_addr` est vérifié mappé (`peek_memory`) et suit `REFIID` (ou `a4` par défaut).
@@ -6835,13 +6934,26 @@ fn create_console_pso_multi_arg(
     if logged.fetch_add(1, Ordering::Relaxed) < 2 {
         sb_info!(
             CHANNEL,
-            "ID3D12Device::{label}(a2={a2:#x}, a3={a3:#x}, a4={a4:#x}, a5={a5:#x}, a6={a6:#x}, a7={a7:#x}, riid_slot={:?}) -> {raw:p}",
+            "ID3D12Device::{label}(a2={a2:#x}, a3={a3:#x}, a4={a4:#x}, a5={a5:#x}, a6={a6:#x}, a7={a7:#x}, riid_slot={:?}, native={is_native}) -> {raw:p}",
             matched.map(|(slot, _)| slot)
         );
     } else {
         sb_debug!(CHANNEL, "ID3D12Device::{label} -> {raw:p}");
     }
     S_OK
+}
+
+fn peek_u64_words(addr: usize, count: usize) -> Vec<u64> {
+    if addr < 0x1_0000 {
+        return Vec::new();
+    }
+    let raw = sb_loader::trampoline::peek_memory(addr, count * 8);
+    raw.as_chunks::<8>()
+        .0
+        .iter()
+        .copied()
+        .map(u64::from_le_bytes)
+        .collect()
 }
 
 /// Slots 56 / 57 / 66 console : `DeserializeGraphicsPipelineStateX(..., riid, ppvPipelineState)`.
@@ -6860,10 +6972,19 @@ extern "win64" fn device_deserialize_graphics_pso_x(
         "DeserializeGraphicsPipelineStateX",
         E_UNEXPECTED,
         {
+            static LOGGED_HDR: AtomicU32 = AtomicU32::new(0);
+            if a2 >= 0x1_0000 && LOGGED_HDR.fetch_add(1, Ordering::Relaxed) < 2 {
+                let words = peek_u64_words(a2, 12);
+                sb_info!(
+                    CHANNEL,
+                    "DeserializeGraphicsPipelineStateX desc(a2={a2:#x}) = {words:x?}"
+                );
+            }
             static LOGGED: AtomicU32 = AtomicU32::new(0);
             create_console_pso_multi_arg(
                 "DeserializeGraphicsPipelineStateX",
                 false,
+                None,
                 &LOGGED,
                 a2,
                 a3,
@@ -6877,11 +6998,11 @@ extern "win64" fn device_deserialize_graphics_pso_x(
 }
 
 /// Slot 67 console : `DeserializeComputePipelineStateX(..., riid, ppvPipelineState)`.
-/// Inspecte le préfixe FSPX (`root_signature` à `+0x00`, paires `kind0/1/6/7` à `+0x08..+0x48`)
-/// lorsqu'il est mappé, puis crée l'objet `ID3D12PipelineState`.
+/// Inspecte le préfixe FSPX (`root_signature` à `+0x00`, paires `kind0/1/6/7` à `+0x08..+0x48`),
+/// tente la compilation RDNA 2 -> SPIR-V -> `VkPipeline` natif, puis crée `ID3D12PipelineState`.
 #[allow(clippy::too_many_arguments)]
 extern "win64" fn device_deserialize_compute_pso_x(
-    _this: *mut D3D12DeviceObject,
+    this: *mut D3D12DeviceObject,
     a2: usize,
     a3: usize,
     a4: usize,
@@ -6890,38 +7011,18 @@ extern "win64" fn device_deserialize_compute_pso_x(
     a7: usize,
 ) -> HResult {
     ffi_guard!(CHANNEL, "DeserializeComputePipelineStateX", E_UNEXPECTED, {
-        if a2 >= 0x1_0000 {
-            let hdr = sb_loader::trampoline::peek_memory(a2, 0x48);
-            if hdr.len() == 0x48 {
-                let rd64 = |o: usize| {
-                    u64::from_le_bytes([
-                        hdr[o],
-                        hdr[o + 1],
-                        hdr[o + 2],
-                        hdr[o + 3],
-                        hdr[o + 4],
-                        hdr[o + 5],
-                        hdr[o + 6],
-                        hdr[o + 7],
-                    ])
-                };
-                let k0_sz = rd64(0x10);
-                let k1_sz = rd64(0x20);
-                let k6_sz = rd64(0x30);
-                let k7_sz = rd64(0x40);
-                if k6_sz > 0 && k6_sz < 16 * 1024 * 1024 {
-                    sb_debug!(
-                        CHANNEL,
-                        "DeserializeComputePipelineStateX FSPX(rs={:#x}, kind0={k0_sz}o, kind1={k1_sz}o, kind6={k6_sz}o, kind7={k7_sz}o)",
-                        rd64(0x00)
-                    );
-                }
-            }
-        }
+        let compiled = if !this.is_null() {
+            // SAFETY: `this` vérifié non-nul (`D3D12DeviceObject`).
+            let dev = unsafe { &*this };
+            native::try_compile_fspx_compute(dev, a2)
+        } else {
+            None
+        };
         static LOGGED: AtomicU32 = AtomicU32::new(0);
         create_console_pso_multi_arg(
             "DeserializeComputePipelineStateX",
             true,
+            compiled,
             &LOGGED,
             a2,
             a3,
@@ -7090,10 +7191,66 @@ extern "win64" fn device_get_frame_statistics_x(
     })
 }
 
+/// Extrait `(vs_bytes, ps_bytes)` depuis un `D3D12_PIPELINE_STATE_STREAM_DESC` (`SizeInBytes`,
+/// `pPipelineStateSubobjectStream`) lorsque les deux sous-objets `VS` (`tag = 1`) et `PS`
+/// (`tag = 2`) sont présents au début du flux.
+fn extract_stream_vs_ps(desc_addr: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    let hdr = peek_u64_words(desc_addr, 2);
+    if hdr.len() < 2 {
+        return None;
+    }
+    let stream_len = hdr[0] as usize;
+    let stream_ptr = hdr[1] as usize;
+    if !(48..=65536).contains(&stream_len) || stream_ptr < 0x1_0000 {
+        return None;
+    }
+    let words = peek_u64_words(stream_ptr, (stream_len / 8).min(32));
+    let mut i = 0usize;
+    let mut vs: Option<(usize, usize)> = None;
+    let mut ps: Option<(usize, usize)> = None;
+    while i < words.len() {
+        let tag = words[i] as u32;
+        match tag {
+            // `ROOT_SIGNATURE` (ptr = 8o)
+            0 => i += 2,
+            // `VS`, `PS`, `DS`, `HS`, `GS`, `CS` (`D3D12_SHADER_BYTECODE` = ptr + len = 16o)
+            1..=6 => {
+                if i + 2 >= words.len() {
+                    break;
+                }
+                let ptr = words[i + 1] as usize;
+                let len = words[i + 2] as usize;
+                if ptr >= 0x1_0000 && (32..=2 * 1024 * 1024).contains(&len) {
+                    if tag == 1 {
+                        vs = Some((ptr, len));
+                    } else if tag == 2 {
+                        ps = Some((ptr, len));
+                    }
+                }
+                i += 3;
+            }
+            _ => break,
+        }
+        if vs.is_some() && ps.is_some() {
+            break;
+        }
+    }
+    let ((vp, vl), (pp, pl)) = (vs?, ps?);
+    let vb = sb_loader::trampoline::peek_memory(vp, vl);
+    let pb = sb_loader::trampoline::peek_memory(pp, pl);
+    if vb.len() == vl && pb.len() == pl {
+        Some((vb, pb))
+    } else {
+        None
+    }
+}
+
 /// Slot 86 console : `CreatePipelineStateX(..., riid, ppvPipelineState)`.
+/// Compile les shaders `DXBC`/`DXIL` VS+PS lorsque le flux `D3D12_PIPELINE_STATE_STREAM_DESC`
+/// est reconnu, avec repli silencieux vers un PSO compatible sinon.
 #[allow(clippy::too_many_arguments)]
 extern "win64" fn device_create_pipeline_state_x(
-    _this: *mut D3D12DeviceObject,
+    this: *mut D3D12DeviceObject,
     a2: usize,
     a3: usize,
     a4: usize,
@@ -7102,10 +7259,45 @@ extern "win64" fn device_create_pipeline_state_x(
     a7: usize,
 ) -> HResult {
     ffi_guard!(CHANNEL, "CreatePipelineStateX", E_UNEXPECTED, {
+        let mut compiled_dxbc_id: Option<usize> = None;
+        if !this.is_null()
+            && let Some((vs_bytes, ps_bytes)) = extract_stream_vs_ps(a2)
+        {
+            // SAFETY: `this` vérifié non-nul (`D3D12DeviceObject`).
+            let dev = unsafe { &*this };
+            let cfg = GraphicsPipelineConfig::default();
+            let mut renderer = dev.shared.renderer.lock();
+            match renderer.create_pipeline_from_dxbc_with_config(&vs_bytes, &ps_bytes, &cfg) {
+                Ok(pid) => {
+                    static LOGGED_OK: AtomicU32 = AtomicU32::new(0);
+                    if LOGGED_OK.fetch_add(1, Ordering::Relaxed) < 3 {
+                        sb_info!(
+                            CHANNEL,
+                            "CreatePipelineStateX (stream DXBC/DXIL) -> VkPipeline #{pid} prêt (VS={}o, PS={}o)",
+                            vs_bytes.len(),
+                            ps_bytes.len()
+                        );
+                    }
+                    compiled_dxbc_id = Some(pid);
+                }
+                Err(err) => {
+                    static LOGGED_ERR: AtomicU32 = AtomicU32::new(0);
+                    if LOGGED_ERR.fetch_add(1, Ordering::Relaxed) < 3 {
+                        sb_info!(
+                            CHANNEL,
+                            "CreatePipelineStateX stream VS={}o/PS={}o repli : {err}",
+                            vs_bytes.len(),
+                            ps_bytes.len()
+                        );
+                    }
+                }
+            }
+        }
         static LOGGED: AtomicU32 = AtomicU32::new(0);
-        create_console_pso_multi_arg(
+        let hr = create_console_pso_multi_arg(
             "CreatePipelineStateX",
             false,
+            None,
             &LOGGED,
             a2,
             a3,
@@ -7113,7 +7305,22 @@ extern "win64" fn device_create_pipeline_state_x(
             a5,
             a6,
             a7,
-        )
+        );
+        if hr == S_OK
+            && let Some(pid) = compiled_dxbc_id
+            && a4 >= 0x1_0000
+            && sb_loader::trampoline::peek_memory(a4, size_of::<usize>()).len()
+                == size_of::<usize>()
+        {
+            // SAFETY: `create_console_pso_multi_arg` vient d'écrire un `D3D12PsoObject*` à `a4`
+            // (quand `a3` est `REFIID`).
+            let raw = unsafe { *(a4 as *const *mut D3D12PsoObject) };
+            if d3d_known_object_name(raw as usize) == Some("ID3D12PipelineState") {
+                // SAFETY: `raw` validé comme `D3D12PsoObject` créé par le bridge.
+                unsafe { (*raw).pipeline_id = pid };
+            }
+        }
+        hr
     })
 }
 

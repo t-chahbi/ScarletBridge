@@ -15,7 +15,7 @@
 //! * Les descripteurs V#/T#/S# ne sont pas interprétés : la configuration indique quels SGPR
 //!   (ou quelle entrée d'une table pointée par un SGPR) correspondent à quelle liaison Vulkan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
@@ -105,6 +105,24 @@ pub struct TranslateConfig {
     /// Contrôle de bornes optionnel : `(set, binding, taille en octets)` = `num_records * stride`
     /// du V#. Accès hors bornes : lectures à 0, écritures/atomiques ignorés (comme le matériel).
     pub buffer_sizes: Vec<(u32, u32, u32)>,
+    /// « Paire de SGPR de user data -> table de descripteurs » : un `s_load_*` dont la base est
+    /// (symboliquement) cette paire + un offset constant charge des mots de descripteurs ; chaque
+    /// entrée (table, offset) utilisée comme V#/T#/S# reçoit automatiquement la liaison
+    /// `(set, binding_base + offset / 16)` (voir [`ProgramInfo::table_bindings`]).
+    pub tables: Vec<DescriptorTable>,
+}
+
+/// Table de descripteurs pointée par une paire de SGPR de user data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorTable {
+    /// Premier SGPR de la paire (64 bits) qui contient l'adresse de la table.
+    pub sgpr: u8,
+    pub set: u32,
+    /// Liaison de l'entrée d'offset 0 ; l'entrée d'offset `o` (multiple de 16) a `base + o / 16`.
+    pub binding_base: u32,
+    /// Stride (octets) supposé pour les V# de cette table (accès `idxen`) : le traducteur ne lit
+    /// pas les mots du V#. 0 = `idxen` refusé avec un message explicite.
+    pub buffer_stride: u32,
 }
 
 impl TranslateConfig {
@@ -119,6 +137,7 @@ impl TranslateConfig {
             user_data_binding: None,
             lds_dwords: 0,
             buffer_sizes: Vec::new(),
+            tables: Vec::new(),
         }
     }
 }
@@ -176,6 +195,43 @@ pub struct ProgramInfo {
     /// Cibles couleur écrites par un PS.
     pub mrts: Vec<u32>,
     pub writes_depth: bool,
+    /// Entrées de tables de descripteurs utilisées, avec la liaison attribuée (une par
+    /// (table, offset)), dans l'ordre de première utilisation.
+    pub table_bindings: Vec<TableBindingUse>,
+}
+
+/// Entrée de table de descripteurs utilisée par le programme.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableBindingUse {
+    /// SGPR de base de la table (voir [`DescriptorTable::sgpr`]).
+    pub table_sgpr: u8,
+    /// Offset en octets du descripteur dans la table.
+    pub byte_offset: u32,
+    /// `storage_buffer` (V#), `sampled_image`/`storage_image` (T#) ou `sampler` (S#).
+    pub kind: &'static str,
+    pub set: u32,
+    pub binding: u32,
+}
+
+/// Nature de descripteur attendue par une instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DescKind {
+    Buffer,
+    Image,
+    Sampler,
+}
+
+impl DescKind {
+    pub(crate) fn dwords(self) -> u8 {
+        if self == DescKind::Image { 8 } else { 4 }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            DescKind::Buffer => "V#",
+            DescKind::Image => "T#",
+            DescKind::Sampler => "S#",
+        }
+    }
 }
 
 /// Résultat : module SPIR-V + informations.
@@ -217,6 +273,17 @@ pub(crate) struct Tr<'a> {
     scc_var: Option<u32>,
     pub exec_const: bool,
     pub res_map: BTreeMap<u8, ResRef>,
+    /// Alias de SGPR `(origin_sgpr, add_offset)` issus de `s_mov_b32`, `s_mov_b64`, `s_add_u32`
+    /// ou `s_addk_i32` (ex. élargissement 32→64 bits d'un pointeur de table de descripteurs).
+    pub sgpr_alias: BTreeMap<u8, (u8, i64)>,
+    /// Liaisons d'images utilisées en écriture/atomique (`image_store`/`image_atomic_*`), afin que
+    /// les `image_load` sur la même liaison émettent `OpImageRead` sur `storage_image`.
+    pub storage_images: BTreeMap<(u32, u32), u32>,
+    /// Origine de chaque SGPR chargé depuis une table déclarée : `(table_sgpr, offset en octets)`.
+    pub desc_words: BTreeMap<u8, (u8, i64)>,
+    /// Dernière instruction qui a écrit chaque SGPR (messages d'erreur).
+    pub last_writer: BTreeMap<u8, &'static str>,
+    pub cur_name: &'static str,
     pub interface: Vec<u32>,
     builtins: BTreeMap<BuiltinIn, u32>,
     pub position: Option<u32>,
@@ -251,6 +318,11 @@ impl<'a> Tr<'a> {
             scc_var: None,
             exec_const: true,
             res_map: BTreeMap::new(),
+            sgpr_alias: BTreeMap::new(),
+            storage_images: BTreeMap::new(),
+            desc_words: BTreeMap::new(),
+            last_writer: BTreeMap::new(),
+            cur_name: "",
             interface: Vec::new(),
             builtins: BTreeMap::new(),
             position: None,
@@ -680,6 +752,13 @@ impl<'a> Tr<'a> {
         for k in dead {
             self.res_map.remove(&k);
         }
+        for k in first..first + width {
+            if let Ok(k8) = u8::try_from(k) {
+                self.sgpr_alias.remove(&k8);
+                self.desc_words.remove(&k8);
+                self.last_writer.insert(k8, self.cur_name);
+            }
+        }
     }
 
     /// Écrit un résultat 32 bits dans un opérande scalaire.
@@ -1026,12 +1105,133 @@ pub(crate) fn res_ref(r: &Resource) -> ResRef {
     }
 }
 
+/// Pré-analyse légère : identifie les liaisons `(set, binding)` d'images écrites par
+/// `image_store*` ou `image_atomic_*` afin que `image_load` sur la même liaison utilise
+/// `storage_image` (`OpImageRead`) au lieu de `sampled_image` (`OpImageFetch`).
+fn prescan_storage_images(insts: &[Decoded], cfg: &TranslateConfig) -> BTreeMap<(u32, u32), u32> {
+    use super::inst::Encoding;
+    let mut alias: BTreeMap<u8, (u8, i64)> = BTreeMap::new();
+    let mut rmap: BTreeMap<u8, ResRef> = BTreeMap::new();
+    let mut out: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    for r in &cfg.resources {
+        if let ResourceLoc::Sgprs(first) = r.loc {
+            rmap.insert(first, res_ref(r));
+        }
+    }
+    let imm_of = |s: Src| -> Option<i64> {
+        match s {
+            Src::InlineInt(v) => Some(i64::from(v)),
+            Src::Literal(v) => Some(i64::from(v)),
+            _ => None,
+        }
+    };
+    let mut _seen: BTreeSet<u8> = BTreeSet::new();
+    for d in insts {
+        let i = &d.inst;
+        if i.name == "s_mov_b32"
+            && let (Some(Src::Sgpr(dst)), Some(Src::Sgpr(src))) = (
+                i.operands.first().map(|o| o.src),
+                i.operands.get(1).map(|o| o.src),
+            )
+        {
+            let orig = alias.get(&src).copied().unwrap_or((src, 0));
+            alias.insert(dst, orig);
+            continue;
+        }
+        if matches!(i.name, "s_add_u32" | "s_add_i32")
+            && let (Some(Src::Sgpr(dst)), Some(o1), Some(o2)) = (
+                i.operands.first().map(|o| o.src),
+                i.operands.get(1).map(|o| o.src),
+                i.operands.get(2).map(|o| o.src),
+            )
+        {
+            match (o1, o2) {
+                (Src::Sgpr(s), other) | (other, Src::Sgpr(s)) => {
+                    if let Some(k) = imm_of(other) {
+                        let (orig, off) = alias.get(&s).copied().unwrap_or((s, 0));
+                        alias.insert(dst, (orig, off.saturating_add(k)));
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if i.name == "s_addk_i32"
+            && let Some(Src::Sgpr(dst)) = i.operands.first().map(|o| o.src)
+        {
+            let sext = i64::from((i.mods.imm as i16) as i32);
+            let (orig, off) = alias.get(&dst).copied().unwrap_or((dst, 0));
+            alias.insert(dst, (orig, off.saturating_add(sext)));
+            continue;
+        }
+        if i.encoding == Encoding::Smem
+            && i.name.starts_with("s_load_")
+            && !i.mods.smem_soffset
+            && let (Some(Src::Sgpr(dst)), Some(Src::Sgpr(base))) = (
+                i.operands.first().map(|o| o.src),
+                i.operands.get(1).map(|o| o.src),
+            )
+        {
+            let count: i64 = match i.name.strip_prefix("s_load_") {
+                Some("dword") => 1,
+                Some("dwordx2") => 2,
+                Some("dwordx4") => 4,
+                Some("dwordx8") => 8,
+                Some("dwordx16") => 16,
+                _ => 0,
+            };
+            let (orig, add_off) = alias.get(&base).copied().unwrap_or((base, 0));
+            let lo = i64::from(i.mods.offset) + add_off;
+            let hi = lo + 4 * count;
+            for r in &cfg.resources {
+                if let ResourceLoc::Table {
+                    table_sgpr,
+                    byte_offset,
+                } = r.loc
+                {
+                    let rr = res_ref(r);
+                    let sz = i64::from(rr.size) * 4;
+                    let off = i64::from(byte_offset);
+                    if (table_sgpr == base || table_sgpr == orig) && off >= lo && off + sz <= hi {
+                        let sgpr = usize::from(dst) + ((off - lo) / 4) as usize;
+                        if let Ok(sg) = u8::try_from(sgpr) {
+                            rmap.insert(sg, rr);
+                            _seen.insert(sg);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if i.encoding == Encoding::Mimg {
+            let is_store = i.name.starts_with("image_store");
+            let is_atomic = i.name.starts_with("image_atomic");
+            if (is_store || is_atomic)
+                && let Some(Src::Sgpr(rn)) = i
+                    .operands
+                    .iter()
+                    .skip(1)
+                    .find(|o| matches!(o.src, Src::Sgpr(_)) && o.width >= 4)
+                    .map(|o| o.src)
+                && let Some(rr) = rmap.get(&rn).filter(|r| r.kind == ResourceKind::Image)
+            {
+                let mode = if is_atomic { 3 } else { 2 };
+                out.entry((rr.set, rr.binding))
+                    .and_modify(|m| *m = (*m).max(mode))
+                    .or_insert(mode);
+            }
+        }
+    }
+    out
+}
+
 /// Traduit un programme RDNA 2 en module SPIR-V.
 pub fn translate_program(code: &[u32], cfg: &TranslateConfig) -> TResult<TranslatedProgram> {
     let decoded = decode_stream(code, cfg.wave)?;
     let count = decoded.len();
     let graph = build_cfg(decoded)?;
     let mut tr = Tr::new(cfg);
+    tr.storage_images = prescan_storage_images(&graph.insts, cfg);
     tr.exec_const = !graph.insts.iter().any(|d| writes_exec(&d.inst));
     tr.info.instructions = count;
     tr.info.blocks = graph.blocks.len();
@@ -1074,6 +1274,15 @@ pub fn translate_program(code: &[u32], cfg: &TranslateConfig) -> TResult<Transla
     tr.info.ps_attrs = tr.attrs.keys().copied().collect();
     tr.info.mrts = tr.mrts.keys().copied().collect();
     tr.info.writes_depth = tr.depth.is_some();
+    let used = tr.info.bindings.clone();
+    for tb in &mut tr.info.table_bindings {
+        if let Some(b) = used
+            .iter()
+            .find(|b| b.set == tb.set && b.binding == tb.binding)
+        {
+            tb.kind = b.kind;
+        }
+    }
     let mut words = tr.spv.assemble(model, main, &modes);
     if tr.uses_psb {
         // OpMemoryModel : Logical -> PhysicalStorageBuffer64 (le writer SPIR-V ne l'expose pas).
