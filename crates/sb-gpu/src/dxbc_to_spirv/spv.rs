@@ -417,6 +417,51 @@ impl Spv {
         self.val(81, v.sc, 1, &[v.id, i])
     }
 
+    // ---------- Extensions utilisées par le traducteur DXIL ----------
+    /// `OpConstantTrue` / `OpConstantFalse`.
+    pub fn c_bool(&mut self, v: bool) -> u32 {
+        let ty = self.ty(Sc::Bool, 1);
+        let key = (ty | 0x2000_0000, vec![u32::from(v)]);
+        if let Some(&i) = self.const_cache.get(&key) {
+            return i;
+        }
+        let id = self.id();
+        put(&mut self.types, if v { 41 } else { 42 }, &[ty, id]);
+        self.const_cache.insert(key, id);
+        id
+    }
+    /// Constante scalaire arbitraire (types 16/64 bits) : `words` = mots du littéral.
+    pub fn c_raw(&mut self, ty: u32, words: &[u32]) -> u32 {
+        let key = (ty | 0x1000_0000, words.to_vec());
+        if let Some(&i) = self.const_cache.get(&key) {
+            return i;
+        }
+        let id = self.id();
+        let mut ops = vec![ty, id];
+        ops.extend_from_slice(words);
+        put(&mut self.types, 43, &ops);
+        self.const_cache.insert(key, id);
+        id
+    }
+    /// Instruction brute avec résultat dans la section des types/constantes globales.
+    pub fn global_raw(&mut self, op: u16, ops: &[u32]) {
+        put(&mut self.types, op, ops);
+    }
+    /// Section de code de la fonction en cours (pour `OpVariable` Function en tête de bloc).
+    pub fn cur_len(&self) -> usize {
+        self.cur.len()
+    }
+    /// Insère une instruction brute à la position `at` du code de la fonction en cours.
+    pub fn insert_raw(&mut self, at: usize, op: u16, ops: &[u32]) {
+        let mut tmp = Vec::new();
+        put(&mut tmp, op, ops);
+        self.cur.splice(at..at, tmp);
+    }
+    /// Entrée `OpEntryPoint` : variables d'interface.
+    pub fn set_interface(&mut self, vars: &[u32]) {
+        self.interface = vars.to_vec();
+    }
+
     /// Assemble le module final.
     pub fn assemble(&mut self, exec_model: u32, main_fn: u32, exec_modes: &[Vec<u32>]) -> Vec<u32> {
         let mut out = vec![0x0723_0203, 0x0001_0300, 0, self.next_id, 0];

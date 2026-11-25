@@ -3,6 +3,7 @@
 
 pub mod dxbc_to_spirv;
 pub mod dxil;
+pub mod rdna2;
 pub mod renderer;
 pub mod sdl3;
 pub mod shader;

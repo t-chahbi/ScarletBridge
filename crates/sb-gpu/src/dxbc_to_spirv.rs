@@ -58,7 +58,7 @@ mod alu;
 mod codegen;
 mod decode;
 mod opcodes;
-mod spv;
+pub(crate) mod spv;
 #[cfg(test)]
 mod tests_ext;
 mod tex;
