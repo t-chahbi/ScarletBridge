@@ -351,13 +351,44 @@ fn decode_vop32(words: &[u32], wave: WaveSize) -> Result<Instruction, DecodeErro
         let e = *words.get(1).ok_or(DecodeError::Truncated(1))?;
         mods.ext = ext;
         mods.ext_raw = e;
+        mods.dpp8_fi = s0 == 234;
         f.src[0] = 256 + (e & 0xFF) as u16;
+        if ext == Ext::Sdwa {
+            if e >> 23 & 1 != 0 {
+                f.src[0] = (e & 0xFF) as u16; // src0 scalaire
+            }
+            if e >> 31 & 1 != 0 {
+                f.b_is_vgpr = false;
+            }
+        }
         words_n = 2;
     } else if s0 == 255 || def.2.contains('K') {
         f.literal = Some(*words.get(1).ok_or(DecodeError::Truncated(1))?);
         words_n = 2;
     }
-    Ok(finish(enc, def, words_n, def.2, wave, &f, mods))
+    let mut inst = finish(enc, def, words_n, def.2, wave, &f, mods);
+    // neg/abs de src0/src1 portés par le second dword
+    let (n0, a0, n1, a1) = match inst.mods.ext {
+        Ext::Sdwa => {
+            let s = inst.mods.sdwa().unwrap_or_default();
+            (s.src0_neg, s.src0_abs, s.src1_neg, s.src1_abs)
+        }
+        Ext::Dpp16 => {
+            let d = inst.mods.dpp16().unwrap_or_default();
+            (d.src0_neg, d.src0_abs, d.src1_neg, d.src1_abs)
+        }
+        _ => (false, false, false, false),
+    };
+    let nd = usize::from(inst.n_dst);
+    if let Some(o) = inst.operands.get_mut(nd) {
+        o.neg = n0;
+        o.abs = a0;
+    }
+    if let Some(o) = inst.operands.get_mut(nd + 1) {
+        o.neg = n1;
+        o.abs = a1;
+    }
+    Ok(inst)
 }
 
 fn decode_vop3(words: &[u32], wave: WaveSize, packed: bool) -> Result<Instruction, DecodeError> {

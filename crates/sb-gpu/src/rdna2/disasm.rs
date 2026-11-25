@@ -339,7 +339,17 @@ fn exp_target(t: u8) -> String {
 
 /// Texte d'une instruction (sans adresse ni encodage), syntaxe LLVM.
 pub fn disassemble(inst: &Instruction, _wave: WaveSize) -> String {
-    let mut out = String::from(inst.name);
+    let mut out = match inst.mods.ext {
+        Ext::None => String::from(inst.name),
+        Ext::Sdwa => format!(
+            "{}_sdwa",
+            inst.name.strip_suffix("_e32").unwrap_or(inst.name)
+        ),
+        Ext::Dpp16 | Ext::Dpp8 => format!(
+            "{}_dpp",
+            inst.name.strip_suffix("_e32").unwrap_or(inst.name)
+        ),
+    };
     let mask16 = literal_is_16bit(inst) || inst.base_name().starts_with("v_fma_mix");
     let mix = inst.encoding == Encoding::Vop3p && inst.base_name().starts_with("v_fma_mix");
     let nd = usize::from(inst.n_dst);
@@ -362,6 +372,14 @@ pub fn disassemble(inst: &Instruction, _wave: WaveSize) -> String {
             fmt_op(&o, mask16)
         })
         .collect();
+    let mut ops = ops;
+    if let Some(sd) = inst.mods.sdwa() {
+        for (k, sext) in [sd.src0_sext, sd.src1_sext].into_iter().enumerate() {
+            if sext && let Some(t) = ops.get_mut(nd + k) {
+                *t = format!("sext({t})");
+            }
+        }
+    }
     match inst.encoding {
         Encoding::Sopp => {
             let imm = inst.mods.imm;
@@ -528,13 +546,7 @@ pub fn disassemble(inst: &Instruction, _wave: WaveSize) -> String {
     if !parts.is_empty() {
         let _ = write!(out, " {}", parts.join(", "));
     }
-    if inst.mods.ext != Ext::None {
-        let _ = write!(
-            out,
-            " /* ext {:?} {:#x} */",
-            inst.mods.ext, inst.mods.ext_raw
-        );
-    }
+    ext_mods(inst, &mut out);
     mods_alu(inst, &mut out);
     mods_mem(inst, &mut out);
     if inst.encoding == Encoding::Smem {
@@ -549,6 +561,87 @@ pub fn disassemble(inst: &Instruction, _wave: WaveSize) -> String {
         }
     }
     out
+}
+
+const SDWA_SEL: [&str; 7] = [
+    "BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD",
+];
+
+/// Modificateurs DPP / SDWA (syntaxe LLVM).
+fn ext_mods(inst: &Instruction, out: &mut String) {
+    if let Some(d) = inst.mods.dpp16() {
+        let c = d.ctrl;
+        let ctrl = match c {
+            0..=0xFF => format!(
+                "quad_perm:[{},{},{},{}]",
+                c & 3,
+                (c >> 2) & 3,
+                (c >> 4) & 3,
+                (c >> 6) & 3
+            ),
+            0x101..=0x10F => format!("row_shl:{}", c & 15),
+            0x111..=0x11F => format!("row_shr:{}", c & 15),
+            0x121..=0x12F => format!("row_ror:{}", c & 15),
+            0x140 => "row_mirror".to_string(),
+            0x141 => "row_half_mirror".to_string(),
+            0x150..=0x15F => format!("row_share:{}", c & 15),
+            0x160..=0x16F => format!("row_xmask:{}", c & 15),
+            _ => format!("dpp_ctrl:0x{c:x}"),
+        };
+        let _ = write!(
+            out,
+            " {ctrl} row_mask:0x{:x} bank_mask:0x{:x}",
+            d.row_mask, d.bank_mask
+        );
+        if d.bound_ctrl {
+            out.push_str(" bound_ctrl:1");
+        }
+        if d.fi {
+            out.push_str(" fi:1");
+        }
+    } else if let Some((sel, fi)) = inst.mods.dpp8() {
+        let l: Vec<String> = sel.iter().map(|v| v.to_string()).collect();
+        let _ = write!(out, " dpp8:[{}]", l.join(","));
+        if fi {
+            out.push_str(" fi:1");
+        }
+    } else if let Some(s) = inst.mods.sdwa() {
+        if s.clamp {
+            out.push_str(" clamp");
+        }
+        match s.omod {
+            1 => out.push_str(" mul:2"),
+            2 => out.push_str(" mul:4"),
+            3 => out.push_str(" div:2"),
+            _ => {}
+        }
+        let has_dst = inst.encoding != Encoding::Vopc;
+        if has_dst {
+            let u = [
+                "UNUSED_PAD",
+                "UNUSED_SEXT",
+                "UNUSED_PRESERVE",
+                "UNUSED_PRESERVE",
+            ][usize::from(s.dst_unused & 3)];
+            let _ = write!(
+                out,
+                " dst_sel:{} dst_unused:{u}",
+                SDWA_SEL[usize::from(s.dst_sel.min(6))]
+            );
+        }
+        let _ = write!(
+            out,
+            " src0_sel:{}",
+            SDWA_SEL[usize::from(s.src0_sel.min(6))]
+        );
+        if inst.srcs().len() > 1 {
+            let _ = write!(
+                out,
+                " src1_sel:{}",
+                SDWA_SEL[usize::from(s.src1_sel.min(6))]
+            );
+        }
+    }
 }
 
 /// Désassemble un flux complet : une ligne `offset: texte` par instruction.

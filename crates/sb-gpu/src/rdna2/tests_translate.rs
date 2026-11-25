@@ -69,6 +69,27 @@ fn config_for(p: &super::test_programs::Program) -> TranslateConfig {
             c
         }
         "ps_const_color" | "ps_kill" => TranslateConfig::new(Stage::Fragment, WaveSize::W32),
+        "ps_mimg_ext" => {
+            let mut c = TranslateConfig::new(Stage::Fragment, WaveSize::W32);
+            let r = |kind, binding, off| Resource {
+                kind,
+                loc: ResourceLoc::Table {
+                    table_sgpr: 0,
+                    byte_offset: off,
+                },
+                set: 0,
+                binding,
+            };
+            c.resources = vec![
+                r(ResourceKind::Image, 1, 0),
+                r(ResourceKind::Sampler, 2, 0x20),
+                r(ResourceKind::Image, 3, 0x30),
+                r(ResourceKind::Image, 4, 0x50),
+                r(ResourceKind::Image, 5, 0x70),
+                r(ResourceKind::Image, 6, 0x90),
+            ];
+            c
+        }
         "ps_texture" => {
             let mut c = TranslateConfig::new(Stage::Fragment, WaveSize::W32);
             c.resources = vec![
@@ -90,6 +111,53 @@ fn config_for(p: &super::test_programs::Program) -> TranslateConfig {
                     set: 0,
                     binding: 1,
                 },
+            ];
+            c
+        }
+        "cs_global_mem" => {
+            let mut c = cs_cfg(p);
+            c.user_data_binding = Some((0, 1));
+            c.sgprs = vec![(2, SgprInit::UserData(0)), (3, SgprInit::UserData(1))];
+            c.resources.clear();
+            c
+        }
+        "cs_ds_battery_w32" | "cs_ds_battery_w64" => {
+            let mut c = cs_cfg(p);
+            c.lds_dwords = 1024;
+            c
+        }
+        "cs_bounds" => {
+            let mut c = cs_cfg(p);
+            let r = |binding, off| Resource {
+                kind: ResourceKind::Buffer { stride: 0 },
+                loc: ResourceLoc::Table {
+                    table_sgpr: 0,
+                    byte_offset: off,
+                },
+                set: 0,
+                binding,
+            };
+            c.resources = vec![r(0, 0), r(1, 0x10)];
+            c.buffer_sizes = vec![(0, 0, 128)];
+            c
+        }
+        "cs_mimg_battery" => {
+            let mut c = cs_cfg(p);
+            let r = |kind, binding, off| Resource {
+                kind,
+                loc: ResourceLoc::Table {
+                    table_sgpr: 0,
+                    byte_offset: off,
+                },
+                set: 0,
+                binding,
+            };
+            c.resources = vec![
+                r(ResourceKind::Buffer { stride: 0 }, 0, 0),
+                r(ResourceKind::Image, 4, 0x20),
+                r(ResourceKind::Sampler, 5, 0x40),
+                r(ResourceKind::Image, 6, 0x60),
+                r(ResourceKind::Image, 7, 0x80),
             ];
             c
         }
@@ -344,10 +412,10 @@ fn single(text: &str, wave: u8) -> Vec<u32> {
 
 #[test]
 fn unsupported_instruction_is_reported_by_name() {
-    let w = single("v_pk_add_f16 v0, v1, v2", 32);
+    let w = single("v_cubeid_f32 v0, v1, v2, v3", 32);
     let cfg = TranslateConfig::new(Stage::Compute, WaveSize::W32);
     match translate_program(&w, &cfg) {
-        Err(TranslateError::Unsupported(n)) => assert_eq!(n, "v_pk_add_f16"),
+        Err(TranslateError::Unsupported(n)) => assert_eq!(n, "v_cubeid_f32"),
         other => panic!("{other:?}"),
     }
 }
@@ -438,7 +506,12 @@ fn programs_decode_back_to_their_asm_source() {
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.ends_with(':') && !l.starts_with(';'))
             .filter_map(|l| l.split_whitespace().next())
-            .map(|m| m.trim_end_matches("_e64").trim_end_matches("_e32"))
+            .map(|m| {
+                m.trim_end_matches("_e64")
+                    .trim_end_matches("_e32")
+                    .trim_end_matches("_dpp")
+                    .trim_end_matches("_sdwa")
+            })
             .collect();
         assert_eq!(got, want, "{} : mnémoniques décodés != source asm", p.name);
     }
@@ -536,6 +609,30 @@ fn translator_coverage_report() {
                 vec![w0, 8 | 10 << 9 | 12 << 18],
             ]
         }),
+        ("VOP3P", VOP3P, |op, _| {
+            vec![vec![
+                0xCC00_0000 | u32::from(op) << 16 | 2,
+                257 | 258 << 9 | 259 << 18,
+            ]]
+        }),
+        ("FLAT", FLAT, |op, _| {
+            vec![vec![
+                0xDC00_0000 | u32::from(op) << 18 | 1 << 16,
+                1 | 2 << 8 | 0x7D << 16 | 3 << 24,
+            ]]
+        }),
+        ("GLOBAL", GLOBAL, |op, _| {
+            vec![vec![
+                0xDC00_0000 | u32::from(op) << 18 | 2 << 14 | 1 << 16,
+                1 | 2 << 8 | 0x7D << 16 | 3 << 24,
+            ]]
+        }),
+        ("SCRATCH", SCRATCH, |op, _| {
+            vec![vec![
+                0xDC00_0000 | u32::from(op) << 18 | 1 << 14 | 1 << 16,
+                1 | 2 << 8 | 0x7D << 16 | 3 << 24,
+            ]]
+        }),
         ("DS", DS, |op, _| {
             vec![vec![
                 0xD800_0000 | u32::from(op) << 18,
@@ -601,5 +698,31 @@ fn translator_coverage_report() {
         ok += s;
     }
     eprintln!("{}\nTOTAL   {ok}/{total}", lines.join("\n"));
-    assert!(ok >= 250, "régression de couverture : {ok}/{total}");
+    assert!(ok >= 700, "régression de couverture : {ok}/{total}");
+}
+
+#[test]
+fn ps_mimg_variants_translate_and_validate() {
+    let t = translate("ps_mimg_ext");
+    let (caps, ops) = scan(&t.words);
+    for (op, what) in [
+        (87, "ImageSampleImplicitLod"),
+        (89, "ImageSampleDrefImplicitLod"),
+        (96, "ImageGather"),
+        (97, "ImageDrefGather"),
+        (105, "ImageQueryLod"),
+        (95, "ImageFetch"),
+    ] {
+        assert!(ops.contains(&op), "{what} attendu");
+    }
+    assert!(caps.contains(&50), "ImageQuery (get_lod, offset émulé)");
+    assert!(caps.contains(&42), "MinLod (_cl)");
+    assert!(caps.contains(&25), "ImageGatherExtended (gather _o)");
+    let sampled = t
+        .info
+        .bindings
+        .iter()
+        .filter(|b| b.kind == "sampled_image")
+        .count();
+    assert_eq!(sampled, 5, "2D, 3D, cube, 1D array, MSAA");
 }

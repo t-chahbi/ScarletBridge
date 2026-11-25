@@ -72,13 +72,14 @@ impl Tr<'_> {
             Encoding::Sop1 | Encoding::Sop2 | Encoding::Sopk | Encoding::Sopc => self.salu(i),
             Encoding::Sopp => self.sopp(i),
             Encoding::Vop1 | Encoding::Vop2 | Encoding::Vopc | Encoding::Vop3 => self.valu(i),
+            Encoding::Vop3p => self.vop3p(i),
             Encoding::Smem => self.smem(i),
             Encoding::Mubuf | Encoding::Mtbuf => self.vbuf(i),
             Encoding::Mimg => self.mimg(i),
             Encoding::Exp => self.export(i),
             Encoding::Vintrp => self.vintrp(i),
             Encoding::Ds => self.ds(i),
-            _ => unsupported(i),
+            Encoding::Flat | Encoding::Global | Encoding::Scratch => self.flat(i),
         }
     }
 
@@ -129,7 +130,7 @@ impl Tr<'_> {
         Some(r)
     }
 
-    fn cmp_op(signed: bool, rel: &str) -> Option<u16> {
+    pub(crate) fn cmp_op(signed: bool, rel: &str) -> Option<u16> {
         Some(match (rel, signed) {
             ("eq", _) => OP_IEQ,
             ("lg", _) | ("ne", _) => OP_INE,
@@ -457,7 +458,7 @@ impl Tr<'_> {
                 self.op2(OP_OR, Sc::U32, lo, hi)
             }
             ("s_getpc_b64", _, _) => return unsupported(i),
-            _ => return unsupported(i),
+            _ => return self.salu_ext32(i, name, &dst, &srcs),
         };
         self.write_s(&dst, r)
     }
@@ -481,7 +482,7 @@ impl Tr<'_> {
         }
     }
 
-    fn mul_hi(&mut self, a: Val, b: Val, signed: bool) -> Val {
+    pub(crate) fn mul_hi(&mut self, a: Val, b: Val, signed: bool) -> Val {
         let u = self.spv.ty(Sc::U32, 1);
         let st = self.spv.structure(&[u, u]);
         let (x, y) = if signed {
@@ -572,6 +573,21 @@ impl Tr<'_> {
         dst: &Operand,
         srcs: &[Operand],
     ) -> TResult<()> {
+        if matches!(
+            name,
+            "s_lshl_b64"
+                | "s_lshr_b64"
+                | "s_ashr_i64"
+                | "s_wqm_b64"
+                | "s_brev_b64"
+                | "s_bcnt0_i32_b64"
+                | "s_ff1_i32_b64"
+                | "s_flbit_i32_b64"
+                | "s_bitset0_b64"
+                | "s_bitset1_b64"
+        ) {
+            return self.salu64_ext(i, name, dst, srcs);
+        }
         let base = name.strip_suffix("_b64").unwrap_or(name);
         let (lo, hi) = match (base, srcs.len()) {
             ("s_mov", 1) => self.src_pair(&srcs[0])?,
@@ -647,7 +663,7 @@ impl Tr<'_> {
         self.write_dst(&dst, r)
     }
 
-    fn fargs(&mut self, i: &Instruction, n: usize) -> TResult<Vec<Val>> {
+    pub(crate) fn fargs(&mut self, i: &Instruction, n: usize) -> TResult<Vec<Val>> {
         let s = i.srcs();
         if s.len() < n {
             return unsupported(i);
@@ -655,7 +671,7 @@ impl Tr<'_> {
         (0..n).map(|k| self.src_f32(&s[k])).collect()
     }
 
-    fn uargs(&mut self, i: &Instruction, n: usize) -> TResult<Vec<Val>> {
+    pub(crate) fn uargs(&mut self, i: &Instruction, n: usize) -> TResult<Vec<Val>> {
         let s = i.srcs();
         if s.len() < n {
             return unsupported(i);
@@ -696,12 +712,27 @@ impl Tr<'_> {
         self.write_dst(&d, r)
     }
 
+    /// Écrit un résultat `i32` dans la destination (VGPR ou SGPR).
+    pub(crate) fn write_dst_i(&mut self, i: &Instruction, r: Val) -> TResult<()> {
+        let d = *i
+            .dst()
+            .ok_or_else(|| TranslateError::Unsupported(i.name.into()))?;
+        self.write_dst(&d, r)
+    }
+
+    pub(crate) fn write_dst_u(&mut self, i: &Instruction, r: Val) -> TResult<()> {
+        self.write_dst_i(i, r)
+    }
+
+    /// Écrit un f32 en appliquant `omod`/`clamp`.
+    pub(crate) fn write_dst_f(&mut self, i: &Instruction, r: Val) -> TResult<()> {
+        self.finish_f32(i, r)
+    }
+
     fn valu(&mut self, i: &Instruction) -> TResult<()> {
         let name = i.base_name();
         if i.mods.ext != super::inst::Ext::None {
-            return Err(TranslateError::Unsupported(format!(
-                "{name} avec extension DPP/SDWA"
-            )));
+            return self.valu_with_ext(i);
         }
         if name.starts_with("v_cmp") {
             return self.vcmp(i, name);
@@ -1165,7 +1196,7 @@ impl Tr<'_> {
             }
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32"
             | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => self.carry_op(i, name),
-            _ => unsupported(i),
+            _ => self.valu_ext(i, name),
         }
     }
 
@@ -1230,7 +1261,10 @@ impl Tr<'_> {
             .rsplit_once('_')
             .ok_or_else(|| TranslateError::Unsupported(name.into()))?;
         let s = i.srcs();
-        if s.len() < 2 || rel == "class" {
+        if rel == "class" || matches!(ty, "f16" | "i16" | "u16" | "f64" | "i64" | "u64") {
+            return self.vcmp_ext(i, is_x, rel, ty);
+        }
+        if s.len() < 2 {
             return unsupported(i);
         }
         let bit: Val = match ty {
@@ -1292,7 +1326,7 @@ impl Tr<'_> {
         self.vcmp_write(i, is_x, bit)
     }
 
-    fn vcmp_write(&mut self, i: &Instruction, is_x: bool, bit: Val) -> TResult<()> {
+    pub(crate) fn vcmp_write(&mut self, i: &Instruction, is_x: bool, bit: Val) -> TResult<()> {
         if is_x {
             // v_cmpx : écrit EXEC.
             let exec = Operand::new(Src::ExecLo, self.wave.mask_dwords());

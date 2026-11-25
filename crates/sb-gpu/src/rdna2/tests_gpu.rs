@@ -54,8 +54,12 @@ impl Gpu {
             let qi = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(qfam)
                 .queue_priorities(&prio)];
+            let mut f12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+            let feats = instance.get_physical_device_features(pd);
             let ci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&qi)
+                .enabled_features(&feats)
+                .push_next(&mut f12)
                 .push_next(&mut f13);
             let dev = instance.create_device(pd, &ci, None).ok()?;
             let queue = dev.get_device_queue(qfam, 0);

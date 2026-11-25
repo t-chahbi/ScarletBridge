@@ -102,6 +102,9 @@ pub struct TranslateConfig {
     pub user_data_binding: Option<(u32, u32)>,
     /// Taille de la LDS en dwords (requis pour les instructions `ds_*`).
     pub lds_dwords: u32,
+    /// Contrôle de bornes optionnel : `(set, binding, taille en octets)` = `num_records * stride`
+    /// du V#. Accès hors bornes : lectures à 0, écritures/atomiques ignorés (comme le matériel).
+    pub buffer_sizes: Vec<(u32, u32, u32)>,
 }
 
 impl TranslateConfig {
@@ -115,6 +118,7 @@ impl TranslateConfig {
             resources: Vec::new(),
             user_data_binding: None,
             lds_dwords: 0,
+            buffer_sizes: Vec::new(),
         }
     }
 }
@@ -138,6 +142,15 @@ pub(crate) type TResult<T> = Result<T, TranslateError>;
 
 pub(crate) fn unsupported<T>(inst: &Instruction) -> TResult<T> {
     Err(TranslateError::Unsupported(inst.name.to_string()))
+}
+
+/// Transformation de la destination d'une instruction SDWA/DPP.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DstXform {
+    /// `(dst_sel, dst_unused)` SDWA.
+    pub sdwa: Option<(u8, u8)>,
+    /// Condition d'écriture (DPP : lane activée et source valide).
+    pub valid: Option<Val>,
 }
 
 /// Liaison utilisée par le module généré.
@@ -217,6 +230,9 @@ pub(crate) struct Tr<'a> {
     pub lds: Option<u32>,
     user_data: Option<u32>,
     ra_decorated: bool,
+    pub uses_psb: bool,
+    pub ext_vals: [Option<Val>; 2],
+    pub dst_xform: Option<DstXform>,
     pub info: ProgramInfo,
 }
 
@@ -248,6 +264,9 @@ impl<'a> Tr<'a> {
             lds: None,
             user_data: None,
             ra_decorated: false,
+            uses_psb: false,
+            ext_vals: [None; 2],
+            dst_xform: None,
             info: ProgramInfo::default(),
         }
     }
@@ -481,8 +500,20 @@ impl<'a> Tr<'a> {
 
     /// Exécute `body` dans une région gardée par EXEC (sans garde si EXEC est constant).
     pub fn guarded<F: FnOnce(&mut Self) -> TResult<()>>(&mut self, body: F) -> TResult<()> {
-        let Some(cond) = self.exec_bit() else {
-            return body(self);
+        self.guarded_with(None, body)
+    }
+
+    /// Comme [`Tr::guarded`] avec une condition supplémentaire (ex. contrôle de bornes).
+    pub fn guarded_with<F: FnOnce(&mut Self) -> TResult<()>>(
+        &mut self,
+        extra: Option<Val>,
+        body: F,
+    ) -> TResult<()> {
+        let cond = match (self.exec_bit(), extra) {
+            (None, None) => return body(self),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (Some(a), Some(b)) => self.bool_and(a, b),
         };
         let then_l = self.spv.id();
         let merge_l = self.spv.id();
@@ -493,6 +524,25 @@ impl<'a> Tr<'a> {
         self.spv.branch(merge_l);
         self.spv.begin_block(merge_l);
         Ok(())
+    }
+
+    /// Taille configurée (octets) du buffer `(set, binding)`, s'il y en a une.
+    pub fn buffer_limit(&self, set: u32, binding: u32) -> Option<u32> {
+        self.cfg
+            .buffer_sizes
+            .iter()
+            .find(|(s, b, _)| *s == set && *b == binding)
+            .map(|x| x.2)
+    }
+
+    /// `byte_end <= limit` (pour le dword d'adresse `byte_addr`, fin = adresse + 4).
+    pub fn dword_in_bounds(&mut self, byte_addr: Val, k: u32, limit: u32) -> Val {
+        let (add, lim) = (self.cu(4 * (k + 1)), self.cu(limit));
+        let end = self.op2(128, Sc::U32, byte_addr, add);
+        // pas de débordement 32 bits : si end < addr, hors bornes
+        let no_wrap = self.op2(174, Sc::Bool, end, byte_addr);
+        let le = self.op2(178, Sc::Bool, end, lim);
+        self.bool_and(no_wrap, le)
     }
 
     // ------------------------------------------------ lecture/écriture d'opérandes
@@ -534,6 +584,13 @@ impl<'a> Tr<'a> {
             Src::Vgpr(n) => {
                 let v = self.vvar(usize::from(n));
                 self.load_u32(v)
+            }
+            Src::Special(c @ 0x1F0..=0x1F1) if self.ext_vals[usize::from(c - 0x1F0)].is_some() => {
+                self.ext_vals[usize::from(c - 0x1F0)].unwrap_or(Val {
+                    id: 0,
+                    sc: Sc::U32,
+                    n: 1,
+                })
             }
             Src::LdsDirect | Src::Special(_) | Src::Off => {
                 return Err(TranslateError::Unsupported(format!(
@@ -664,6 +721,10 @@ impl<'a> Tr<'a> {
     pub fn write_dst(&mut self, dst: &Operand, v: Val) -> TResult<()> {
         match dst.src {
             Src::Vgpr(n) => {
+                let v = match self.dst_xform.take() {
+                    Some(x) => self.apply_dst_xform(usize::from(n), v, x),
+                    None => v,
+                };
                 self.write_v(usize::from(n), v);
                 Ok(())
             }
@@ -1013,7 +1074,18 @@ pub fn translate_program(code: &[u32], cfg: &TranslateConfig) -> TResult<Transla
     tr.info.ps_attrs = tr.attrs.keys().copied().collect();
     tr.info.mrts = tr.mrts.keys().copied().collect();
     tr.info.writes_depth = tr.depth.is_some();
-    let words = tr.spv.assemble(model, main, &modes);
+    let mut words = tr.spv.assemble(model, main, &modes);
+    if tr.uses_psb {
+        // OpMemoryModel : Logical -> PhysicalStorageBuffer64 (le writer SPIR-V ne l'expose pas).
+        let mut p = 5;
+        while p < words.len() {
+            if words[p] & 0xFFFF == 14 {
+                words[p + 1] = 5348;
+                break;
+            }
+            p += (words[p] >> 16) as usize;
+        }
+    }
     Ok(TranslatedProgram {
         words,
         info: tr.info,

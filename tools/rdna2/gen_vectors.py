@@ -172,6 +172,7 @@ w64: v_cndmask_b32 v0, v1, v2, vcc
 w64: v_cmp_gt_u32 s[0:1], v0, v1
 w64: v_cmpx_lt_f32 v0, v1
 # --- VOP3
+v_cubeid_f32 v0, v1, v2, v3
 v_fma_f32 v0, v1, v2, v3
 v_mad_u32_u24 v0, v1, v2, v3
 v_mad_i32_i24 v0, v1, v2, v3
@@ -283,6 +284,17 @@ exp mrt0 v0, off, v1, off
 exp mrtz v0, off, off, off
 exp mrt0 v0, v0, v1, v1 done compr vm
 exp null off, off, off, off done vm
+# --- DPP / SDWA
+v_mov_b32_dpp v0, v1 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+v_add_f32_dpp v0, -v1, |v2| row_shl:3 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v0, v1 row_share:5 row_mask:0xf bank_mask:0xf fi:1
+v_mov_b32_dpp v0, v1 row_xmask:3 row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v0, v1 row_mirror row_mask:0xf bank_mask:0xf
+v_mov_b32_dpp v0, v1 dpp8:[7,6,5,4,3,2,1,0]
+v_add_f32_sdwa v0, -v1, |v2| clamp dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_2 src1_sel:DWORD
+v_mov_b32_sdwa v0, v1 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:BYTE_1
+v_cmp_eq_u32_sdwa vcc_lo, v1, v2 src0_sel:BYTE_0 src1_sel:DWORD
+v_add_nc_u32_sdwa v0, sext(v1), v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:BYTE_0
 # --- VINTRP
 v_interp_p1_f32 v0, v1, attr0.x
 v_interp_p2_f32 v0, v1, attr0.x

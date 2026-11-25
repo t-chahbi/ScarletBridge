@@ -4,8 +4,7 @@
 use super::inst::{Instruction, Operand, Src};
 use super::tables::TBUF_FORMATS;
 use super::translate::{
-    BindingUse, ResRef, ResourceKind, ResourceLoc, Stage, TResult, Tr, TranslateError, res_ref,
-    unsupported,
+    ResRef, ResourceKind, ResourceLoc, Stage, TResult, Tr, TranslateError, res_ref, unsupported,
 };
 use crate::dxbc_to_spirv::spv::{Sc, Val};
 
@@ -16,12 +15,12 @@ const OP_SHR: u16 = 194;
 const OP_BFSEXT: u16 = 202;
 const OP_BFUEXT: u16 = 203;
 
-fn err<T>(msg: impl Into<String>) -> TResult<T> {
+pub(crate) fn err<T>(msg: impl Into<String>) -> TResult<T> {
     Err(TranslateError::Unresolved(msg.into()))
 }
 
 /// Opérande registre vectoriel : index du VGPR de base.
-fn vgpr_of(o: &Operand) -> TResult<usize> {
+pub(crate) fn vgpr_of(o: &Operand) -> TResult<usize> {
     match o.src {
         Src::Vgpr(n) => Ok(usize::from(n)),
         other => Err(TranslateError::Unsupported(format!(
@@ -49,7 +48,7 @@ fn dword_count(name: &str) -> Option<usize> {
 
 impl Tr<'_> {
     // ------------------------------------------------------------ résolution de descripteurs
-    fn sgpr_index(o: &Operand) -> TResult<u8> {
+    pub(crate) fn sgpr_index(o: &Operand) -> TResult<u8> {
         match o.src {
             Src::Sgpr(n) => Ok(n),
             Src::Ttmp(n) => Ok(108 + n),
@@ -157,8 +156,20 @@ impl Tr<'_> {
         for k in 0..count {
             let kc = self.cu(k as u32);
             let idx = self.op2(OP_IADD, Sc::U32, word0, kc);
+            let (idx, okc) = match self.buffer_limit(set, binding) {
+                Some(l) => {
+                    let ok = self.dword_in_bounds(byte, k as u32, l);
+                    let z = self.cu(0);
+                    (self.select(ok, idx, z), Some(ok))
+                }
+                None => (idx, None),
+            };
             let ptr = self.buffer_word_ptr(set, binding, idx);
-            let v = self.load_ptr_u32(ptr);
+            let mut v = self.load_ptr_u32(ptr);
+            if let Some(ok) = okc {
+                let z = self.cu(0);
+                v = self.select(ok, v, z);
+            }
             let var = self.svar(dcode + k);
             self.store_u32(var, v);
         }
@@ -212,6 +223,7 @@ impl Tr<'_> {
         let c2 = self.cu(2);
         let widx = self.op2(OP_SHR, Sc::U32, addr, c2);
         let (set, binding) = (res.set, res.binding);
+        let limit = self.buffer_limit(set, binding);
         let base = name
             .strip_prefix("tbuffer_")
             .or_else(|| name.strip_prefix("buffer_"))
@@ -219,7 +231,8 @@ impl Tr<'_> {
 
         // --- atomiques
         if let Some(op) = base.strip_prefix("atomic_") {
-            return self.buffer_atomic(i, op, data, set, binding, widx);
+            let ok = limit.map(|l| self.dword_in_bounds(addr, 0, l));
+            return self.buffer_atomic(i, op, data, set, binding, widx, ok);
         }
         // --- composantes
         let is_t = name.starts_with("tbuffer_");
@@ -270,6 +283,7 @@ impl Tr<'_> {
                 "sbyte" => (1, 1, Some((8, true))),
                 "ushort" => (1, 1, Some((16, false))),
                 "sshort" => (1, 1, Some((16, true))),
+                "byte" | "short" | "byte_d16_hi" | "short_d16_hi" => (1, 1, None),
                 _ => return unsupported(i),
             }
         };
@@ -278,7 +292,38 @@ impl Tr<'_> {
             None => return unsupported(i),
         };
         if is_store {
-            if small.is_some() || kind == "byte" || kind == "short" {
+            if kind == "byte" || kind == "short" || kind == "byte_d16_hi" || kind == "short_d16_hi"
+            {
+                // lecture-modification-écriture atomique du dword contenant
+                let bits = if kind.starts_with("byte") { 8u32 } else { 16 };
+                let var = self.vvar(d0);
+                let mut v = self.load_u32(var);
+                if kind.ends_with("_hi") {
+                    let c16 = self.cu(16);
+                    v = self.op2(194, Sc::U32, v, c16);
+                }
+                let ok = limit.map(|l| self.dword_in_bounds(addr, 0, l));
+                return self.guarded_with(ok, |t| {
+                    let ptr = t.buffer_word_ptr(set, binding, widx);
+                    let (c3, c8, mask) = (
+                        t.cu(if bits == 8 { 3 } else { 2 }),
+                        t.cu(8),
+                        t.cu(if bits == 8 { 0xFF } else { 0xFFFF }),
+                    );
+                    let lowb = t.op2(OP_AND, Sc::U32, addr, c3);
+                    let sh = t.op2(OP_IMUL, Sc::U32, lowb, c8);
+                    let mv = t.op2(OP_AND, Sc::U32, v, mask);
+                    let vs = t.op2(196, Sc::U32, mv, sh);
+                    let ms = t.op2(196, Sc::U32, mask, sh);
+                    let inv = t.op1(200, Sc::U32, ms);
+                    let (scope, sem) = (t.spv.c_u32(1), t.spv.c_u32(0));
+                    let u = t.spv.ty(Sc::U32, 1);
+                    t.spv.emit(240, u, &[ptr, scope, sem, inv.id]);
+                    t.spv.emit(241, u, &[ptr, scope, sem, vs.id]);
+                    Ok(())
+                });
+            }
+            if small.is_some() {
                 return unsupported(i);
             }
             let mut vals = Vec::new();
@@ -286,7 +331,16 @@ impl Tr<'_> {
                 let var = self.vvar(d0 + c);
                 vals.push(self.load_u32(var));
             }
-            return self.guarded(|t| {
+            let mut ok = None;
+            if let Some(l) = limit {
+                let mut all = self.dword_in_bounds(addr, 0, l);
+                for c in 1..vals.len() {
+                    let o = self.dword_in_bounds(addr, c as u32, l);
+                    all = self.bool_and(all, o);
+                }
+                ok = Some(all);
+            }
+            return self.guarded_with(ok, |t| {
                 for (c, v) in vals.iter().enumerate() {
                     let kc = t.cu(c as u32);
                     let idx = t.op2(OP_IADD, Sc::U32, widx, kc);
@@ -302,8 +356,20 @@ impl Tr<'_> {
                 let v = if c < mem_comps {
                     let kc = t.cu(c as u32);
                     let idx = t.op2(OP_IADD, Sc::U32, widx, kc);
+                    let (idx, okc) = match limit {
+                        Some(l) => {
+                            let ok = t.dword_in_bounds(addr, c as u32, l);
+                            let z = t.cu(0);
+                            (t.select(ok, idx, z), Some(ok))
+                        }
+                        None => (idx, None),
+                    };
                     let ptr = t.buffer_word_ptr(set, binding, idx);
-                    let w = t.load_ptr_u32(ptr);
+                    let mut w = t.load_ptr_u32(ptr);
+                    if let Some(ok) = okc {
+                        let z = t.cu(0);
+                        w = t.select(ok, w, z);
+                    }
                     match small {
                         Some((bits, signed)) => {
                             // octet/demi-mot à l'intérieur du dword
@@ -333,6 +399,7 @@ impl Tr<'_> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn buffer_atomic(
         &mut self,
         i: &Instruction,
@@ -341,6 +408,7 @@ impl Tr<'_> {
         set: u32,
         binding: u32,
         widx: Val,
+        ok: Option<Val>,
     ) -> TResult<()> {
         let Some(d) = data else { return unsupported(i) };
         if op.ends_with("_x2") {
@@ -370,7 +438,7 @@ impl Tr<'_> {
         } else {
             None
         };
-        self.guarded(|t| {
+        self.guarded_with(ok, |t| {
             let ptr = t.buffer_word_ptr(set, binding, widx);
             let (scope, sem) = (t.spv.c_u32(1), t.spv.c_u32(0));
             let u = t.spv.ty(Sc::U32, 1);
@@ -395,65 +463,7 @@ impl Tr<'_> {
         })
     }
 
-    // ------------------------------------------------------------ DS (LDS)
-    pub(crate) fn ds(&mut self, i: &Instruction) -> TResult<()> {
-        let name = i.name;
-        if self.cfg.lds_dwords == 0 {
-            return Err(TranslateError::Config(
-                "instruction ds_* sans lds_dwords".into(),
-            ));
-        }
-        let (is_read, width) = match name {
-            "ds_read_b32" => (true, 1),
-            "ds_read_b64" => (true, 2),
-            "ds_read_b96" => (true, 3),
-            "ds_read_b128" => (true, 4),
-            "ds_write_b32" => (false, 1),
-            "ds_write_b64" => (false, 2),
-            "ds_write_b96" => (false, 3),
-            "ds_write_b128" => (false, 4),
-            _ => return unsupported(i),
-        };
-        let ops = &i.operands;
-        let lds = self.lds_var();
-        let (addr_reg, data_reg) = if is_read {
-            (vgpr_of(&ops[1])?, vgpr_of(&ops[0])?)
-        } else {
-            (vgpr_of(&ops[0])?, vgpr_of(&ops[1])?)
-        };
-        let av = self.vvar(addr_reg);
-        let a = self.load_u32(av);
-        let off = self.cu(i.mods.offset as u32);
-        let byte = self.op2(OP_IADD, Sc::U32, a, off);
-        let c2 = self.cu(2);
-        let widx = self.op2(OP_SHR, Sc::U32, byte, c2);
-        let u = self.spv.ty(Sc::U32, 1);
-        let pt = self.spv.ptr(4, u);
-        let mut vals = Vec::new();
-        if !is_read {
-            for k in 0..width {
-                let v = self.vvar(data_reg + k);
-                vals.push(self.load_u32(v));
-            }
-        }
-        self.guarded(|t| {
-            for k in 0..width {
-                let kc = t.cu(k as u32);
-                let idx = t.op2(OP_IADD, Sc::U32, widx, kc);
-                let ptr = t.spv.emit(65, pt, &[lds, idx.id]);
-                match vals.get(k) {
-                    Some(v) => t.spv.emit_void(62, &[ptr, v.id]),
-                    None => {
-                        let w = t.load_ptr_u32(ptr);
-                        t.write_v(data_reg + k, w);
-                    }
-                }
-            }
-            Ok(())
-        })
-    }
-
-    fn lds_var(&mut self) -> u32 {
+    pub(crate) fn lds_var(&mut self) -> u32 {
         if let Some(v) = self.lds {
             return v;
         }
@@ -641,268 +651,6 @@ impl Tr<'_> {
         let d = vgpr_of(&i.operands[0])?;
         self.write_v(d, c);
         Ok(())
-    }
-
-    // ------------------------------------------------------------ MIMG
-    pub(crate) fn mimg(&mut self, i: &Instruction) -> TResult<()> {
-        let name = i.name;
-        let m = &i.mods;
-        if m.a16 || m.d16 || m.tfe || m.lwe {
-            return unsupported(i);
-        }
-        // dimension -> (Dim SPIR-V, arrayed, composantes)
-        let (dim, arrayed, ncoord) = match m.dim {
-            0 => (0u32, 0u32, 1usize),
-            1 => (1, 0, 2),
-            2 => (2, 0, 3),
-            3 => (3, 0, 3),
-            4 => (0, 1, 2),
-            5 => (1, 1, 3),
-            _ => return unsupported(i),
-        };
-        let (is_sample, is_load) = (
-            name.starts_with("image_sample"),
-            name == "image_load" || name == "image_load_mip",
-        );
-        if !is_sample && !is_load {
-            return unsupported(i);
-        }
-        let ops = &i.operands;
-        let n = ops.len();
-        let n_trailer = if is_sample { 2 } else { 1 };
-        let (vdata, addr_ops) = (ops[0], &ops[1..n - n_trailer]);
-        let rsrc = ops[n - n_trailer];
-        // registres d'adresse
-        let mut regs = Vec::new();
-        for o in addr_ops {
-            let r = vgpr_of(o)?;
-            for k in 0..usize::from(o.width.max(1)) {
-                regs.push(r + k);
-            }
-        }
-        let mut next = regs.into_iter();
-        // image
-        let rn = Self::sgpr_index(&rsrc)?;
-        let Some(img_res) = self
-            .res_map
-            .get(&rn)
-            .copied()
-            .filter(|r| r.kind == ResourceKind::Image)
-        else {
-            return err(format!("aucun T# connu dans s[{rn}:{}]", rn + 7));
-        };
-        let (img_var, img_ty) = self.image_var(img_res.set, img_res.binding, dim, arrayed)?;
-        let nvals = m.dmask.count_ones() as usize;
-        if nvals == 0 {
-            return Ok(());
-        }
-        let d0 = vgpr_of(&vdata)?;
-        let f32t = self.spv.ty(Sc::F32, 1);
-        let v4 = self.spv.ty(Sc::F32, 4);
-
-        if is_load {
-            let mut coords = Vec::new();
-            for _ in 0..ncoord {
-                let r = next.next().ok_or_else(|| {
-                    TranslateError::Unsupported(format!("{name} : adresse trop courte"))
-                })?;
-                let var = self.vvar(r);
-                let v = self.load_u32(var);
-                coords.push(self.spv.bitcast(v, Sc::I32).id);
-            }
-            let lod = if name == "image_load_mip" {
-                let r = next
-                    .next()
-                    .ok_or_else(|| TranslateError::Unsupported(format!("{name} : lod manquant")))?;
-                let var = self.vvar(r);
-                let v = self.load_u32(var);
-                self.spv.bitcast(v, Sc::I32)
-            } else {
-                Val {
-                    id: self.spv.c_i32(0),
-                    sc: Sc::I32,
-                    n: 1,
-                }
-            };
-            let coord = self.spv.construct(Sc::I32, &coords);
-            let imgt = self.spv.ty(Sc::F32, 1);
-            let _ = imgt;
-            let img = self.spv.emit(61, img_ty, &[img_var]);
-            let px = self.spv.emit(95, v4, &[img, coord.id, 2, lod.id]);
-            return self.write_dmask(
-                m.dmask,
-                d0,
-                Val {
-                    id: px,
-                    sc: Sc::F32,
-                    n: 4,
-                },
-            );
-        }
-
-        // --- échantillonnage : décoder les suffixes
-        let rest = name.strip_prefix("image_sample").unwrap_or("");
-        let toks: Vec<&str> = rest.split('_').filter(|t| !t.is_empty()).collect();
-        let (mut has_c, mut has_b, mut has_l, mut has_lz) = (false, false, false, false);
-        for t in &toks {
-            match *t {
-                "c" => has_c = true,
-                "b" => has_b = true,
-                "l" => has_l = true,
-                "lz" => has_lz = true,
-                _ => return unsupported(i),
-            }
-        }
-        let take = |t: &mut Self, nx: &mut std::vec::IntoIter<usize>| -> TResult<Val> {
-            let r = nx.next().ok_or_else(|| {
-                TranslateError::Unsupported(format!("{name} : adresse trop courte"))
-            })?;
-            let var = t.vvar(r);
-            let v = t.load_u32(var);
-            Ok(t.spv.bitcast(v, Sc::F32))
-        };
-        let bias = if has_b {
-            Some(take(self, &mut next)?)
-        } else {
-            None
-        };
-        let dref = if has_c {
-            Some(take(self, &mut next)?)
-        } else {
-            None
-        };
-        let mut coords = Vec::new();
-        for _ in 0..ncoord {
-            coords.push(take(self, &mut next)?.id);
-        }
-        let lod = if has_l {
-            Some(take(self, &mut next)?)
-        } else {
-            None
-        };
-        let coord = self.spv.construct(Sc::F32, &coords);
-        // échantillonneur
-        let sn = Self::sgpr_index(&ops[n - 1])?;
-        let Some(smp_res) = self
-            .res_map
-            .get(&sn)
-            .copied()
-            .filter(|r| r.kind == ResourceKind::Sampler)
-        else {
-            return err(format!("aucun S# connu dans s[{sn}:{}]", sn + 3));
-        };
-        let smp_var = self.sampler_var(smp_res.set, smp_res.binding);
-        let samp_ty = self.spv.raw_type(26, &[]);
-        let si_ty = self.spv.raw_type(27, &[img_ty]);
-        let img = self.spv.emit(61, img_ty, &[img_var]);
-        let smp = self.spv.emit(61, samp_ty, &[smp_var]);
-        let si = self.spv.emit(86, si_ty, &[img, smp]);
-
-        let implicit = self.cfg.stage == Stage::Fragment && !has_l && !has_lz;
-        let res_ty = if has_c { f32t } else { v4 };
-        let zero = self.spv.c_f32(0.0);
-        let px = match (dref, implicit) {
-            (None, true) => match bias {
-                Some(b) => self.spv.emit(87, res_ty, &[si, coord.id, 1, b.id]),
-                None => self.spv.emit(87, res_ty, &[si, coord.id]),
-            },
-            (None, false) => {
-                let l = lod.map(|v| v.id).unwrap_or(zero);
-                self.spv.emit(88, res_ty, &[si, coord.id, 2, l])
-            }
-            (Some(d), true) => match bias {
-                Some(b) => self.spv.emit(89, res_ty, &[si, coord.id, d.id, 1, b.id]),
-                None => self.spv.emit(89, res_ty, &[si, coord.id, d.id]),
-            },
-            (Some(d), false) => {
-                let l = lod.map(|v| v.id).unwrap_or(zero);
-                self.spv.emit(90, res_ty, &[si, coord.id, d.id, 2, l])
-            }
-        };
-        if has_c {
-            // un seul canal : réplique la valeur de comparaison dans le premier registre
-            return self.write_dmask(
-                m.dmask,
-                d0,
-                Val {
-                    id: px,
-                    sc: Sc::F32,
-                    n: 1,
-                },
-            );
-        }
-        self.write_dmask(
-            m.dmask,
-            d0,
-            Val {
-                id: px,
-                sc: Sc::F32,
-                n: 4,
-            },
-        )
-    }
-
-    /// Écrit les composantes de `px` sélectionnées par `dmask` dans des VGPR consécutifs.
-    fn write_dmask(&mut self, dmask: u8, d0: usize, px: Val) -> TResult<()> {
-        let mut k = 0usize;
-        for c in 0..4u32 {
-            if dmask >> c & 1 == 0 {
-                continue;
-            }
-            let v = if px.n == 1 {
-                px
-            } else {
-                self.spv.extract(px, c)
-            };
-            self.write_v(d0 + k, v);
-            k += 1;
-        }
-        Ok(())
-    }
-
-    fn image_var(&mut self, set: u32, binding: u32, dim: u32, arrayed: u32) -> TResult<(u32, u32)> {
-        let f32t = self.spv.ty(Sc::F32, 1);
-        if dim == 0 {
-            self.spv.caps.insert(43); // Sampled1D
-        }
-        let img_ty = self.spv.raw_type(25, &[f32t, dim, 0, arrayed, 0, 1, 0]);
-        if let Some(&(v, t, d)) = self.images.get(&(set, binding)) {
-            if t != img_ty || u32::from(d) != dim {
-                return err(format!(
-                    "la liaison ({set},{binding}) est utilisée avec plusieurs dimensions d'image"
-                ));
-            }
-            return Ok((v, t));
-        }
-        let pt = self.spv.ptr(0, img_ty);
-        let var = self.spv.global_var(pt, 0, None);
-        self.spv.decorate(var, 34, &[set]);
-        self.spv.decorate(var, 33, &[binding]);
-        self.images.insert((set, binding), (var, img_ty, dim as u8));
-        self.info.bindings.push(BindingUse {
-            set,
-            binding,
-            kind: "sampled_image",
-        });
-        Ok((var, img_ty))
-    }
-
-    fn sampler_var(&mut self, set: u32, binding: u32) -> u32 {
-        if let Some(&v) = self.samplers.get(&(set, binding)) {
-            return v;
-        }
-        let st = self.spv.raw_type(26, &[]);
-        let pt = self.spv.ptr(0, st);
-        let var = self.spv.global_var(pt, 0, None);
-        self.spv.decorate(var, 34, &[set]);
-        self.spv.decorate(var, 33, &[binding]);
-        self.samplers.insert((set, binding), var);
-        self.info.bindings.push(BindingUse {
-            set,
-            binding,
-            kind: "sampler",
-        });
-        var
     }
 }
 

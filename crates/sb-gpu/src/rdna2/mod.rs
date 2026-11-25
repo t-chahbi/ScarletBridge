@@ -10,7 +10,14 @@ pub mod inst;
 #[rustfmt::skip]
 mod tables;
 mod trans_alu;
+mod trans_ds;
+mod trans_ext;
+mod trans_f16;
+mod trans_f64;
+mod trans_flat;
 mod trans_mem;
+mod trans_mimg;
+mod trans_misc;
 pub mod translate;
 
 pub use decode::{Decoded, decode, decode_stream};
@@ -31,6 +38,8 @@ mod tests;
 mod test_programs;
 #[cfg(test)]
 mod tests_gpu;
+#[cfg(test)]
+mod tests_gpu_ext;
 #[cfg(test)]
 mod tests_gpu_gfx;
 #[cfg(test)]

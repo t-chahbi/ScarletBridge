@@ -213,6 +213,8 @@ pub struct Mods {
     pub ext: Ext,
     /// Second dword d'une extension DPP/SDWA.
     pub ext_raw: u32,
+    /// DPP8 : variante « fetch inactive » (src0 = 234).
+    pub dpp8_fi: bool,
     // --- mémoire ---
     /// Offset immédiat (MUBUF/MTBUF/SMEM/FLAT/DS).
     pub offset: i32,
@@ -247,6 +249,101 @@ pub struct Mods {
     // --- VINTRP ---
     pub attr: u8,
     pub attr_chan: u8,
+}
+
+/// Champs décodés d'un second dword SDWA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sdwa {
+    /// 0..=3 BYTE_0..3, 4..=5 WORD_0..1, 6 DWORD.
+    pub dst_sel: u8,
+    /// 0 PAD, 1 SEXT, 2 PRESERVE.
+    pub dst_unused: u8,
+    pub clamp: bool,
+    pub omod: u8,
+    pub src0_sel: u8,
+    pub src0_sext: bool,
+    pub src0_neg: bool,
+    pub src0_abs: bool,
+    /// src0 est un SGPR/constante (bit s0).
+    pub src0_scalar: bool,
+    pub src1_sel: u8,
+    pub src1_sext: bool,
+    pub src1_neg: bool,
+    pub src1_abs: bool,
+    pub src1_scalar: bool,
+}
+
+/// Champs décodés d'un second dword DPP16.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dpp16 {
+    pub ctrl: u16,
+    pub fi: bool,
+    pub bound_ctrl: bool,
+    pub src0_neg: bool,
+    pub src0_abs: bool,
+    pub src1_neg: bool,
+    pub src1_abs: bool,
+    pub bank_mask: u8,
+    pub row_mask: u8,
+}
+
+impl Mods {
+    /// Champs SDWA, si l'instruction porte une extension SDWA.
+    pub fn sdwa(&self) -> Option<Sdwa> {
+        if self.ext != Ext::Sdwa {
+            return None;
+        }
+        let e = self.ext_raw;
+        let b = |n: u32| e >> n & 1 != 0;
+        Some(Sdwa {
+            dst_sel: (e >> 8 & 7) as u8,
+            dst_unused: (e >> 11 & 3) as u8,
+            clamp: b(13),
+            omod: (e >> 14 & 3) as u8,
+            src0_sel: (e >> 16 & 7) as u8,
+            src0_sext: b(19),
+            src0_neg: b(20),
+            src0_abs: b(21),
+            src0_scalar: b(23),
+            src1_sel: (e >> 24 & 7) as u8,
+            src1_sext: b(27),
+            src1_neg: b(28),
+            src1_abs: b(29),
+            src1_scalar: b(31),
+        })
+    }
+
+    /// Champs DPP16, si l'instruction porte une extension DPP16.
+    pub fn dpp16(&self) -> Option<Dpp16> {
+        if self.ext != Ext::Dpp16 {
+            return None;
+        }
+        let e = self.ext_raw;
+        let b = |n: u32| e >> n & 1 != 0;
+        Some(Dpp16 {
+            ctrl: (e >> 8 & 0x1FF) as u16,
+            fi: b(18),
+            bound_ctrl: b(19),
+            src0_neg: b(20),
+            src0_abs: b(21),
+            src1_neg: b(22),
+            src1_abs: b(23),
+            bank_mask: (e >> 24 & 0xF) as u8,
+            row_mask: (e >> 28 & 0xF) as u8,
+        })
+    }
+
+    /// Sélecteurs de lanes DPP8 (8 x 3 bits) et drapeau `fi`.
+    pub fn dpp8(&self) -> Option<([u8; 8], bool)> {
+        if self.ext != Ext::Dpp8 {
+            return None;
+        }
+        let mut sel = [0u8; 8];
+        for (k, s) in sel.iter_mut().enumerate() {
+            *s = (self.ext_raw >> (8 + 3 * k) & 7) as u8;
+        }
+        Some((sel, self.dpp8_fi))
+    }
 }
 
 /// Instruction RDNA 2 décodée.
