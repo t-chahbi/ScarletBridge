@@ -14,7 +14,7 @@ jobs:
     name: Format & Clippy (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -28,7 +28,7 @@ jobs:
     name: Unit & Headless Vulkan Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Vulkan (Lavapipe) & SPIR-V Tools
         run: |
           sudo apt-get update
@@ -45,7 +45,7 @@ jobs:
     name: Win64 Cross-Build & Native PE32+ Harnesses
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install MinGW-w64, LLVM dlltool & Lavapipe Vulkan
         run: |
           sudo apt-get update
