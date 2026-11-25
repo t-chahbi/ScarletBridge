@@ -20,9 +20,9 @@ use sb_common::{sb_debug, sb_info, sb_warn};
 
 use crate::dxbc_to_spirv::{
     CBUFFER_VEC4_COUNT, MAX_CBUFFER_SLOTS, MAX_SAMPLER_SLOTS, MAX_STORAGE_SLOTS, MAX_TEXTURE_SLOTS,
-    SAMPLER_BINDING_BASE, STORAGE_BINDING_BASE, TEXTURE_BINDING_BASE, translate_dxbc_to_spirv,
+    SAMPLER_BINDING_BASE, STORAGE_BINDING_BASE, TEXTURE_BINDING_BASE,
 };
-use crate::shader::ShaderStage;
+use crate::shader::{ShaderStage, translate_shader};
 use crate::vulkan::{GpuContext, GpuError};
 
 const CBUFFER_BYTE_SIZE: u64 = (CBUFFER_VEC4_COUNT as u64) * 16; // 4096 octets (256 × vec4)
@@ -1020,12 +1020,14 @@ impl VulkanRenderer {
         ps_dxbc: &[u8],
         cfg: &GraphicsPipelineConfig,
     ) -> Result<usize, String> {
-        let vs = translate_dxbc_to_spirv(vs_dxbc).map_err(|e| format!("VS DXBC->SPIR-V: {e}"))?;
-        let ps = translate_dxbc_to_spirv(ps_dxbc).map_err(|e| format!("PS DXBC->SPIR-V: {e}"))?;
+        let vs = translate_shader(vs_dxbc, ShaderStage::Vertex)
+            .map_err(|e| format!("VS DXBC/DXIL->SPIR-V: {e}"))?;
+        let ps = translate_shader(ps_dxbc, ShaderStage::Pixel)
+            .map_err(|e| format!("PS DXBC/DXIL->SPIR-V: {e}"))?;
 
         sb_info!(
             "renderer",
-            "shaders DXBC -> SPIR-V traduits : VS={} mots ({} in, {} out, cb={:?}), PS={} mots (tex={:?})",
+            "shaders DXBC/DXIL -> SPIR-V traduits : VS={} mots ({} in, {} out, cb={:?}), PS={} mots (tex={:?})",
             vs.spirv.len(),
             vs.inputs.len(),
             vs.outputs.len(),
@@ -1229,7 +1231,8 @@ impl VulkanRenderer {
 
     /// Traduit un Compute Shader DXBC SM5.0 (`CS`) en SPIR-V 1.3 et compile un `VkPipeline` Compute natif !
     pub fn create_compute_pipeline_from_dxbc(&mut self, cs_dxbc: &[u8]) -> Result<usize, String> {
-        let cs = translate_dxbc_to_spirv(cs_dxbc).map_err(|e| format!("CS DXBC->SPIR-V: {e}"))?;
+        let cs = translate_shader(cs_dxbc, ShaderStage::Compute)
+            .map_err(|e| format!("CS DXBC/DXIL->SPIR-V: {e}"))?;
         if cs.stage != ShaderStage::Compute {
             return Err(format!("stage Compute attendu, reçu {:?}", cs.stage));
         }

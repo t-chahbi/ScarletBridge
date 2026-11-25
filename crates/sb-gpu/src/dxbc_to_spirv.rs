@@ -52,6 +52,12 @@ pub enum ShaderTranslateError {
     InvalidOperand(String),
     #[error("fonctionnalité shader non supportée : {0}")]
     Unsupported(String),
+    /// Opcode `dx.op.*` DXIL non géré (nom de la table DXIL, `?` si inconnu).
+    #[error("opcode DXIL non supporté : dx.op.{name} (opcode {opcode})")]
+    UnsupportedDxilOp { opcode: u32, name: &'static str },
+    /// Bitcode / conteneur DXIL malformé.
+    #[error("DXIL invalide : {0}")]
+    InvalidDxil(String),
 }
 
 mod alu;
@@ -89,6 +95,9 @@ pub struct TranslatedShader {
     /// Buffers SRV bruts/structurés (`t#`), bindings `SRV_BUFFER_BINDING_BASE + slot`.
     pub used_srv_buffers: Vec<u32>,
     pub thread_group_size: [u32; 3],
+    /// Vrai si le shader (DXIL SM6.6) accède au tas de descripteurs non lié : tableaux
+    /// `RuntimeArray` du set 1 (voir `dxil::res`), non branchés par le renderer actuel.
+    pub descriptor_heap: bool,
 }
 
 impl TranslatedShader {
@@ -179,6 +188,7 @@ pub fn translate_dxbc_to_spirv(dxbc: &[u8]) -> Result<TranslatedShader, ShaderTr
         used_storage_buffers: emitted.used_storage_buffers,
         used_srv_buffers: emitted.used_srv_buffers,
         thread_group_size: emitted.thread_group_size,
+        descriptor_heap: false,
     })
 }
 

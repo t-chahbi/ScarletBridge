@@ -18,13 +18,14 @@ pub use dxbc_to_spirv::{
     sample_triangle_ps_dxbc, sample_triangle_vs_dxbc, translate_dxbc_to_spirv,
 };
 pub use dxil::{
-    DxilError, DxilProgramInfo, build_sample_dxil_sm60_container, parse_dxil_container,
+    DxilError, DxilParseError, DxilProgramInfo, build_sample_dxil_sm60_container,
+    is_dxil_container, parse_dxil_container, translate_dxil_to_spirv,
 };
 pub use renderer::{
     GraphicsPipelineConfig, RenderCommand, SSBO_BYTE_SIZE, VertexAttrConfig, VertexPosColor,
     VertexPosUvColor, VulkanRenderer, dxgi_format_byte_size, dxgi_format_to_vk,
 };
 pub use sdl3::{GamepadSnapshot, Sdl3AudioStream, Sdl3Lib, Sdl3Window};
-pub use shader::{ShaderContainer, ShaderFormat, ShaderStage};
+pub use shader::{ShaderContainer, ShaderFormat, ShaderStage, translate_shader};
 pub use unified_mem::{UnifiedMemoryManager, UnifiedRegion};
 pub use vulkan::{GpuContext, GpuError, SwapchainPresenter};

@@ -3,6 +3,23 @@
 //! Extrait les chunks (`SHDR`, `SHEX`, `DXIL`, `ISGN`, `OSGN`, `RDEF`), le type de shader
 //! (Vertex, Pixel, Compute, Geometry, Hull, Domain, Mesh/Amplification) et le Shader Model.
 
+use crate::dxbc_to_spirv::{ShaderTranslateError, TranslatedShader, translate_dxbc_to_spirv};
+use crate::dxil::{is_dxil_container, translate_dxil_to_spirv};
+
+/// Aiguillage DXBC (SM4/SM5, chunk `SHDR`/`SHEX`) / DXIL (SM6.x, chunk `DXIL`/`ILDB`) d'après les
+/// chunks du conteneur : traduit le shader en SPIR-V 1.3 pour Vulkan. `stage` est le stage attendu
+/// par le pipeline (vérifié pour DXIL).
+pub fn translate_shader(
+    bytes: &[u8],
+    stage: ShaderStage,
+) -> Result<TranslatedShader, ShaderTranslateError> {
+    if is_dxil_container(bytes) {
+        translate_dxil_to_spirv(bytes, stage)
+    } else {
+        translate_dxbc_to_spirv(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShaderFormat {
     Dxbc,
@@ -104,8 +121,25 @@ impl ShaderContainer {
             } else if &fourcc == b"DXIL" && payload_start + 4 <= bytes.len() {
                 format = ShaderFormat::Dxil;
                 bytecode_len = chunk_size;
-                stage = ShaderStage::LibraryOrMesh;
-                major_version = 6;
+                // `DxilProgramHeader.ProgramVersion` : (kind << 16) | (major << 4) | minor.
+                let ver_token = u32::from_le_bytes([
+                    bytes[payload_start],
+                    bytes[payload_start + 1],
+                    bytes[payload_start + 2],
+                    bytes[payload_start + 3],
+                ]);
+                stage = match (ver_token >> 16) & 0xFFFF {
+                    0 => ShaderStage::Pixel,
+                    1 => ShaderStage::Vertex,
+                    2 => ShaderStage::Geometry,
+                    3 => ShaderStage::Hull,
+                    4 => ShaderStage::Domain,
+                    5 => ShaderStage::Compute,
+                    6..=14 => ShaderStage::LibraryOrMesh,
+                    other => ShaderStage::Unknown(other as u16),
+                };
+                major_version = ((ver_token >> 4) & 0xF) as u8;
+                minor_version = (ver_token & 0xF) as u8;
             }
         }
 
