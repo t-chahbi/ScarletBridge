@@ -4,8 +4,8 @@
 use super::inst::{Instruction, Operand, Src};
 use super::tables::TBUF_FORMATS;
 use super::translate::{
-    DescKind, ResRef, ResourceKind, ResourceLoc, Stage, TResult, TableBindingUse, Tr,
-    TranslateError, res_ref, unsupported,
+    DescKind, DescriptorTable, ResRef, ResourceKind, ResourceLoc, SgprInit, Stage, TResult,
+    TableBindingUse, TableRange, Tr, TranslateError, res_ref, unsupported,
 };
 use crate::dxbc_to_spirv::spv::{Sc, Val};
 
@@ -70,11 +70,34 @@ impl Tr<'_> {
     /// Explique pourquoi les SGPR `[n, n+words)` ne contiennent pas de descripteur résolu.
     fn explain_sgpr(&self, n: u8, words: u8) -> String {
         let mut why = Vec::new();
+        let last = n.saturating_add(words) - 1;
+        // cause unique pour toute la plage : message compact
+        let ptrs: Vec<_> = (n..=last)
+            .map(|k| self.ptr_loaded.get(&k).copied())
+            .collect();
+        if let Some(Some((w, p))) = ptrs.first().copied()
+            && ptrs.iter().all(|x| *x == Some((w, p)))
+        {
+            why.push(format!(
+                "s[{n}:{last}] contiennent des données chargées par `{w}` depuis le pointeur de buffer déclaré s[{p}:{}] (ce n'est pas une table de descripteurs)",
+                p + 1
+            ));
+        }
         for k in n..n.saturating_add(words) {
+            if !why.is_empty() {
+                break;
+            }
             let alias = self.sgpr_alias.get(&k);
             let origin = self.desc_words.get(&k);
             why.push(match (origin, alias) {
                 (Some((t, off)), _) => format!("s{k}=mot de table s[{t}:{}]+{off:#x}", t + 1),
+                (None, _) if self.ptr_loaded.contains_key(&k) => {
+                    let (w, p) = self.ptr_loaded[&k];
+                    format!(
+                        "s{k} contient des données chargées par `{w}` depuis le pointeur de buffer déclaré s[{p}:{}] (ce n'est pas une table de descripteurs)",
+                        p + 1
+                    )
+                }
                 (None, Some((o, a))) => format!("s{k}=alias de s{o}+{a:#x} (pas un descripteur)"),
                 (None, None) => match self.last_writer.get(&k) {
                     Some(w) => {
@@ -88,6 +111,7 @@ impl Tr<'_> {
             .cfg
             .tables
             .iter()
+            .chain(self.auto_tables.iter())
             .map(|t| format!("s[{}:{}]", t.sgpr, t.sgpr + 1))
             .collect();
         format!(
@@ -99,6 +123,53 @@ impl Tr<'_> {
                 tables.join(" ")
             }
         )
+    }
+
+    /// Table déclarée ou inférée dont la paire de base est `sgpr`.
+    pub(crate) fn find_table(&self, sgpr: u8) -> Option<DescriptorTable> {
+        self.cfg
+            .tables
+            .iter()
+            .chain(self.auto_tables.iter())
+            .find(|t| t.sgpr == sgpr)
+            .copied()
+    }
+
+    /// Inférence par l'usage : `orig` (paire de user-SGPR intacte) devient une table si
+    /// `TranslateConfig::infer_tables` est actif et que la paire n'est ni un pointeur ni une
+    /// ressource déclarés.
+    fn infer_table(&mut self, orig: u8, widened: bool) -> Option<DescriptorTable> {
+        let inf = self.cfg.infer_tables?;
+        let is_user = |r: u8| {
+            self.cfg
+                .sgprs
+                .iter()
+                .any(|(s, init)| *s == r && matches!(init, SgprInit::UserData(_)))
+        };
+        if !is_user(orig)
+            || !(widened || is_user(orig.wrapping_add(1)))
+            || self.last_writer.contains_key(&orig)
+            || (!widened && self.last_writer.contains_key(&orig.wrapping_add(1)))
+        {
+            return None;
+        }
+        let declared = self.cfg.resources.iter().any(|r| match r.loc {
+            ResourceLoc::Pointer(p) => p == orig,
+            ResourceLoc::Table { table_sgpr, .. } => table_sgpr == orig,
+            ResourceLoc::Sgprs(f) => (f..f.saturating_add(8)).contains(&orig),
+        });
+        if declared {
+            return None;
+        }
+        let k = self.auto_tables.len() as u32;
+        let t = DescriptorTable {
+            sgpr: orig,
+            set: inf.set,
+            binding_base: inf.first_binding_base + k * inf.binding_span,
+            buffer_stride: inf.buffer_stride,
+        };
+        self.auto_tables.push(t);
+        Some(t)
     }
 
     /// Résout le descripteur de nature `kind` dont le premier SGPR est celui de `o` : ressource
@@ -145,7 +216,7 @@ impl Tr<'_> {
                 ));
             }
         }
-        let Some(tbl) = self.cfg.tables.iter().find(|x| x.sgpr == t).copied() else {
+        let Some(tbl) = self.find_table(t) else {
             return err(format!("{ctx} : table s[{t}:{}] non déclarée", t + 1));
         };
         if off < 0 || off % 16 != 0 {
@@ -160,23 +231,36 @@ impl Tr<'_> {
             DescKind::Image => "sampled_image",
             DescKind::Sampler => "sampler",
         };
-        if let Some(prev) = self
-            .info
-            .table_bindings
-            .iter()
-            .find(|b| b.table_sgpr == t && i64::from(b.byte_offset) == off)
-        {
-            let same = (prev.kind == "storage_buffer") == (kind == DescKind::Buffer)
-                && (prev.kind == "sampler") == (kind == DescKind::Sampler);
-            if !same {
-                return err(format!(
-                    "{ctx} : l'entrée {off:#x} de la table s[{t}:{}] est utilisée avec deux natures ({} puis {})",
-                    t + 1,
-                    prev.kind,
-                    tag
-                ));
+        // Entrées indexées par (offset, nature) + plage d'octets (T# = 32 octets, V#/S# = 16) :
+        // deux natures différentes dont les plages se recouvrent sont refusées (jamais confondues).
+        let (lo, hi) = (off, off + 4 * i64::from(words));
+        let mut known = false;
+        for r in &self.table_ranges {
+            if r.table != t || r.hi <= lo || hi <= r.lo {
+                continue;
             }
-        } else {
+            if r.kind == kind && r.lo == lo && r.hi == hi {
+                known = true;
+                continue;
+            }
+            return err(format!(
+                "{ctx} : {} [{lo:#x}..{hi:#x}) de la table s[{t}:{}] chevauche {} [{:#x}..{:#x}) déjà utilisé par `{}` : une même plage de table ne peut pas être lue avec deux natures/tailles",
+                kind.label(),
+                t + 1,
+                r.kind.label(),
+                r.lo,
+                r.hi,
+                r.inst
+            ));
+        }
+        if !known {
+            self.table_ranges.push(TableRange {
+                table: t,
+                lo,
+                hi,
+                kind,
+                inst: ctx,
+            });
             self.info.table_bindings.push(TableBindingUse {
                 table_sgpr: t,
                 byte_offset: off as u32,
@@ -245,7 +329,13 @@ impl Tr<'_> {
             if let (ResourceLoc::Pointer(p), ResourceKind::Buffer { .. }) = (r.loc, r.kind)
                 && (p == n || p == orig)
             {
-                return self.smem_read_words(r.set, r.binding, eff_imm as i32, soff, dcode, count);
+                self.smem_read_words(r.set, r.binding, eff_imm as i32, soff, dcode, count)?;
+                for k in 0..count {
+                    if let Ok(c8) = u8::try_from(dcode + k) {
+                        self.ptr_loaded.insert(c8, (name, p));
+                    }
+                }
+                return Ok(());
             }
         }
         // 2. table de descripteurs : on associe les SGPR de destination aux ressources chargées
@@ -274,7 +364,17 @@ impl Tr<'_> {
         }
         // 3. table déclarée (`TranslateConfig::tables`) : les mots chargés sont des mots de
         //    descripteurs ; leur nature (V#/T#/S#) est décidée à l'usage.
-        if let Some(tbl) = cfg.tables.iter().find(|t| t.sgpr == orig || t.sgpr == n) {
+        let tbl = self
+            .find_table(orig)
+            .or_else(|| self.find_table(n))
+            .or_else(|| {
+                if found {
+                    None
+                } else {
+                    self.infer_table(orig, orig != n)
+                }
+            });
+        if let Some(tbl) = tbl {
             let Some(cs) = const_soff else {
                 return err(format!(
                     "{name} depuis s[{n}:{}] (base = table s[{}:{}] + {add_off:#x}, imm={imm:#x}) : offset SGPR/non constant (soffset={:?}), impossible de choisir l'entrée de table",
@@ -324,6 +424,7 @@ impl Tr<'_> {
         let tbls: Vec<String> = cfg
             .tables
             .iter()
+            .chain(self.auto_tables.iter())
             .map(|t| format!("s[{}:{}]", t.sgpr, t.sgpr + 1))
             .collect();
         err(format!(

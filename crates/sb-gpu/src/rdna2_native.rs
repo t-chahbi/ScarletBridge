@@ -44,8 +44,8 @@
 use thiserror::Error;
 
 use crate::rdna2::{
-    DescriptorTable, ProgramInfo, Resource, ResourceKind, ResourceLoc, SgprInit, Stage,
-    TranslateConfig, VgprInit, WaveSize, translate_program,
+    DescriptorTable, InferTables, ProgramInfo, Resource, ResourceKind, ResourceLoc, SgprInit,
+    Stage, TranslateConfig, VgprInit, WaveSize, translate_program,
 };
 
 pub const SBR2_MAGIC: [u8; 4] = *b"SBR2";
@@ -208,6 +208,15 @@ pub fn is_native_container(bytes: &[u8]) -> bool {
 fn rd(bytes: &[u8], i: usize) -> u32 {
     let o = i * 4;
     u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+}
+
+/// Résultat de [`NativeShader::discover_tables`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableDiscovery {
+    /// Entrées de tables utilisées, triées par `(table, offset)`.
+    pub resources: Vec<NativeResource>,
+    /// Paires de user-SGPR des tables : déclarées d'abord, puis inférées (ordre d'usage).
+    pub tables: Vec<u8>,
 }
 
 impl NativeShader {
@@ -488,6 +497,18 @@ impl NativeShader {
         &self,
         tables: &[u8],
     ) -> Result<Vec<NativeResource>, NativeError> {
+        Ok(self.discover_tables(tables, false)?.resources)
+    }
+
+    /// Comme [`Self::discover_table_resources`], avec en plus (`infer = true`) l'inférence des
+    /// tables par l'usage : toute paire de user-SGPR utilisée comme base de `s_load_*` qui n'est ni
+    /// un pointeur/table/ressource déclaré ni dans `tables` devient une table, dans l'ordre de
+    /// première utilisation (`TableDiscovery::tables` : déclarées d'abord, puis inférées).
+    pub fn discover_tables(
+        &self,
+        tables: &[u8],
+        infer: bool,
+    ) -> Result<TableDiscovery, NativeError> {
         let mut cfg = self.translate_config();
         cfg.tables = tables
             .iter()
@@ -498,6 +519,14 @@ impl NativeShader {
                 buffer_stride: 4,
             })
             .collect();
+        if infer {
+            cfg.infer_tables = Some(InferTables {
+                set: 0,
+                first_binding_base: 1000 + 4096 * tables.len() as u32,
+                binding_span: 4096,
+                buffer_stride: 4,
+            });
+        }
         let t = translate_program(&self.code, &cfg)
             .map_err(|e| NativeError::Translate(e.to_string()))?;
         let mut found: Vec<NativeResource> = t
@@ -523,7 +552,12 @@ impl NativeShader {
             } => (table_sgpr, byte_offset),
             _ => (u8::MAX, 0),
         });
-        Ok(found)
+        let mut order: Vec<u8> = tables.to_vec();
+        order.extend(t.info.inferred_tables.iter().map(|d| d.sgpr));
+        Ok(TableDiscovery {
+            resources: found,
+            tables: order,
+        })
     }
 
     /// Traduit le programme en SPIR-V et recense les liaisons Vulkan réellement utilisées.

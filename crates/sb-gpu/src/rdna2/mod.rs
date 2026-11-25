@@ -24,8 +24,8 @@ pub use decode::{Decoded, decode, decode_stream};
 pub use disasm::{disassemble, disassemble_stream, format_operand};
 pub use inst::{DecodeError, Encoding, Ext, Instruction, Mods, Operand, Src, WaveSize};
 pub use translate::{
-    BindingUse, DescriptorTable, ProgramInfo, Resource, ResourceKind, ResourceLoc, SgprInit, Stage,
-    TableBindingUse, TranslateConfig, TranslateError, TranslatedProgram, VgprInit,
+    BindingUse, DescriptorTable, InferTables, ProgramInfo, Resource, ResourceKind, ResourceLoc,
+    SgprInit, Stage, TableBindingUse, TranslateConfig, TranslateError, TranslatedProgram, VgprInit,
     translate_program,
 };
 
@@ -36,7 +36,7 @@ mod test_vectors;
 mod tests;
 #[cfg(test)]
 #[rustfmt::skip]
-mod test_programs;
+pub(crate) mod test_programs;
 #[cfg(test)]
 mod tests_gpu;
 #[cfg(test)]

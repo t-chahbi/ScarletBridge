@@ -27,8 +27,8 @@ use sb_gpu::rdna2_native::{
     NativeShaderMeta, NativeStage, is_native_container,
 };
 use sb_gpu::renderer::{
-    NativeBinding, NativeDispatchCmd, NativeDrawCmd, NativeSamplerDesc, NativeStageState,
-    native_format_texel_bytes,
+    NativeBinding, NativeDispatchCmd, NativeDrawCmd, NativeImageDim, NativeSamplerDesc,
+    NativeStageState, native_format_texel_bytes,
 };
 
 /// Nombre de mots user-SGPR transmis à chaque étage.
@@ -112,6 +112,10 @@ pub(crate) enum RootArg {
 pub(crate) struct RootBinding {
     pub layout: Option<Arc<RootSigLayout>>,
     pub args: Vec<RootArg>,
+    /// Plan user-SGPR propre au PSO courant : `(indice de paramètre racine, premier user-SGPR)`
+    /// qui remplace `RootSigLayout::first_sgpr` (plan déduit de l'usage, voir
+    /// [`discover_root_tables`]). Conservé lors d'un changement de signature.
+    pub plan_override: Vec<(usize, u32)>,
 }
 
 impl RootBinding {
@@ -165,8 +169,18 @@ impl RootBinding {
         let Some(layout) = &self.layout else {
             return out;
         };
-        for (i, arg) in self.args.iter().enumerate() {
-            let first = layout.first_sgpr[i] as usize;
+        let overridden = |i: usize| self.plan_override.iter().find(|(p, _)| *p == i);
+        // Paramètres au plan réel d'abord, puis ceux déplacés par le plan déduit (qui gagnent en
+        // cas de recouvrement avec un paramètre inutilisé par le shader).
+        let order = (0..self.args.len())
+            .filter(|&i| overridden(i).is_none())
+            .chain((0..self.args.len()).filter(|&i| overridden(i).is_some()));
+        for i in order {
+            let arg = &self.args[i];
+            let first = match overridden(i) {
+                Some(&(_, sgpr)) => sgpr as usize,
+                None => layout.first_sgpr[i] as usize,
+            };
             match arg {
                 RootArg::Unset => {}
                 RootArg::Constants(v) => {
@@ -194,6 +208,8 @@ impl RootBinding {
 #[derive(Debug)]
 pub(crate) struct NativePso {
     pub stages: Vec<NativeShaderMeta>,
+    /// Plan user-SGPR déduit de l'usage (vide = plan réel de la signature racine).
+    pub user_plan: Vec<(usize, u32)>,
 }
 
 /// État natif d'une liste de commandes.
@@ -209,10 +225,16 @@ impl NativeListState {
     /// Mémorise le PSO courant (`None` si le PSO n'est pas natif : le chemin DXBC reprend la main).
     pub fn note_pso(&mut self, id: usize, is_compute: bool, native: &Option<Arc<NativePso>>) {
         let v = native.as_ref().map(|n| (id, Arc::clone(n)));
+        let plan = native
+            .as_ref()
+            .map(|n| n.user_plan.clone())
+            .unwrap_or_default();
         if is_compute {
             self.cs_pso = v;
+            self.cs.plan_override = plan;
         } else {
             self.gfx_pso = v;
+            self.gfx.plan_override = plan;
         }
     }
 }
@@ -258,6 +280,7 @@ pub(crate) fn create_native_graphics_pso(
         Ok(id) => {
             let native = Arc::new(NativePso {
                 stages: vec![v.meta, p.meta],
+                user_plan: Vec::new(),
             });
             // SAFETY: `out_pso` vérifié non-nul par l'appelant.
             unsafe { *out_pso = new_pso_object(id, false, native) };
@@ -295,6 +318,7 @@ pub(crate) fn create_native_compute_pso(
         Ok(id) => {
             let native = Arc::new(NativePso {
                 stages: vec![c.meta],
+                user_plan: Vec::new(),
             });
             // SAFETY: `out_pso` vérifié non-nul par l'appelant.
             unsafe { *out_pso = new_pso_object(id, true, native) };
@@ -567,43 +591,145 @@ pub(crate) fn infer_compute_resources(
     (num_user_sgprs.clamp(2, USER_DWORDS as u32), resources)
 }
 
-/// Tables de descripteurs de la signature racine : les entrées V#/T#/S# réellement utilisées par
-/// le programme sont découvertes par le traducteur (suivi symbolique « base de table + offset
-/// constant » à travers `s_add_u32`/`s_addc_u32`/`s_mov_b32`/`s_mov_b64`, `s_load_dwordx{1..16}`,
-/// plusieurs T#/S# par table) et remplacent les ressources `Table`/`Pointer` de ces paires de
-/// SGPR. Échoue avec le message du traducteur (SGPR, instruction, table) si une base ou un offset
-/// n'est pas constant ; sans disposition de signature racine, rien n'est inventé ici.
+/// Tables de descripteurs d'un shader compute.
+///
+/// Les entrées V#/T#/S# réellement utilisées sont découvertes par le traducteur (suivi symbolique
+/// « base de table + offset constant » à travers `s_add_u32`/`s_addc_u32`/`s_mov_b32`/`s_mov_b64`,
+/// `s_load_dwordx{1..16}`, plusieurs T#/S# par table, entrées indexées par (offset, nature)) et
+/// remplacent les ressources `Table`/`Pointer` issues de l'heuristique.
+///
+/// Les tables sont d'abord celles du plan user-SGPR réel de la signature racine
+/// (`pack_user_sgprs`). Toute autre paire de user-SGPR utilisée comme base de `s_load_*` (hors
+/// pointeurs CBV/SRV/UAV du plan) est une table **inférée par l'usage** : elle est associée, dans
+/// l'ordre de première utilisation, aux paramètres table de la signature que le shader n'utilise
+/// pas à leur emplacement du plan. L'association est journalisée (`sb_warn`) et renvoyée sous
+/// forme de plan `(paramètre racine, user-SGPR)`. Aucune donnée n'est inventée : trop de tables
+/// utilisées, ou une paire qui recouvre des constantes racine, est une erreur précise.
+///
+/// Sans disposition de signature racine, rien n'est modifié.
 pub(crate) fn discover_root_tables(
     meta: &mut NativeShaderMeta,
     code: &[u32],
     layout: Option<&RootSigLayout>,
-) -> Result<(), String> {
-    let Some(l) = layout else { return Ok(()) };
-    let tables = l.table_sgprs();
-    if tables.is_empty() {
-        return Ok(());
-    }
-    let is_table = |s: u8| tables.contains(&s);
+) -> Result<Vec<(usize, u32)>, String> {
+    let Some(l) = layout else {
+        return Ok(Vec::new());
+    };
+    let declared = l.table_sgprs();
+    let ptr_slots: Vec<u8> = l
+        .params
+        .iter()
+        .zip(&l.first_sgpr)
+        .filter(|((k, _), _)| {
+            matches!(
+                k,
+                RootParamKind::Cbv | RootParamKind::Srv | RootParamKind::Uav
+            )
+        })
+        .filter_map(|(_, &f)| u8::try_from(f).ok())
+        .collect();
     meta.resources.retain(|r| match r.loc {
-        NativeResourceLoc::Table { table_sgpr, .. } => !is_table(table_sgpr),
-        NativeResourceLoc::Pointer { sgpr } => !is_table(sgpr),
+        NativeResourceLoc::Table { .. } => false,
+        NativeResourceLoc::Pointer { sgpr } => ptr_slots.contains(&sgpr),
         _ => true,
     });
     let found = NativeShader {
         meta: meta.clone(),
         code: code.to_vec(),
     }
-    .discover_table_resources(&tables)
-    .map_err(|e| format!("tables de descripteurs (user-SGPR {tables:?}) : {e}"))?;
-    if meta.resources.len() + found.len() > MAX_RESOURCES {
+    .discover_tables(&declared, true)
+    .map_err(|e| format!("tables de descripteurs (user-SGPR du plan {declared:?}) : {e}"))?;
+    if meta.resources.len() + found.resources.len() > MAX_RESOURCES {
         return Err(format!(
             "{} entrées de table + {} autres ressources > {MAX_RESOURCES} (limite SBR2)",
-            found.len(),
+            found.resources.len(),
             meta.resources.len()
         ));
     }
-    meta.resources.extend(found);
-    Ok(())
+    let used_slots: Vec<u8> = found
+        .resources
+        .iter()
+        .filter_map(|r| match r.loc {
+            NativeResourceLoc::Table { table_sgpr, .. } => Some(table_sgpr),
+            _ => None,
+        })
+        .collect();
+    let inferred: Vec<u8> = found.tables[declared.len()..].to_vec();
+    let mut plan: Vec<(usize, u32)> = Vec::new();
+    if !inferred.is_empty() {
+        // paramètres table du plan réel non utilisés à leur emplacement
+        let free: Vec<usize> = l
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(i, (k, _))| {
+                *k == RootParamKind::Table
+                    && u8::try_from(l.first_sgpr[*i]).is_ok_and(|s| !used_slots.contains(&s))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if inferred.len() > free.len() {
+            return Err(format!(
+                "plan user-SGPR : le shader utilise {} table(s) de descripteurs aux user-SGPR {inferred:?} (hors plan de la signature racine, tables du plan : {declared:?}) mais la signature n'a que {} paramètre(s) table libre(s) ({} au total) : association impossible",
+                inferred.len(),
+                free.len(),
+                declared.len()
+            ));
+        }
+        for (k, &sgpr) in inferred.iter().enumerate() {
+            plan.push((free[k], u32::from(sgpr)));
+        }
+        // une paire déduite ne doit pas recouvrir des constantes racine (données lues par le
+        // shader) ni une autre paire du plan
+        for &(param, sgpr) in &plan {
+            for (i, &(kind, n)) in l.params.iter().enumerate() {
+                if i == param {
+                    continue;
+                }
+                let first = plan
+                    .iter()
+                    .find(|(p, _)| *p == i)
+                    .map_or(l.first_sgpr[i], |&(_, s)| s);
+                let width = if kind == RootParamKind::Constants {
+                    n.max(1)
+                } else {
+                    2
+                };
+                let overlaps = first < sgpr + 2 && sgpr < first + width;
+                if overlaps && (kind == RootParamKind::Constants || plan.iter().any(|p| p.0 == i)) {
+                    return Err(format!(
+                        "plan user-SGPR : la table déduite s[{sgpr}:{}] (paramètre racine #{param}) recouvre le paramètre racine #{i} ({kind:?}) aux user-SGPR [{first}..{})",
+                        sgpr + 1,
+                        first + width
+                    ));
+                }
+            }
+            if sgpr + 2 > USER_DWORDS as u32 {
+                return Err(format!(
+                    "plan user-SGPR : la table déduite s[{sgpr}:{}] dépasse les {USER_DWORDS} user-SGPR",
+                    sgpr + 1
+                ));
+            }
+            meta.num_user_sgprs = meta.num_user_sgprs.max(sgpr + 2);
+        }
+        let desc: Vec<String> = plan
+            .iter()
+            .map(|&(p, s)| {
+                format!(
+                    "paramètre racine #{p} (plan réel s{}) -> s[{s}:{}]",
+                    l.first_sgpr[p],
+                    s + 1
+                )
+            })
+            .collect();
+        sb_warn!(
+            CHANNEL,
+            "FSPX Compute : plan user-SGPR déduit de l'usage (le shader charge ses descripteurs depuis des paires hors plan de la signature racine, tables du plan {declared:?}) : {}",
+            desc.join(", ")
+        );
+    }
+    meta.resources.extend(found.resources);
+    Ok(plan)
 }
 
 /// Registres matériels compute AMD RDNA 2 extraits du bloc `kind0` FSPX (28 octets = 7 dwords) :
@@ -734,7 +860,7 @@ pub(crate) fn try_compile_fspx_compute(
             meta.sys_sgpr_flags = 0x7;
         }
         meta.resources = resources;
-        discover_root_tables(&mut meta, &code, layout.as_deref())?;
+        let user_plan = discover_root_tables(&mut meta, &code, layout.as_deref())?;
         let n_res = meta.resources.len();
         let n_words = code.len();
         let sbr2 = NativeShader {
@@ -748,7 +874,10 @@ pub(crate) fn try_compile_fspx_compute(
             .map_err(|e| format!("Vulkan/SPIR-V : {e}"))?;
         Ok((
             id,
-            Arc::new(NativePso { stages: vec![meta] }),
+            Arc::new(NativePso {
+                stages: vec![meta],
+                user_plan,
+            }),
             n_words,
             n_res,
         ))
@@ -852,6 +981,12 @@ pub(crate) fn gfx10_to_vk_format(fmt: u32) -> Option<vk::Format> {
         29 => vk::Format::R16G16_SFLOAT,
         22 => vk::Format::R32_SFLOAT,
         20 => vk::Format::R32_UINT,
+        21 => vk::Format::R32_SINT,
+        57 => vk::Format::R8G8B8A8_SNORM,
+        60 => vk::Format::R8G8B8A8_UINT,
+        61 => vk::Format::R8G8B8A8_SINT,
+        64 => vk::Format::R32G32_SFLOAT,
+        13 => vk::Format::R16_SFLOAT,
         _ => return None,
     })
 }
@@ -939,6 +1074,9 @@ pub(crate) struct ImageKey {
     addr: usize,
     width: u32,
     height: u32,
+    /// Couches (2D array) ou profondeur (3D) ; 1 pour une image 2D.
+    depth: u32,
+    dim: NativeImageDim,
     format: i32,
 }
 
@@ -966,6 +1104,20 @@ pub(crate) struct ResolvedStage {
     pub state: NativeStageState,
     /// Par ressource : `(adresse, octets d'origine)` pour les V#.
     pub buffers: Vec<Option<(usize, Vec<u8>)>>,
+    /// Par ressource : région mémoire des images T# (pour la recopie sortante des images de
+    /// stockage).
+    pub images: Vec<Option<ImageRegion>>,
+}
+
+/// Région mémoire d'une image T# résolue.
+#[derive(Debug, Clone)]
+pub(crate) struct ImageRegion {
+    /// Adresse de base de la ressource propriétaire (`need` octets lus à cette adresse).
+    pub base: usize,
+    /// Octets linéaires serrés téléversés (comparaison avant/après un dispatch).
+    pub before: Vec<u8>,
+    /// Ressource linéaire : la recopie sortante est possible (sinon aucun re-tiling connu).
+    pub linear: bool,
 }
 
 fn user_ptr(user: &[u32], sgpr: u8) -> u64 {
@@ -977,13 +1129,18 @@ fn user_ptr(user: &[u32], sgpr: u8) -> u64 {
 }
 
 /// Résout l'image d'un T# : adresse (mots matériels) -> ressource du bridge -> image Vulkan.
-fn resolve_image(ctx: &mut ResolveCtx<'_>, words: &[u32], handle: Option<usize>) -> NativeBinding {
+fn resolve_image(
+    ctx: &mut ResolveCtx<'_>,
+    words: &[u32],
+    handle: Option<usize>,
+) -> (NativeBinding, Option<ImageRegion>) {
+    let unbound = (NativeBinding::Unbound, None);
     let Ok(w8) = <[u32; 8]>::try_from(words) else {
-        return NativeBinding::Unbound;
+        return unbound;
     };
     let Some(img) = decode_image(&w8) else {
         sb_warn!(CHANNEL, "Rdna2Native : T# invalide, image de repli liée");
-        return NativeBinding::Unbound;
+        return unbound;
     };
     let Some(fmt) = gfx10_to_vk_format(img.format) else {
         sb_warn!(
@@ -991,21 +1148,41 @@ fn resolve_image(ctx: &mut ResolveCtx<'_>, words: &[u32], handle: Option<usize>)
             "Rdna2Native : format GFX10 {} non supporté pour un T#",
             img.format
         );
-        return NativeBinding::Unbound;
+        return unbound;
     };
-    if img.image_type != ImageType::Image2D || img.first_mip != 0 || img.layer_count != 1 {
+    // 2D, 2D array et 3D (mip 0, première couche 0) ; contenu supposé linéaire serré
+    // (couche/tranche après couche/tranche) ou détuilé par `detile_from_resource`.
+    let (dim, depth) = match img.image_type {
+        ImageType::Image2D if img.layer_count == 1 => (NativeImageDim::D2, 1),
+        ImageType::Image2DArray if img.layer_count >= 1 => {
+            (NativeImageDim::D2Array, img.layer_count)
+        }
+        ImageType::Image3D if img.depth >= 1 => (NativeImageDim::D3, img.depth),
+        _ => {
+            sb_warn!(
+                CHANNEL,
+                "Rdna2Native : T# {:?} ({} couche(s), profondeur {}) non supporté (2D, 2D array, 3D seulement)",
+                img.image_type,
+                img.layer_count,
+                img.depth
+            );
+            return unbound;
+        }
+    };
+    if img.first_mip != 0 || (dim == NativeImageDim::D2Array && img.first_layer != 0) {
         sb_warn!(
             CHANNEL,
-            "Rdna2Native : seuls les T# 2D (mip 0, 1 couche) sont supportés ({:?})",
-            img.image_type
+            "Rdna2Native : T# avec mip de base {} / couche de base {} non supporté (mip 0, couche 0)",
+            img.first_mip,
+            img.first_layer
         );
-        return NativeBinding::Unbound;
+        return unbound;
     }
     let Some(bpp) = native_format_texel_bytes(fmt) else {
-        return NativeBinding::Unbound;
+        return unbound;
     };
     let (w, h) = (img.width, img.height);
-    let need = (w as usize) * (h as usize) * bpp as usize;
+    let need = (w as usize) * (h as usize) * (depth as usize) * bpp as usize;
     let taddr = img.address as usize;
 
     // 1. Ressource via la table `descriptors` (handle -> SRV), recoupée avec l'adresse du T#.
@@ -1045,13 +1222,15 @@ fn resolve_image(ctx: &mut ResolveCtx<'_>, words: &[u32], handle: Option<usize>)
             CHANNEL,
             "Rdna2Native : T# à l'adresse {taddr:#x} ne correspond à aucune ressource du bridge"
         );
-        return NativeBinding::Unbound;
+        return unbound;
     };
     let mut data = None;
+    let mut linear = true;
     if let Some(rp) = res_ptr {
         // SAFETY: `rp` provient de la table `descriptors` (ressource valide, voir plus haut).
         let res = unsafe { &*(rp as *const D3D12ResourceObject) };
         if res.swizzle_mode.is_some() {
+            linear = false;
             data = detile_from_resource(res).filter(|d| d.len() >= need);
         }
     }
@@ -1060,15 +1239,17 @@ fn resolve_image(ctx: &mut ResolveCtx<'_>, words: &[u32], handle: Option<usize>)
         None => {
             sb_warn!(
                 CHANNEL,
-                "Rdna2Native : T# {w}x{h} dépasse la mémoire de la ressource ({need} octets)"
+                "Rdna2Native : T# {w}x{h}x{depth} dépasse la mémoire de la ressource ({need} octets)"
             );
-            return NativeBinding::Unbound;
+            return unbound;
         }
     };
     let key = ImageKey {
         addr: base,
         width: w,
         height: h,
+        depth,
+        dim,
         format: fmt.as_raw(),
     };
     let hash = fnv1a(&data);
@@ -1085,26 +1266,36 @@ fn resolve_image(ctx: &mut ResolveCtx<'_>, words: &[u32], handle: Option<usize>)
             }
             if let Err(e) = ctx.renderer.update_native_image(c.id, &data) {
                 sb_warn!(CHANNEL, "Rdna2Native : mise à jour d'image échouée : {e}");
-                return NativeBinding::Unbound;
+                return unbound;
             }
             cache.insert(key, CachedImage { id: c.id, hash });
             c.id
         }
-        None => match ctx.renderer.create_native_image(w, h, fmt, &data) {
+        None => match ctx
+            .renderer
+            .create_native_image_dim(w, h, depth, dim, fmt, &data)
+        {
             Ok(id) => {
                 cache.insert(key, CachedImage { id, hash });
                 id
             }
             Err(e) => {
                 sb_warn!(CHANNEL, "Rdna2Native : création d'image échouée : {e}");
-                return NativeBinding::Unbound;
+                return unbound;
             }
         },
     };
-    NativeBinding::Image {
-        image_id: id,
-        swizzle: swizzle_to_vk(img.swizzle),
-    }
+    (
+        NativeBinding::Image {
+            image_id: id,
+            swizzle: swizzle_to_vk(img.swizzle),
+        },
+        Some(ImageRegion {
+            base,
+            before: data,
+            linear,
+        }),
+    )
 }
 
 /// Copie les octets d'un tampon `[addr, addr + size)` borné à sa ressource propriétaire.
@@ -1141,6 +1332,7 @@ pub(crate) fn resolve_stage(
         bindings: Vec::with_capacity(meta.resources.len()),
     };
     let mut buffers = Vec::with_capacity(meta.resources.len());
+    let mut images: Vec<Option<ImageRegion>> = Vec::with_capacity(meta.resources.len());
     for res in &meta.resources {
         let dwords = res.kind.descriptor_dwords() as usize;
         // Pointeur racine : tampon désigné directement par son adresse.
@@ -1157,6 +1349,7 @@ pub(crate) fn resolve_stage(
             };
             state.bindings.push(b);
             buffers.push(region);
+            images.push(None);
             continue;
         }
         // Mots du descripteur : table (mémoire du tas) ou user-SGPR.
@@ -1189,6 +1382,7 @@ pub(crate) fn resolve_stage(
             );
             state.bindings.push(NativeBinding::Unbound);
             buffers.push(None);
+            images.push(None);
             continue;
         };
         match res.kind {
@@ -1212,10 +1406,13 @@ pub(crate) fn resolve_stage(
                 };
                 state.bindings.push(b);
                 buffers.push(region);
+                images.push(None);
             }
             NativeResourceKind::Image => {
-                state.bindings.push(resolve_image(ctx, &words, handle));
+                let (b, region) = resolve_image(ctx, &words, handle);
+                state.bindings.push(b);
                 buffers.push(None);
+                images.push(region);
             }
             NativeResourceKind::Sampler => {
                 let b = <[u32; 4]>::try_from(words.as_slice())
@@ -1223,10 +1420,15 @@ pub(crate) fn resolve_stage(
                     .unwrap_or(NativeBinding::Unbound);
                 state.bindings.push(b);
                 buffers.push(None);
+                images.push(None);
             }
         }
     }
-    ResolvedStage { state, buffers }
+    ResolvedStage {
+        state,
+        buffers,
+        images,
+    }
 }
 
 /// Construit la commande de dessin native depuis les états résolus.
@@ -1261,9 +1463,40 @@ pub(crate) fn run_dispatch(
         z: xyz.2,
         cs: cs.state,
     };
-    match renderer.dispatch_native(&cmd) {
+    match renderer.dispatch_native_ex(&cmd) {
         Ok(out) => {
-            for (orig, new) in cs.buffers.iter().zip(out) {
+            for (region, after) in cs.images.iter().zip(out.images) {
+                let (Some(region), Some(after)) = (region, after) else {
+                    continue;
+                };
+                if after == region.before {
+                    continue;
+                }
+                if !region.linear {
+                    sb_warn!(
+                        CHANNEL,
+                        "Rdna2Native : image de stockage modifiée par le dispatch mais ressource tuilée (aucun re-tiling connu) : le contenu reste côté GPU, la mémoire invitée n'est pas mise à jour"
+                    );
+                    continue;
+                }
+                let Some((base, total)) = owning_range(region.base) else {
+                    continue;
+                };
+                if after.len() != region.before.len() || region.base + after.len() > base + total {
+                    sb_warn!(
+                        CHANNEL,
+                        "Rdna2Native : recopie d'image de stockage hors de la ressource, ignorée"
+                    );
+                    continue;
+                }
+                // SAFETY: `region.base..+len` appartient à une ressource du bridge (vérifié
+                // ci-dessus avec `owning_range`) et a été lu avec succès pendant ce même
+                // `ExecuteCommandLists` ; `after.len() == before.len()`.
+                unsafe {
+                    ptr::copy_nonoverlapping(after.as_ptr(), region.base as *mut u8, after.len());
+                }
+            }
+            for (orig, new) in cs.buffers.iter().zip(out.buffers) {
                 if let (Some((addr, before)), Some(after)) = (orig, new)
                     && *before != after
                 {
@@ -1639,6 +1872,147 @@ mod tests {
         assert_eq!(read_res(in_res, 512), u32s(&input));
     }
 
+    /// `cs_store_2d` (llvm-mc gfx1030) : écrit `(x, y, 0.5, 1.0)` dans le texel `(x, y)` d'une
+    /// image 8x8 (T# en entrée 0 de la table s[0:1], groupe 8x8 = 64 threads).
+    const CS_STORE_2D: &[u32] = &[
+        0xf40c0200, 0xfa000000, 0xbf8cc07f, 0x36020087, 0x2c040083, 0x7e060202, 0x7e080d01,
+        0x7e0a0d02, 0x7e0c02f0, 0x7e0e02f2, 0xf0201f08, 0x00020401, 0xbf810000,
+    ];
+    const CS_STORE_3D: &[u32] = &[
+        0xf40c0200, 0xfa000000, 0xbf8cc07f, 0x36020087, 0x2c040083, 0x7e060202, 0x7e080d01,
+        0x7e0a0d02, 0x7e0c0d03, 0x7e0e02f2, 0xf0201f10, 0x00020401, 0xbf810000,
+    ];
+
+    fn storage_cs_bytes(code: &[u32]) -> Vec<u8> {
+        let mut meta = NativeShaderMeta::new(NativeStage::Compute, 32);
+        meta.local_size = [64, 1, 1];
+        meta.num_user_sgprs = 2;
+        meta.num_input_vgprs = 1;
+        meta.sys_sgpr_flags = 1;
+        meta.resources = vec![NativeResource {
+            kind: NativeResourceKind::Image,
+            loc: NativeResourceLoc::Table {
+                table_sgpr: 0,
+                byte_offset: 0,
+            },
+        }];
+        NativeShader {
+            meta,
+            code: code.to_vec(),
+        }
+        .to_bytes()
+    }
+
+    /// Dispatch d'un CS d'écriture d'image de stockage sur une texture `dimension` (3 = 2D,
+    /// 4 = 3D) `8x8xdepth` RGBA32F ; renvoie les octets de la ressource après recopie sortante.
+    fn run_storage_texture(
+        code: &[u32],
+        dimension: u32,
+        uav_dim: u32,
+        depth: u32,
+    ) -> Option<Vec<u8>> {
+        let dev = make_device()?;
+        let tex = make_resource(
+            dev,
+            D3D12ResourceDesc {
+                dimension,
+                width: 8,
+                height: 8,
+                depth_or_array_size: depth as u16,
+                mip_levels: 1,
+                format: 2,
+                sample_desc: DxgiSampleDesc {
+                    count: 1,
+                    quality: 0,
+                },
+                ..Default::default()
+            },
+        );
+        // la mémoire d'une texture committed est zéro-initialisée ; sa taille ne couvre que la
+        // première tranche (`compute_resource_byte_len` ignore la profondeur / les couches)
+        let heap = make_heap(2, 0);
+        let mut uav = u32s(&[2, uav_dim, 0, 0, depth]);
+        uav.resize(48, 0);
+        device_create_uav(dev, tex.cast(), ptr::null_mut(), uav.as_ptr().cast(), heap);
+        let cs = storage_cs_bytes(code);
+        let rs = make_root_sig(dev, &[(0, 0)]);
+        let desc = D3D12ComputePipelineStateDesc {
+            root_signature: rs,
+            cs: D3D12ShaderBytecode {
+                shader_bytecode: cs.as_ptr(),
+                bytecode_length: cs.len(),
+            },
+            node_mask: 0,
+            _pad0: 0,
+            cached_pso: D3D12CachedPipelineState {
+                cached_blob: ptr::null(),
+                cached_blob_size_in_bytes: 0,
+            },
+            flags: 0,
+            _pad1: 0,
+        };
+        let mut pso: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_compute_pso(dev, &desc, &IID_ID3D12PIPELINESTATE, &mut pso),
+            S_OK
+        );
+        let cl = make_cmdlist(dev);
+        let cl_obj = cl.cast::<D3D12CmdListObject>();
+        cmdlist_set_pipeline_state(cl_obj, pso.cast());
+        cmdlist_set_compute_root_sig(cl_obj, rs.cast());
+        cmdlist_set_compute_root_desc_table(cl_obj, 0, heap as u64);
+        cmdlist_dispatch(cl_obj, depth, 1, 1);
+        assert_eq!(cmdlist_close(cl_obj), S_OK);
+        let mut queue: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_queue(
+                dev,
+                &D3D12CommandQueueDesc::default(),
+                &IID_ID3D12COMMANDQUEUE,
+                &mut queue
+            ),
+            S_OK
+        );
+        queue_execute_command_lists(queue.cast(), 1, [cl_obj].as_ptr());
+        Some(read_res(tex, 8 * 8 * 16))
+    }
+
+    fn f32_of(b: &[u8], i: usize) -> f32 {
+        f32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+    }
+
+    #[test]
+    fn native_storage_image_through_com_writes_back_linear_2d_texture() {
+        let _serial = crate::d3d12_xs::test_serial();
+        let Some(out) = run_storage_texture(CS_STORE_2D, 3, 4, 1) else {
+            return;
+        };
+        for y in 0..8usize {
+            for x in 0..8usize {
+                let o = (y * 8 + x) * 4;
+                let got = [
+                    f32_of(&out, o),
+                    f32_of(&out, o + 1),
+                    f32_of(&out, o + 2),
+                    f32_of(&out, o + 3),
+                ];
+                assert_eq!(got, [x as f32, y as f32, 0.5, 1.0], "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn native_storage_image_through_com_refuses_3d_texture_truncated_by_bridge_sizing() {
+        // `compute_resource_byte_len` (d3d12_xs) ne compte que la première tranche d'une texture
+        // committed : un T# 3D 8x8x4 dépasse la ressource -> liaison non résolue, dispatch refusé
+        // proprement, mémoire invitée intacte (aucun débordement).
+        let _serial = crate::d3d12_xs::test_serial();
+        let Some(out) = run_storage_texture(CS_STORE_3D, 4, 8, 4) else {
+            return;
+        };
+        assert!(out.iter().all(|&b| b == 0));
+    }
+
     #[test]
     fn native_graphics_through_com_textured_triangle_reads_descriptor_words() {
         let _serial = crate::d3d12_xs::test_serial();
@@ -1947,7 +2321,175 @@ mod tests {
             e.contains("s_load_dwordx4") && e.contains("s_add_u32") && e.contains("s[8:9]"),
             "{e}"
         );
-        assert!(e.contains("user-SGPR [0]"), "{e}");
+        assert!(e.contains("user-SGPR du plan [0]"), "{e}");
+    }
+
+    /// `cs_infer_tables` de docs/rdna2.md (llvm-mc gfx1030) : tables aux user-SGPR s[4:5] (via
+    /// `s_mov_b64`) et s[6:7], absentes du plan réel de la signature racine.
+    const CS_INFER_TABLES: &[u32] = &[
+        0xbe8a0404, 0xf4100405, 0xfa000000, 0xf4080803, 0xfa000010, 0xbf8cc07f, 0x34020082,
+        0xe0301000, 0x80050201, 0xe0301000, 0x80070301, 0xbf8c3f70, 0x4a080702, 0xe0701000,
+        0x80080401, 0xbf810000,
+    ];
+
+    fn infer_meta() -> NativeShaderMeta {
+        let mut meta = NativeShaderMeta::new(NativeStage::Compute, 32);
+        meta.num_user_sgprs = 8;
+        meta.num_input_vgprs = 3;
+        meta.local_size = [64, 1, 1];
+        meta
+    }
+
+    #[test]
+    fn root_table_inference_maps_usage_order_to_table_params_and_remaps_user_data() {
+        let layout =
+            RootSigLayout::from_params(vec![(RootParamKind::Table, 0), (RootParamKind::Table, 0)])
+                .expect("layout");
+        assert_eq!(layout.table_sgprs(), vec![0, 2]);
+        let mut meta = infer_meta();
+        let plan = discover_root_tables(&mut meta, CS_INFER_TABLES, Some(&layout)).expect("plan");
+        // ordre d'usage : s4 puis s6 <-> paramètres table #0 puis #1
+        assert_eq!(plan, vec![(0, 4), (1, 6)]);
+        let again = {
+            let mut m = infer_meta();
+            discover_root_tables(&mut m, CS_INFER_TABLES, Some(&layout)).expect("plan")
+        };
+        assert_eq!(plan, again, "déterministe");
+        let offs: Vec<(u8, u32)> = meta
+            .resources
+            .iter()
+            .map(|r| match r.loc {
+                NativeResourceLoc::Table {
+                    table_sgpr,
+                    byte_offset,
+                } => (table_sgpr, byte_offset),
+                other => panic!("loc inattendue {other:?}"),
+            })
+            .collect();
+        assert_eq!(offs, vec![(4, 0x10), (4, 0x30), (6, 0x10)]);
+        // les adresses de table arrivent aux user-SGPR utilisés par le shader
+        let mut b = RootBinding::default();
+        b.set_signature(Some(Arc::new(layout)));
+        b.plan_override = plan;
+        b.set_table(0, 0x1_0000_1000);
+        b.set_table(1, 0x2_0000_2000);
+        let u = b.user_data();
+        assert_eq!(&u[..8], &[0, 0, 0, 0, 0x1000, 1, 0x2000, 2]);
+        // la traduction finale (ressources explicites) réussit
+        NativeShader {
+            meta,
+            code: CS_INFER_TABLES.to_vec(),
+        }
+        .translate()
+        .expect("traduction");
+    }
+
+    /// `err_ptr_used_as_table` (table aux user-SGPR s[2:3], `s_load_dwordx16` puis `image_load`).
+    const CS_PTR_AS_TABLE: &[u32] = &[
+        0xf4100201, 0xfa000000, 0xbf8cc07f, 0xf0001f08, 0x00020400, 0xbf8c3f70, 0xbf810000,
+    ];
+    /// `cs_reuse_regs` (table s[4:5] ; s[12:15] = S# puis V# à des offsets disjoints).
+    const CS_REUSE_REGS: &[u32] = &[
+        0xf40c0402, 0xfa000000, 0xf4080302, 0xfa000020, 0xbf8cc07f, 0xf09c0f08, 0x00640400,
+        0xf4080302, 0xfa000030, 0xbf8cc07f, 0xf4240606, 0xfa000000, 0xbf8c0070, 0x7e100218,
+        0xe0701000, 0x80030800, 0xbf810000,
+    ];
+
+    /// Avant (heuristique historique `infer_compute_resources`, plan réel de la signature) /
+    /// après (`discover_root_tables`) sur les motifs des journaux : cas 1 (x16 depuis une paire
+    /// hors plan), cas 2 (cascade `image_load` après un `s_load` classé pointeur), cas 3 (SGPR
+    /// réutilisés avec deux natures).
+    #[test]
+    fn log_patterns_old_heuristic_fails_discovery_succeeds() {
+        let layout =
+            RootSigLayout::from_params(vec![(RootParamKind::Table, 0), (RootParamKind::Table, 0)])
+                .expect("layout");
+        let before = |code: &[u32]| -> String {
+            let insts = decode_stream(code, WaveSize::W32).expect("décodage");
+            let (_, resources) = infer_compute_resources(&insts, Some(&layout));
+            let mut meta = infer_meta();
+            meta.resources = resources;
+            // déclare les tables du plan comme le faisait l'ancienne glue
+            match (NativeShader {
+                meta,
+                code: code.to_vec(),
+            })
+            .translate()
+            {
+                Ok(_) => "OK".into(),
+                Err(e) => e.to_string(),
+            }
+        };
+        let after = |code: &[u32]| -> Result<Vec<(usize, u32)>, String> {
+            let mut meta = infer_meta();
+            let insts = decode_stream(code, WaveSize::W32).expect("décodage");
+            meta.resources = infer_compute_resources(&insts, Some(&layout)).1;
+            let plan = discover_root_tables(&mut meta, code, Some(&layout))?;
+            NativeShader {
+                meta,
+                code: code.to_vec(),
+            }
+            .translate()
+            .map_err(|e| e.to_string())?;
+            Ok(plan)
+        };
+        // cas 1
+        let b = before(CS_INFER_TABLES);
+        assert!(b != "OK" && b.contains("s_load_dwordx16"), "avant : {b}");
+        assert_eq!(after(CS_INFER_TABLES).expect("après"), vec![(0, 4), (1, 6)]);
+        // cas 2 (cascade)
+        let b = before(CS_PTR_AS_TABLE);
+        assert!(b != "OK" && b.contains("image_load"), "avant : {b}");
+        assert_eq!(after(CS_PTR_AS_TABLE).expect("après"), Vec::new());
+        // cas 3
+        let b = before(CS_REUSE_REGS);
+        assert!(b != "OK", "avant : {b}");
+        assert_eq!(after(CS_REUSE_REGS).expect("après"), vec![(0, 4)]);
+        eprintln!("avant cas 1 : {}", before(CS_INFER_TABLES));
+        eprintln!("avant cas 2 : {}", before(CS_PTR_AS_TABLE));
+        eprintln!("avant cas 3 : {}", before(CS_REUSE_REGS));
+    }
+
+    #[test]
+    fn root_table_inference_fails_when_more_tables_than_table_params() {
+        let layout = RootSigLayout::from_params(vec![(RootParamKind::Table, 0)]).expect("1 table");
+        let mut meta = infer_meta();
+        let e = discover_root_tables(&mut meta, CS_INFER_TABLES, Some(&layout))
+            .expect_err("2 tables utilisées, 1 paramètre");
+        assert!(
+            e.contains("2 table(s)") && e.contains("1 paramètre(s) table libre(s)"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn root_table_inference_refuses_pairs_overlapping_root_constants() {
+        let layout = RootSigLayout::from_params(vec![
+            (RootParamKind::Table, 0),
+            (RootParamKind::Table, 0),
+            (RootParamKind::Constants, 4),
+        ])
+        .expect("layout");
+        // constantes racine aux user-SGPR 4..8 : recouvrent s[4:5] et s[6:7]
+        let mut meta = infer_meta();
+        let e = discover_root_tables(&mut meta, CS_INFER_TABLES, Some(&layout))
+            .expect_err("recouvrement");
+        assert!(e.contains("recouvre") && e.contains("Constants"), "{e}");
+    }
+
+    #[test]
+    fn root_table_plan_in_use_is_kept_as_is() {
+        // shader qui utilise la table du plan réel s[0:1] : aucun plan déduit
+        let code: Vec<u32> = vec![
+            0xf4080200, 0xfa000000, 0xbf8cc07f, 0xe0301000, 0x80020100, 0xbf810000,
+        ];
+        let layout =
+            RootSigLayout::from_params(vec![(RootParamKind::Table, 0), (RootParamKind::Table, 0)])
+                .expect("layout");
+        let mut meta = infer_meta();
+        let plan = discover_root_tables(&mut meta, &code, Some(&layout)).expect("découverte");
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(meta.resources.len(), 1);
     }
 
     #[test]

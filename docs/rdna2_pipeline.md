@@ -55,6 +55,21 @@ tire la liste des entrées `(table, offset)` réellement utilisées (V#, T#, S#,
 `base + indice`, comme avant) et remplace les ressources `Table`/`Pointer` heuristiques de ces SGPR.
 Les paramètres CBV/SRV/UAV racine restent des `Pointer` (données). Sans signature racine connue,
 l'ancienne inférence par motifs `s_load` est conservée (aucune information n'est inventée).
+**Plan user-SGPR déduit de l'usage.** `pack_user_sgprs` fournit le plan *réel* (`first_sgpr`) ; les
+tables du plan sont déclarées d'abord. Si le shader charge ses descripteurs depuis une autre paire de
+user-SGPR (hors CBV/SRV/UAV du plan), cette paire est une table **inférée par l'usage**
+(`TranslateConfig::infer_tables`). La glue l'associe, dans l'ordre de première utilisation, aux
+paramètres **table** de la signature que le shader n'utilise pas à leur emplacement du plan
+(usage ↔ ordre des paramètres table), journalise `FSPX Compute : plan user-SGPR déduit de l'usage
+… paramètre racine #0 (plan réel s0) -> s[4:5]` (`sb_warn`) et mémorise le plan `(paramètre, user-SGPR)`
+dans `NativePso::user_plan` ; `NativeListState::note_pso` l'installe dans `RootBinding::plan_override`
+(`user_data()` y place alors le pointeur de table, sans toucher `d3d12_xs.rs`). Rien n'est inventé :
+plus de tables utilisées que de paramètres table libres → `plan user-SGPR : le shader utilise N
+table(s) … mais la signature n'a que M paramètre(s) table libre(s)` ; paire déduite qui recouvre des
+constantes racine → erreur nommant les deux paramètres. L'ordre est déterministe (ordre du programme).
+Les pointeurs hérités de l'heuristique pour des bases hors CBV/SRV/UAV du plan sont supprimés (ils
+provoquaient les confusions de natures et la cascade `image_load` après `s_load_dwordx16`).
+
 Échecs : le message du traducteur est renvoyé tel quel avec la liste des user-SGPR de table
 (`tables de descripteurs (user-SGPR [0, 4]) : s_load_dwordx4 depuis s[8:9] (…)`) ; au-delà de 32
 entrées, `n entrées de table + m autres ressources > 32`. Une table dont les mots sont lus comme
@@ -70,6 +85,15 @@ sont lues.** Les mots sont la source de vérité (format, dimensions, adresse) :
 * **V#** (`decode_buffer`) → copie des octets `[adresse, adresse + num_records·max(stride,1))` bornés à la
   ressource propriétaire → SSBO à la liaison de la ressource (copie entrante ; après un *dispatch*, les tampons
   modifiés sont recopiés en mémoire). Un pointeur racine désigne le reste de la ressource (≤ 16 Mio).
+* **Images de stockage** : un T# lié par `image_store`/`image_load`/`image_atomic_*` (liaison
+  `storage_image`) devient une image `STORAGE` (si le format le permet) en layout `GENERAL` pendant le
+  dispatch : transition `SHADER_READ_ONLY -> GENERAL`, dispatch, barrière, copie image → tampon hôte,
+  retour en `SHADER_READ_ONLY_OPTIMAL`. `VulkanRenderer::dispatch_native_ex` renvoie les texels
+  linéaires serrés (`NativeDispatchOutput::images`) ; le bridge les recopie en mémoire invitée si la
+  ressource est **linéaire** (aucun re-tiling connu : pour une ressource tuilée, l'image reste côté GPU
+  et un avertissement est journalisé). Formats : GFX10 56/57/60/61 (RGBA8 UNORM/SNORM/UINT/SINT), 130
+  (SRGB, échantillonnage seul), 71, 77, 29, 22, 21, 20, 64, 13 ; dimensions 2D, 2D array
+  (`create_native_image_dim`, `NativeImageDim`) et 3D, mip 0, couche de base 0.
 * **T#** (`decode_image`) : adresse (>>8) + format GFX10 + dimensions → ressource du bridge. Résolution : (1) la
   table `descriptors` (handle → SRV) donne la ressource, recoupée avec l'adresse du T# ; (2) sinon plage dont
   la base tronquée à 256 octets ou le contenu inclut l'adresse (ambiguïté signalée). Puis table
@@ -85,14 +109,21 @@ Un descripteur illisible ou non supporté lie une ressource de repli (zéros / t
 
 `VulkanRenderer::create_native_graphics_pipeline` / `create_native_compute_pipeline` : layout de set dérivé
 des liaisons **réellement utilisées** par les modules (user data = binding 0 ; ressources `1..=32` VS/CS,
-`33..=64` PS ; V# → `STORAGE_BUFFER`, T# → `SAMPLED_IMAGE`, S# → `SAMPLER`). Pas d'attributs de sommet (le VS
+`33..=64` PS ; V# → `STORAGE_BUFFER`, T# → `SAMPLED_IMAGE` (ou `STORAGE_IMAGE` si le programme écrit/atomise l'image), S# →
+`SAMPLER`). Pas d'attributs de sommet (le VS
 lit ses sommets par V#). Les ressources voyagent dans `RenderCommand::NativeDraw` / `dispatch_native`. Un CS
 qui modifie EXEC impose la taille de sous-groupe (`subgroupSizeControl`) ou est refusé.
 
 ## 5. Limites
 
-* T# : 2D, mip 0, 1 couche ; formats GFX10 56/130 (RGBA8), 71, 77, 29, 22, 20 seulement (le layout console
-  explicite des textures n'est pas documenté : rien n'est deviné). Images de stockage et UAV graphiques : non.
+* T# : 2D, 2D array, 3D (mip 0, couche de base 0) ; formats GFX10 56/57/60/61/130 (RGBA8), 71, 77, 29, 22,
+  21, 20, 64, 13 seulement (le layout console explicite des textures n'est pas documenté : rien n'est
+  deviné). Images de stockage : **compute seulement** (une image de stockage dans un étage graphique est
+  refusée à la création du pipeline : la transition `GENERAL` est impossible dans une passe de rendu) ;
+  recopie sortante pour les ressources linéaires seulement. Le dimensionnement des textures committed du
+  bridge (`compute_resource_byte_len`, `d3d12_xs.rs`, hors périmètre) ignore la profondeur / les couches :
+  un T# 2D array ou 3D qui dépasse la ressource est refusé (`dépasse la mémoire de la ressource`) ; les
+  tests GPU du renderer couvrent 2D array et 3D, le harnais PE32+ la 2D.
 * Pas de `DrawIndexedInstanced` avec un pipeline natif ; pas de MRT ; état raster/blend/depth du PSO D3D12.
 * Copie entrante/sortante (pas de zéro-copie) ; recopie sortante pour les *dispatch* seulement.
 * Lecture des descripteurs à l'exécution de la liste (pas à l'enregistrement).

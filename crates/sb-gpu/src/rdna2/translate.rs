@@ -110,6 +110,24 @@ pub struct TranslateConfig {
     /// entrée (table, offset) utilisée comme V#/T#/S# reçoit automatiquement la liaison
     /// `(set, binding_base + offset / 16)` (voir [`ProgramInfo::table_bindings`]).
     pub tables: Vec<DescriptorTable>,
+    /// Inférence des tables par l'usage : toute paire de user-SGPR (index < nombre de SGPR
+    /// `SgprInit::UserData`, non modifiée) utilisée comme base (directe ou via copies/constantes)
+    /// d'un `s_load_*`/`s_buffer_load_*` et qui n'est ni un pointeur ni une table ni une
+    /// ressource déclarés devient une table, dans l'ordre de première utilisation (voir
+    /// [`ProgramInfo::inferred_tables`]).
+    pub infer_tables: Option<InferTables>,
+}
+
+/// Paramètres d'attribution des liaisons des tables inférées par l'usage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InferTables {
+    pub set: u32,
+    /// Liaison de base de la première table inférée ; la table `k` reçoit
+    /// `first_binding_base + k * binding_span`.
+    pub first_binding_base: u32,
+    /// Nombre de liaisons réservées par table (offsets jusqu'à `16 * binding_span` octets).
+    pub binding_span: u32,
+    pub buffer_stride: u32,
 }
 
 /// Table de descripteurs pointée par une paire de SGPR de user data.
@@ -138,6 +156,7 @@ impl TranslateConfig {
             lds_dwords: 0,
             buffer_sizes: Vec::new(),
             tables: Vec::new(),
+            infer_tables: None,
         }
     }
 }
@@ -198,6 +217,9 @@ pub struct ProgramInfo {
     /// Entrées de tables de descripteurs utilisées, avec la liaison attribuée (une par
     /// (table, offset)), dans l'ordre de première utilisation.
     pub table_bindings: Vec<TableBindingUse>,
+    /// Tables inférées par l'usage (`TranslateConfig::infer_tables`), dans l'ordre de première
+    /// utilisation.
+    pub inferred_tables: Vec<DescriptorTable>,
 }
 
 /// Entrée de table de descripteurs utilisée par le programme.
@@ -232,6 +254,16 @@ impl DescKind {
             DescKind::Sampler => "S#",
         }
     }
+}
+
+/// Plage d'octets d'une table liée à une nature de descripteur.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TableRange {
+    pub table: u8,
+    pub lo: i64,
+    pub hi: i64,
+    pub kind: DescKind,
+    pub inst: &'static str,
 }
 
 /// Résultat : module SPIR-V + informations.
@@ -281,6 +313,13 @@ pub(crate) struct Tr<'a> {
     pub storage_images: BTreeMap<(u32, u32), u32>,
     /// Origine de chaque SGPR chargé depuis une table déclarée : `(table_sgpr, offset en octets)`.
     pub desc_words: BTreeMap<u8, (u8, i64)>,
+    /// Tables inférées par l'usage (voir `TranslateConfig::infer_tables`).
+    pub auto_tables: Vec<DescriptorTable>,
+    /// SGPR remplis par un `s_load_*` depuis un pointeur de buffer déclaré : `sgpr -> (instruction,
+    /// premier SGPR du pointeur)` (messages d'erreur : ce ne sont pas des mots de table).
+    pub ptr_loaded: BTreeMap<u8, (&'static str, u8)>,
+    /// Plages d'octets de table déjà liées : `(table, début, fin, nature, instruction)`.
+    pub table_ranges: Vec<TableRange>,
     /// Dernière instruction qui a écrit chaque SGPR (messages d'erreur).
     pub last_writer: BTreeMap<u8, &'static str>,
     pub cur_name: &'static str,
@@ -321,6 +360,9 @@ impl<'a> Tr<'a> {
             sgpr_alias: BTreeMap::new(),
             storage_images: BTreeMap::new(),
             desc_words: BTreeMap::new(),
+            auto_tables: Vec::new(),
+            ptr_loaded: BTreeMap::new(),
+            table_ranges: Vec::new(),
             last_writer: BTreeMap::new(),
             cur_name: "",
             interface: Vec::new(),
@@ -756,6 +798,7 @@ impl<'a> Tr<'a> {
             if let Ok(k8) = u8::try_from(k) {
                 self.sgpr_alias.remove(&k8);
                 self.desc_words.remove(&k8);
+                self.ptr_loaded.remove(&k8);
                 self.last_writer.insert(k8, self.cur_name);
             }
         }
@@ -1274,6 +1317,7 @@ pub fn translate_program(code: &[u32], cfg: &TranslateConfig) -> TResult<Transla
     tr.info.ps_attrs = tr.attrs.keys().copied().collect();
     tr.info.mrts = tr.mrts.keys().copied().collect();
     tr.info.writes_depth = tr.depth.is_some();
+    tr.info.inferred_tables = tr.auto_tables.clone();
     let used = tr.info.bindings.clone();
     for tb in &mut tr.info.table_bindings {
         if let Some(b) = used

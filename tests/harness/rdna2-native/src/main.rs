@@ -6,7 +6,9 @@
 //!    lit deux V# (tas), un biais par CBV racine et une échelle par constante racine ;
 //! 3. **graphique** : un VS + PS RDNA 2 dessinent un triangle plein écran texturé (V# des sommets,
 //!    T# + S# lus dans les tas, teinte par constantes racine) ;
-//! 4. relit le résultat (tampon de lecture / UAV) et vérifie les valeurs et les pixels.
+//! 4. **image de stockage** : deux programmes compute écrivent (`image_store`) puis relisent et
+//!    modifient (`image_load` + `image_store`) une texture 2D RGBA32F 8x8 par un UAV (T#) ;
+//! 5. relit le résultat (tampon de lecture / UAV) et vérifie les valeurs et les pixels.
 //!
 //! Les octets de code ont été assemblés avec `llvm-mc -triple=amdgcn -mcpu=gfx1030
 //! -mattr=+wavefrontsize32` et sont figés dans ce fichier. Le format `SBR2` v1 est décrit dans
@@ -365,6 +367,31 @@ mod win_impl {
         0xbf8cc07f, 0x4a000007, 0x34020082, 0xe0301000, 0x80020201, 0xbf8c3f70, 0x7e060d02,
         0xd54b0003, 0x00180903, 0xe0701000, 0x80030301, 0xbf810000,
     ];
+
+    /// `cs_store_2d` : `image_store (x, y, 0.5, 1.0)` dans le texel `(x, y)` (T# : table s[0:1] + 0).
+    const CS_STORE_2D: [u32; 13] = [
+        0xf40c0200, 0xfa000000, 0xbf8cc07f, 0x36020087, 0x2c040083, 0x7e060202, 0x7e080d01,
+        0x7e0a0d02, 0x7e0c02f0, 0x7e0e02f2, 0xf0201f08, 0x00020401, 0xbf810000,
+    ];
+    /// `cs_storage_rw_2d` : `image_load` puis `image_store (r + 1, g + 2, b, a)`.
+    const CS_RW_2D: [u32; 14] = [
+        0xf40c0200, 0xfa000000, 0xbf8cc07f, 0x36020087, 0x2c040083, 0x7e060202, 0xf0001f08,
+        0x00020401, 0xbf8c3f70, 0x060808f2, 0x060a0af4, 0xf0201f08, 0x00020401, 0xbf810000,
+    ];
+
+    fn storage_blob(code: &[u32]) -> Vec<u8> {
+        sbr2(
+            &Meta {
+                stage: 2,
+                local: [64, 1, 1],
+                user_sgprs: 2,
+                input_vgprs: 1,
+                sys_flags: 1,
+                res: &[(1, 0, 0, 0, 0)], // T# image de stockage : table s[0:1] + 0
+            },
+            code,
+        )
+    }
 
     fn vs_blob() -> Vec<u8> {
         sbr2(
@@ -760,6 +787,146 @@ mod win_impl {
         }
     }
 
+    // ==================== Test image de stockage ====================
+
+    unsafe fn run_cs(ctx: &Ctx, code: &[u32], tex_table: u64) -> bool {
+        // SAFETY: vtables COM du bridge.
+        unsafe {
+            let rs = ctx.root_sig(&[(0, 0)]);
+            let cs = storage_blob(code);
+            let desc = D3D12ComputePipelineStateDesc {
+                root_signature: rs,
+                cs: D3D12ShaderBytecode {
+                    shader_bytecode: cs.as_ptr(),
+                    bytecode_length: cs.len(),
+                },
+                node_mask: 0,
+                _pad0: 0,
+                cached_pso: D3D12CachedPipelineState {
+                    cached_blob: ptr::null(),
+                    cached_blob_size_in_bytes: 0,
+                },
+                flags: 0,
+                _pad1: 0,
+            };
+            let create_pso: extern "win64" fn(
+                *mut c_void,
+                *const D3D12ComputePipelineStateDesc,
+                *const Guid,
+                *mut *mut c_void,
+            ) -> i32 = vtbl_fn(ctx.dev, 11);
+            let mut pso: *mut c_void = ptr::null_mut();
+            let hr = create_pso(ctx.dev, &desc, &DUMMY_IID, &mut pso);
+            if hr != 0 {
+                println!(
+                    "[rdna2_native] ECHEC CreateComputePipelineState (image de stockage) hr={hr:#x}"
+                );
+                return false;
+            }
+            let cl = ctx.cmd_list();
+            let set_pso: extern "win64" fn(*mut c_void, *mut c_void) = vtbl_fn(cl, 25);
+            let set_rs: extern "win64" fn(*mut c_void, *mut c_void) = vtbl_fn(cl, 29);
+            let set_table: extern "win64" fn(*mut c_void, u32, u64) = vtbl_fn(cl, 31);
+            let dispatch: extern "win64" fn(*mut c_void, u32, u32, u32) = vtbl_fn(cl, 14);
+            set_pso(cl, pso);
+            set_rs(cl, rs);
+            set_table(cl, 0, tex_table);
+            dispatch(cl, 1, 1, 1);
+            ctx.execute_and_wait(cl);
+            true
+        }
+    }
+
+    unsafe fn test_storage_image(ctx: &Ctx) -> bool {
+        // SAFETY: vtables COM du bridge.
+        unsafe {
+            // Texture 2D RGBA32F 8x8 (dimension 3, DXGI_FORMAT_R32G32B32A32_FLOAT = 2).
+            let tex = ctx.resource(&D3D12ResourceDesc {
+                dimension: 3,
+                width: 8,
+                height: 8,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: 2,
+                sample_desc: DxgiSampleDesc {
+                    count: 1,
+                    quality: 0,
+                },
+                ..Default::default()
+            });
+            write_resource(tex, &vec![0u8; 8 * 8 * 16]);
+            let (cpu, gpu) = ctx.heap(0, 2);
+            // D3D12_UNORDERED_ACCESS_VIEW_DESC : format, dim = TEXTURE2D (4), MipSlice, PlaneSlice.
+            let mut d = u32s(&[2, 4, 0, 0]);
+            d.resize(48, 0);
+            let create_uav: extern "win64" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *const u8,
+                usize,
+            ) = vtbl_fn(ctx.dev, 19);
+            create_uav(ctx.dev, tex, ptr::null_mut(), d.as_ptr(), cpu);
+
+            if !run_cs(ctx, &CS_STORE_2D, gpu) {
+                return false;
+            }
+            let rd = |out: &[u8], i: usize| {
+                f32::from_le_bytes([out[4 * i], out[4 * i + 1], out[4 * i + 2], out[4 * i + 3]])
+            };
+            let out = read_resource(tex, 8 * 8 * 16);
+            let mut bad = 0;
+            for y in 0..8usize {
+                for x in 0..8usize {
+                    let o = (y * 8 + x) * 4;
+                    let got = [
+                        rd(&out, o),
+                        rd(&out, o + 1),
+                        rd(&out, o + 2),
+                        rd(&out, o + 3),
+                    ];
+                    if got != [x as f32, y as f32, 0.5, 1.0] {
+                        if bad < 4 {
+                            println!("[rdna2_native] image_store ({x},{y}) = {got:?}");
+                        }
+                        bad += 1;
+                    }
+                }
+            }
+            if bad != 0 {
+                println!("[rdna2_native] ECHEC image_store : {bad}/64 texels faux");
+                return false;
+            }
+            println!(
+                "[rdna2_native] Image de stockage : 64 texels écrits par image_store, relus en mémoire"
+            );
+
+            if !run_cs(ctx, &CS_RW_2D, gpu) {
+                return false;
+            }
+            let out = read_resource(tex, 8 * 8 * 16);
+            for y in 0..8usize {
+                for x in 0..8usize {
+                    let o = (y * 8 + x) * 4;
+                    let got = [
+                        rd(&out, o),
+                        rd(&out, o + 1),
+                        rd(&out, o + 2),
+                        rd(&out, o + 3),
+                    ];
+                    if got != [x as f32 + 1.0, y as f32 + 2.0, 0.5, 1.0] {
+                        println!("[rdna2_native] ECHEC image_load/store ({x},{y}) = {got:?}");
+                        return false;
+                    }
+                }
+            }
+            println!(
+                "[rdna2_native] Image de stockage : image_load + image_store (r+1, g+2) vérifiés"
+            );
+            true
+        }
+    }
+
     // ==================== Test graphique ====================
 
     unsafe fn test_graphics(ctx: &Ctx, backbuffer: *mut c_void) -> bool {
@@ -1054,12 +1221,15 @@ mod win_impl {
 
             let ctx = Ctx { dev, queue };
             let compute_ok = test_compute(&ctx);
+            let storage_ok = test_storage_image(&ctx);
             let gfx_ok = test_graphics(&ctx, bb);
-            if compute_ok && gfx_ok {
+            if compute_ok && storage_ok && gfx_ok {
                 println!("[rdna2_native] === PROGRAMMES GPU RDNA 2 NATIFS (VS+PS+CS) VÉRIFIÉS ===");
                 0
             } else {
-                println!("[rdna2_native] === ECHEC (compute={compute_ok}, graphique={gfx_ok}) ===");
+                println!(
+                    "[rdna2_native] === ECHEC (compute={compute_ok}, image de stockage={storage_ok}, graphique={gfx_ok}) ==="
+                );
                 1
             }
         }

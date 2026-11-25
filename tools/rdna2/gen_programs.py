@@ -81,6 +81,238 @@ PROGRAMS = [
         buffer_store_short v2, v3, s[4:7], 0 offen offset:256
         s_endpgm
     """),
+    ("cs_table_x16", 32, """
+        s_load_dwordx16 s[8:23], s[0:1], 0x0
+        s_add_u32 s24, s0, 0x40
+        s_addc_u32 s25, s1, 0
+        s_load_dwordx16 s[32:47], s[24:25], 0x10
+        s_load_dwordx4 s[48:51], s[24:25], 0x40
+        s_waitcnt lgkmcnt(0)
+        v_lshlrev_b32 v1, 2, v0
+        buffer_load_dword v2, v1, s[12:15], 0 offen
+        buffer_load_dword v3, v1, s[16:19], 0 offen
+        buffer_load_dword v4, v1, s[20:23], 0 offen
+        buffer_load_dword v5, v1, s[32:35], 0 offen
+        buffer_load_dword v6, v1, s[36:39], 0 offen
+        buffer_load_dword v7, v1, s[40:43], 0 offen
+        buffer_load_dword v8, v1, s[44:47], 0 offen
+        buffer_load_dword v9, v1, s[48:51], 0 offen
+        s_waitcnt vmcnt(0)
+        v_mad_u32_u24 v10, v3, 10, v2
+        v_mad_u32_u24 v10, v4, 100, v10
+        v_mad_u32_u24 v10, v5, 1000, v10
+        v_mad_u32_u24 v10, v6, 10000, v10
+        v_mad_u32_u24 v10, v7, 100000, v10
+        v_mad_u32_u24 v10, v8, 1000000, v10
+        v_add_nc_u32 v10, v9, v10
+        buffer_store_dword v10, v1, s[8:11], 0 offen
+        s_endpgm
+    """),
+    ("ps_table_views", 32, """
+        s_load_dwordx4 s[16:19], s[0:1], 0x0
+        s_load_dwordx16 s[20:35], s[0:1], 0x10
+        s_add_u32 s40, s0, 0x50
+        s_addc_u32 s41, s1, 0
+        s_load_dwordx16 s[44:59], s[40:41], 0x0
+        s_mov_b64 s[60:61], s[40:41]
+        s_load_dwordx4 s[64:67], s[60:61], 0x40
+        s_waitcnt lgkmcnt(0)
+        v_interp_p1_f32 v2, v0, attr0.x
+        v_interp_p1_f32 v3, v0, attr0.y
+        v_interp_p1_f32 v4, v0, attr0.z
+        image_sample v[8:11], v[2:3], s[20:27], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+        image_sample v[12:15], v[2:4], s[28:35], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY
+        image_sample v[24:27], v[2:4], s[44:51], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_3D
+        image_sample v[28:31], v[2:4], s[52:59], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_CUBE
+        buffer_load_format_xyzw v[32:35], v0, s[64:67], 0 idxen
+        s_waitcnt vmcnt(0)
+        v_add_f32 v8, v8, v12
+        v_add_f32 v8, v8, v24
+        v_add_f32 v8, v8, v28
+        v_add_f32 v8, v8, v32
+        exp mrt0 v8, v9, v10, v11 done vm
+        s_endpgm
+    """),
+    ("err_dynamic_base", 32, """
+        s_add_u32 s8, s0, s2
+        s_addc_u32 s9, s1, 0
+        s_load_dwordx4 s[16:19], s[8:9], 0x0
+        s_waitcnt lgkmcnt(0)
+        buffer_load_dword v1, v0, s[16:19], 0 offen
+        s_endpgm
+    """),
+    ("err_dynamic_soffset", 32, """
+        s_load_dwordx4 s[16:19], s[0:1], s2
+        s_waitcnt lgkmcnt(0)
+        buffer_load_dword v1, v0, s[16:19], 0 offen
+        s_endpgm
+    """),
+    ("err_not_loaded", 32, """
+        buffer_load_dword v1, v0, s[16:19], 0 offen
+        s_endpgm
+    """),
+    ("err_split_descriptor", 32, """
+        s_load_dwordx2 s[16:17], s[0:1], 0x0
+        s_load_dwordx2 s[18:19], s[0:1], 0x20
+        s_waitcnt lgkmcnt(0)
+        buffer_load_dword v1, v0, s[16:19], 0 offen
+        s_endpgm
+    """),
+    ("cs_infer_tables", 32, """
+        s_mov_b64 s[10:11], s[4:5]
+        s_load_dwordx16 s[16:31], s[10:11], 0x0
+        s_load_dwordx4 s[32:35], s[6:7], 0x10
+        s_waitcnt lgkmcnt(0)
+        v_lshlrev_b32 v1, 2, v0
+        buffer_load_dword v2, v1, s[20:23], 0 offen
+        buffer_load_dword v3, v1, s[28:31], 0 offen
+        s_waitcnt vmcnt(0)
+        v_add_nc_u32 v4, v2, v3
+        buffer_store_dword v4, v1, s[32:35], 0 offen
+        s_endpgm
+    """),
+    ("err_ptr_used_as_table", 32, """
+        s_load_dwordx16 s[8:23], s[2:3], 0x0
+        s_waitcnt lgkmcnt(0)
+        image_load v[4:7], v[0:1], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+        s_waitcnt vmcnt(0)
+        s_endpgm
+    """),
+    ("err_range_overlap", 32, """
+        s_load_dwordx8 s[8:15], s[4:5], 0x0
+        s_load_dwordx4 s[16:19], s[4:5], 0x10
+        s_waitcnt lgkmcnt(0)
+        image_load v[4:7], v[0:1], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+        buffer_load_dword v2, v0, s[16:19], 0 offen
+        s_endpgm
+    """),
+    ("cs_reuse_regs", 32, """
+        s_load_dwordx8 s[16:23], s[4:5], 0x0
+        s_load_dwordx4 s[12:15], s[4:5], 0x20
+        s_waitcnt lgkmcnt(0)
+        image_sample_lz v[4:7], v[0:1], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D
+        s_load_dwordx4 s[12:15], s[4:5], 0x30
+        s_waitcnt lgkmcnt(0)
+        s_buffer_load_dwordx2 s[24:25], s[12:15], 0x0
+        s_waitcnt lgkmcnt(0) vmcnt(0)
+        v_mov_b32 v8, s24
+        buffer_store_dword v8, v0, s[12:15], 0 offen
+        s_endpgm
+    """),
+    ("cs_store_2d", 32, """
+        s_load_dwordx8 s[8:15], s[0:1], 0x0
+        s_waitcnt lgkmcnt(0)
+        v_and_b32 v1, 7, v0
+        v_lshrrev_b32 v2, 3, v0
+        v_mov_b32 v3, s2
+        v_cvt_f32_u32 v4, v1
+        v_cvt_f32_u32 v5, v2
+        v_mov_b32 v6, 0.5
+        v_mov_b32 v7, 1.0
+        image_store v[4:7], v[1:2], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+        s_endpgm
+    """),
+    ("cs_store_2darray", 32, """
+        s_load_dwordx8 s[8:15], s[0:1], 0x0
+        s_waitcnt lgkmcnt(0)
+        v_and_b32 v1, 7, v0
+        v_lshrrev_b32 v2, 3, v0
+        v_mov_b32 v3, s2
+        v_cvt_f32_u32 v4, v1
+        v_cvt_f32_u32 v5, v2
+        v_cvt_f32_u32 v6, v3
+        v_mov_b32 v7, 1.0
+        image_store v[4:7], v[1:3], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY unorm
+        s_endpgm
+    """),
+    ("cs_store_3d", 32, """
+        s_load_dwordx8 s[8:15], s[0:1], 0x0
+        s_waitcnt lgkmcnt(0)
+        v_and_b32 v1, 7, v0
+        v_lshrrev_b32 v2, 3, v0
+        v_mov_b32 v3, s2
+        v_cvt_f32_u32 v4, v1
+        v_cvt_f32_u32 v5, v2
+        v_cvt_f32_u32 v6, v3
+        v_mov_b32 v7, 1.0
+        image_store v[4:7], v[1:3], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_3D unorm
+        s_endpgm
+    """),
+    ("cs_store_u32_2d", 32, """
+        s_load_dwordx8 s[8:15], s[0:1], 0x0
+        s_waitcnt lgkmcnt(0)
+        v_and_b32 v1, 7, v0
+        v_lshrrev_b32 v2, 3, v0
+        v_mov_b32 v3, s2
+        v_lshl_add_u32 v4, v2, 3, v1
+        v_mov_b32 v5, v4
+        v_mov_b32 v6, v4
+        v_mov_b32 v7, v4
+        image_store v[4:7], v[1:2], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+        s_endpgm
+    """),
+    ("cs_storage_rw_2d", 32, """
+        s_load_dwordx8 s[8:15], s[0:1], 0x0
+        s_waitcnt lgkmcnt(0)
+        v_and_b32 v1, 7, v0
+        v_lshrrev_b32 v2, 3, v0
+        v_mov_b32 v3, s2
+        image_load v[4:7], v[1:2], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+        s_waitcnt vmcnt(0)
+        v_add_f32 v4, 1.0, v4
+        v_add_f32 v5, 2.0, v5
+        image_store v[4:7], v[1:2], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+        s_endpgm
+    """),
+    ("cs_storage_atomic_2d", 32, """
+        s_load_dwordx8 s[8:15], s[0:1], 0x0
+        s_waitcnt lgkmcnt(0)
+        v_and_b32 v1, 7, v0
+        v_lshrrev_b32 v2, 3, v0
+        v_mov_b32 v3, s2
+        v_mov_b32 v4, 1
+        v_mov_b32 v1, 0
+        v_mov_b32 v2, 0
+        image_atomic_add v4, v[1:2], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
+        s_endpgm
+    """),
+    ("cs_table_images", 32, """
+        s_load_dwordx16 s[8:23], s[0:1], 0x0
+        s_add_u32 s24, s0, 0x40
+        s_addc_u32 s25, s1, 0
+        s_load_dwordx8 s[32:39], s[24:25], 0x0
+        s_load_dwordx16 s[40:55], s[24:25], 0x20
+        s_waitcnt lgkmcnt(0)
+        v_lshlrev_b32 v1, 2, v0
+        v_and_b32 v2, 3, v0
+        v_lshrrev_b32 v3, 2, v0
+        v_and_b32 v3, 3, v3
+        v_cvt_f32_u32 v10, v2
+        v_add_f32 v10, 0.5, v10
+        v_mul_f32 v10, 0.25, v10
+        v_cvt_f32_u32 v11, v3
+        v_add_f32 v11, 0.5, v11
+        v_mul_f32 v11, 0.25, v11
+        v_and_b32 v12, 1, v0
+        v_lshrrev_b32 v13, 1, v0
+        v_and_b32 v13, 1, v13
+        image_sample_lz v[4:7], v[10:11], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D
+        image_sample_lz v[24:27], v[10:11], s[32:39], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D
+        v_cvt_f32_u32 v40, v12
+        v_cvt_f32_u32 v41, v13
+        v_mov_b32 v42, 0
+        v_mov_b32 v43, 1.0
+        image_store v[40:43], v[12:13], s[48:55] dmask:0xf dim:SQ_RSRC_IMG_2D unorm
+        v_mov_b32 v44, 1
+        v_mov_b32 v45, 0
+        v_mov_b32 v46, 0
+        image_atomic_add v44, v[45:46], s[40:47] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc
+        s_waitcnt vmcnt(0)
+        buffer_store_dword v4, v1, s[8:11], 0 offen
+        buffer_store_dword v25, v1, s[8:11], 0 offen offset:256
+        buffer_store_dword v44, v1, s[8:11], 0 offen offset:512
+        s_endpgm
+    """),
     ("vs_uv_passthrough", 32, """
         s_load_dwordx4 s[4:7], s[0:1], 0x0
         s_waitcnt lgkmcnt(0)

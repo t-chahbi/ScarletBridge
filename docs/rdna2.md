@@ -106,6 +106,7 @@ seule : toute évolution incompatible de ce writer par le chantier DXIL casserai
   `s_load_*` depuis une table pointée par une paire de SGPR) ou `Pointer(n)` (pointeur vers les
   données d'un buffer, cible de `s_load_*`).
   **Les descripteurs ne sont jamais interprétés** : le traducteur ne lit pas les mots du V#/T#/S#.
+* `tables` / `infer_tables` : tables de descripteurs (voir « Tables de descripteurs » ci-dessous).
 * `lds_dwords` pour `ds_*`.
 
 Entrées/sorties : VS `exp posN` → `Position` (pos1..3 ignorés), `exp paramN` → `Location N` ;
@@ -160,7 +161,12 @@ configuré → `TranslateError::Unresolved` ; jamais de devinette silencieuse.
 * Chaque entrée utilisée reçoit la liaison **`(set, binding_base + offset / 16)`** ; l'offset doit
   être un multiple de 16. Les entrées sont listées dans `ProgramInfo::table_bindings`
   (`table_sgpr, byte_offset, kind, set, binding`) : un même `(table, offset)` = une seule liaison
-  (rechargé deux fois → même liaison) ; une même entrée utilisée avec deux natures est refusée.
+  (rechargé deux fois → même liaison). Les entrées sont indexées par **(offset, nature)** et par
+  **plage d'octets** (T# = 32 octets, V#/S# = 16) : deux natures/tailles différentes dont les plages se
+  recouvrent sont refusées avec un message qui nomme les deux plages et l'instruction qui a lié la
+  première (`V# [0x10..0x20) de la table s[4:5] chevauche T# [0x0..0x20) déjà utilisé par image_load`) ;
+  des plages disjointes ne se confondent jamais (un S# à `0x20` puis un V# à `0x30` chargés dans les
+  mêmes SGPR à des instants différents donnent deux entrées, `desc_words` suit le dernier chargement).
   2D, 2D array, 3D, cube (T#), V# (buffers) et S# peuvent cohabiter dans une même table ; le type
   d'image vient de la dimension de l'instruction.
 * Les `Resource` explicites (`Sgprs`/`Table`/`Pointer`) restent prioritaires. Un V# de table suppose
@@ -172,6 +178,18 @@ configuré → `TranslateError::Unresolved` ; jamais de devinette silencieuse.
   charge que des descripteurs (ses mots lus valent 0 en tant que données).
 * Hôte : `NativeShader::discover_table_resources(&[table_sgpr])` traduit et retourne les
   `NativeResource::Table` utilisées (pour construire un conteneur SBR2).
+* **Inférence des tables par l'usage** (`TranslateConfig::infer_tables = Some(InferTables { set,
+  first_binding_base, binding_span, buffer_stride })`) : toute paire de user-SGPR (`SgprInit::UserData`,
+  jamais écrite avant l'usage, ou élargie 32→64 bits par `s_mov_b32` + constante) utilisée comme base
+  (directe ou via les copies/additions constantes ci-dessus) d'un `s_load_*` et qui n'est ni un
+  pointeur, ni une table, ni une `Resource` déclarés devient une table, **dans l'ordre de première
+  utilisation** (déterministe), avec `binding_base = first_binding_base + k * binding_span` unique.
+  `ProgramInfo::inferred_tables` les liste. Hôte : `NativeShader::discover_tables(&declared, true)`
+  renvoie `TableDiscovery { resources, tables }` (déclarées d'abord, puis inférées).
+* **Pas de cascade d'erreurs** : un `s_load_*` depuis un pointeur de buffer déclaré dont les mots sont
+  ensuite utilisés comme descripteur ne produit qu'une seule erreur, qui nomme la cause initiale
+  (`s[8:15] contiennent des données chargées par s_load_dwordx16 depuis le pointeur de buffer déclaré
+  s[2:3] (ce n'est pas une table de descripteurs)`).
 
 ### Prérequis Vulkan des nouvelles fonctions
 
@@ -240,6 +258,12 @@ configuré → `TranslateError::Unresolved` ; jamais de devinette silencieuse.
   * tables de descripteurs : `s_load_dwordx16` à offsets constants (dont base `s_add_u32 + s_addc_u32`
     et réutilisation d'une entrée), 8 V# distincts ; deux textures + sampler + images de stockage
     (`image_store`, `image_atomic_add`) issues de la même table, une liaison par entrée.
+* **Tranche 4** : `cs_infer_tables`, `cs_reuse_regs`, `err_range_overlap`, `err_ptr_used_as_table`
+  (inférence par l'usage, réutilisation de SGPR avec natures différentes, chevauchement, absence de
+  cascade) : tests de traduction + `spirv-val` ; `cs_store_{2d,2darray,3d,u32_2d}`,
+  `cs_storage_rw_2d`, `cs_storage_atomic_2d` (images de stockage) : `spirv-val` + exécution GPU via le
+  renderer natif (`renderer::native::tests`, RGBA8 / RGBA16F / RGBA32F / R32F / R32UI / R32I / RG16F ;
+  2D, 2D array, 3D ; `image_load`/`image_store`/`image_atomic_add` ; persistance entre dispatch).
 * `ps_table_views` (PS : S#, T# 2D / 2D array / 3D / cube et V# dans une table) : `spirv-val`.
 * `ps_mimg_ext` (PS : `_b _c _cl _d_cl _o _c_l`, gather `_c_o`, `get_lod`, a16, tfe, d16, 3D, cube,
   1D array, MSAA load) n'est validé que par `spirv-val` (pas rendu sur GPU).

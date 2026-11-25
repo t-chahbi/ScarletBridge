@@ -27,8 +27,8 @@ use crate::vulkan::{GpuContext, GpuError};
 
 mod native;
 pub use native::{
-    NativeBinding, NativeDispatchCmd, NativeDrawCmd, NativeImage, NativeSamplerDesc,
-    NativeStageState, native_format_texel_bytes,
+    NativeBinding, NativeDispatchCmd, NativeDispatchOutput, NativeDrawCmd, NativeImage,
+    NativeImageDim, NativeSamplerDesc, NativeStageState, native_format_texel_bytes,
 };
 use native::{NativePipelines, NativeTemp};
 

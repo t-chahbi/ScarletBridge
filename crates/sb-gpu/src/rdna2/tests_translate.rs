@@ -44,6 +44,34 @@ fn cs_cfg(p: &super::test_programs::Program) -> TranslateConfig {
     c
 }
 
+/// Compute à 8 user-SGPR (s0..s7), `WorkgroupId` en s8, tables inférées par l'usage ;
+/// `ptr` = pointeur de buffer déclaré (paire de SGPR).
+fn infer_cfg(p: &super::test_programs::Program, ptr: Option<u8>) -> TranslateConfig {
+    let mut c = TranslateConfig::new(Stage::Compute, wave_of(p));
+    c.local_size = [64, 1, 1];
+    c.user_data_binding = Some((0, 500));
+    c.sgprs = (0..8u8)
+        .map(|k| (k, SgprInit::UserData(u32::from(k))))
+        .collect();
+    c.sgprs.push((8, SgprInit::WorkgroupId(0)));
+    c.vgprs = vec![(0, VgprInit::LocalInvocationId(0))];
+    if let Some(sgpr) = ptr {
+        c.resources = vec![Resource {
+            kind: ResourceKind::Buffer { stride: 4 },
+            loc: ResourceLoc::Pointer(sgpr),
+            set: 0,
+            binding: 1,
+        }];
+    }
+    c.infer_tables = Some(InferTables {
+        set: 0,
+        first_binding_base: 1000,
+        binding_span: 4096,
+        buffer_stride: 4,
+    });
+    c
+}
+
 fn config_for(p: &super::test_programs::Program) -> TranslateConfig {
     match p.name {
         "vs_passthrough" | "vs_uv_passthrough" => {
@@ -88,6 +116,26 @@ fn config_for(p: &super::test_programs::Program) -> TranslateConfig {
                 r(ResourceKind::Image, 5, 0x70),
                 r(ResourceKind::Image, 6, 0x90),
             ];
+            c
+        }
+        "cs_infer_tables" | "cs_reuse_regs" | "err_range_overlap" => infer_cfg(p, None),
+        "err_ptr_used_as_table" => infer_cfg(p, Some(2)),
+        "cs_store_2d"
+        | "cs_store_2darray"
+        | "cs_store_3d"
+        | "cs_store_u32_2d"
+        | "cs_storage_rw_2d"
+        | "cs_storage_atomic_2d" => {
+            let mut c = cs_cfg(p);
+            c.resources = vec![Resource {
+                kind: ResourceKind::Image,
+                loc: ResourceLoc::Table {
+                    table_sgpr: 0,
+                    byte_offset: 0,
+                },
+                set: 0,
+                binding: 1,
+            }];
             c
         }
         "cs_table_x16"
@@ -841,4 +889,124 @@ fn unresolved_resources_explain_why() {
     );
     let e = tr_err("err_split_descriptor");
     assert!(e.contains("contigus") && e.contains("s[0:1]"), "{e}");
+}
+
+#[test]
+fn tables_are_inferred_by_usage_in_first_use_order() {
+    let t = translate("cs_infer_tables");
+    let tabs: Vec<(u8, u32)> = t
+        .info
+        .inferred_tables
+        .iter()
+        .map(|d| (d.sgpr, d.binding_base))
+        .collect();
+    assert_eq!(tabs, vec![(4, 1000), (6, 1000 + 4096)]);
+    let mut got: Vec<(u8, u32, &str)> = t
+        .info
+        .table_bindings
+        .iter()
+        .map(|b| (b.table_sgpr, b.byte_offset, b.kind))
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![
+            (4, 0x10, "storage_buffer"),
+            (4, 0x30, "storage_buffer"),
+            (6, 0x10, "storage_buffer"),
+        ]
+    );
+    // déterminisme : deux traductions donnent la même découverte
+    let u = translate("cs_infer_tables");
+    assert_eq!(t.info.inferred_tables, u.info.inferred_tables);
+    assert_eq!(t.info.table_bindings, u.info.table_bindings);
+}
+
+#[test]
+fn inference_is_off_without_config_and_never_touches_declared_pointers() {
+    let p = program("cs_infer_tables");
+    let mut c = infer_cfg(p, None);
+    c.infer_tables = None;
+    let e = translate_program(p.words, &c).expect_err("sans inférence");
+    assert!(e.to_string().contains("ni pointeur"), "{e}");
+    // s[4:5] déclaré pointeur : jamais table
+    let mut c = infer_cfg(p, Some(4));
+    c.resources.push(Resource {
+        kind: ResourceKind::Buffer { stride: 4 },
+        loc: ResourceLoc::Pointer(6),
+        set: 0,
+        binding: 2,
+    });
+    let e = translate_program(p.words, &c);
+    assert!(
+        e.is_err() || e.as_ref().is_ok_and(|t| t.info.inferred_tables.is_empty()),
+        "pointeurs déclarés intacts"
+    );
+}
+
+#[test]
+fn mixed_type_overlap_names_both_instructions_and_ranges() {
+    let p = program("err_range_overlap");
+    let e = translate_program(p.words, &config_for(p))
+        .expect_err("T# [0,0x20) et V# [0x10,0x20)")
+        .to_string();
+    assert!(
+        e.contains("V#") && e.contains("T#") && e.contains("0x10..0x20") && e.contains("0x0..0x20"),
+        "{e}"
+    );
+    assert!(
+        e.contains("buffer_load_dword") && e.contains("image_load"),
+        "{e}"
+    );
+}
+
+#[test]
+fn register_reuse_with_different_entry_types_is_not_confused() {
+    // s[12:15] : S# (0x20) puis V# (0x30) — plages disjointes, deux entrées distinctes.
+    let t = translate("cs_reuse_regs");
+    let mut got = tb(&t);
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![
+            (0x00, "sampled_image", 1000),
+            (0x20, "sampler", 1002),
+            (0x30, "storage_buffer", 1003),
+        ]
+    );
+}
+
+#[test]
+fn failed_pointer_load_reports_only_the_initial_cause() {
+    let p = program("err_ptr_used_as_table");
+    let e = translate_program(p.words, &config_for(p))
+        .expect_err("x16 depuis un pointeur de buffer utilisé comme T#")
+        .to_string();
+    assert!(
+        e.contains("pointeur de buffer déclaré s[2:3]") && e.contains("s_load_dwordx16"),
+        "{e}"
+    );
+    assert!(!e.contains("écrit en dernier"), "{e}");
+}
+
+#[test]
+fn storage_image_programs_translate_and_validate() {
+    for name in [
+        "cs_store_2d",
+        "cs_store_2darray",
+        "cs_store_3d",
+        "cs_store_u32_2d",
+        "cs_storage_rw_2d",
+        "cs_storage_atomic_2d",
+    ] {
+        let t = translate(name);
+        assert!(
+            t.info
+                .bindings
+                .iter()
+                .any(|b| b.kind == "storage_image" && b.binding == 1),
+            "{name} : liaison storage_image attendue : {:?}",
+            t.info.bindings
+        );
+    }
 }
