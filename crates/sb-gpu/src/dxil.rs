@@ -12,6 +12,7 @@ use crate::shader::ShaderStage;
 
 mod bitcode;
 mod cfg;
+mod container;
 mod dxmeta;
 mod iface;
 mod module;
@@ -292,42 +293,17 @@ fn scan_llvm_bitstream(stream: &[u8]) -> Result<BitstreamStats, DxilError> {
     Ok(stats)
 }
 
-/// Retourne le payload du chunk `DXIL` (ou `ILDB`, variante avec debug info) d'un conteneur.
+/// Payload du chunk `DXIL` (ou `ILDB`) d'un conteneur, lecture tolérante.
+#[cfg(test)]
 fn dxil_chunk(dxbc: &[u8]) -> Option<&[u8]> {
-    if dxbc.len() < 32 || &dxbc[0..4] != b"DXBC" {
-        return None;
-    }
-    let chunk_count = u32::from_le_bytes([dxbc[28], dxbc[29], dxbc[30], dxbc[31]]) as usize;
-    if chunk_count > dxbc.len() / 4 || 32 + chunk_count * 4 > dxbc.len() {
-        return None;
-    }
-    let mut found = None;
-    for i in 0..chunk_count {
-        let p = 32 + i * 4;
-        let off = u32::from_le_bytes([dxbc[p], dxbc[p + 1], dxbc[p + 2], dxbc[p + 3]]) as usize;
-        if off.checked_add(8).is_none_or(|e| e > dxbc.len()) {
-            continue;
-        }
-        let fourcc = &dxbc[off..off + 4];
-        let size = u32::from_le_bytes([dxbc[off + 4], dxbc[off + 5], dxbc[off + 6], dxbc[off + 7]])
-            as usize;
-        let Some(end) = (off + 8).checked_add(size).filter(|&e| e <= dxbc.len()) else {
-            continue;
-        };
-        if fourcc == b"DXIL" {
-            return Some(&dxbc[off + 8..end]);
-        }
-        if fourcc == b"ILDB" && found.is_none() {
-            found = Some(&dxbc[off + 8..end]);
-        }
-    }
-    found
+    container::dxil_chunk(dxbc)
 }
 
-/// Vrai si `bytes` est un conteneur `DXBC` portant un chunk `DXIL`/`ILDB` (shader SM6.x) et non
-/// un bytecode `SHDR`/`SHEX` (SM4/SM5).
+/// Vrai si `bytes` doit être traité par le traducteur DXIL : conteneur `DXBC` portant un chunk
+/// `DXIL`/`ILDB` (et non un bytecode `SHDR`/`SHEX` SM4/SM5), `DxilProgramHeader` nu ou bitcode
+/// brut (sniffing par magic).
 pub fn is_dxil_container(bytes: &[u8]) -> bool {
-    dxil_chunk(bytes).is_some()
+    container::sniff_is_dxil(bytes)
 }
 
 /// Construit un conteneur `DXBC` contenant un chunk `DXIL` SM 6.0 valide (pour tests unitaires).

@@ -63,38 +63,17 @@ pub(super) fn run(
     container: &[u8],
     hint: ShaderStage,
 ) -> Result<TranslatedShader, ShaderTranslateError> {
-    let Some(payload) = super::dxil_chunk(container) else {
-        return Err(if container.len() < 32 || &container[0..4] != b"DXBC" {
-            ShaderTranslateError::InvalidContainer
-        } else {
-            ShaderTranslateError::MissingBytecode
-        });
-    };
-    if payload.len() < 24 {
-        return Err(ShaderTranslateError::InvalidDxil(
-            "DxilProgramHeader tronqué".into(),
-        ));
+    let loc = super::container::locate(container)?;
+    for n in &loc.notes {
+        sb_common::sb_warn!("dxil", "{n} ({})", loc.diag);
     }
-    let rd =
-        |o: usize| u32::from_le_bytes([payload[o], payload[o + 1], payload[o + 2], payload[o + 3]]);
-    if rd(8) != u32::from_le_bytes(*b"DXIL") {
-        return Err(ShaderTranslateError::InvalidDxil(
-            "magic DXIL absent".into(),
-        ));
-    }
-    let off = rd(16) as usize;
-    let size = rd(20) as usize;
-    let start = 8usize.saturating_add(off);
-    let end = start.saturating_add(size);
-    if end > payload.len() || size < 8 {
-        return Err(ShaderTranslateError::InvalidDxil(
-            "bitcode hors du chunk".into(),
-        ));
-    }
-    let bitcode = &payload[start..end];
-    let blocks = parse_bitcode(bitcode)?;
-    let module = parse_module(&blocks)?;
-    let info: EntryInfo = parse_entry(&module)?;
+    let bitcode = loc.bitcode;
+    let blocks = parse_bitcode(bitcode)
+        .map_err(|e| ShaderTranslateError::InvalidDxil(format!("{e} ({})", loc.diag)))?;
+    let module = parse_module(&blocks)
+        .map_err(|e| ShaderTranslateError::InvalidDxil(format!("{e} ({})", loc.diag)))?;
+    let info: EntryInfo = parse_entry(&module)
+        .map_err(|e| ShaderTranslateError::InvalidDxil(format!("{e} ({})", loc.diag)))?;
     let stage = stage_of_kind(info.kind);
     if matches!(
         hint,
