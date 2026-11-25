@@ -118,3 +118,19 @@ ScarletBridge/
 3. **Zéro unwind across FFI** : toute fonction `extern "win64"` est enveloppée dans `sb_common::ffi_guard!`.
 4. **Isolation `unsafe`** : blocs `unsafe` documentés par `// SAFETY: ...`, structures ABI annotées `#[repr(C)]` et validées par `size_of!`/`offset_of!`.
 5. **Isolation VFS & Offline** : `/home` jamais exposé, path traversal et symlinks sortants bloqués, `SB_OFFLINE_MODE=1` par défaut.
+
+---
+
+## 7. D3D12 console (`d3d12_xs`) — descripteurs matériels et tuilage
+
+**Branché** (`crates/sb-hle/src/d3d12_views.rs`, glue dans `d3d12_xs.rs`) :
+- Les handles CPU de descripteurs sont de vraies adresses (chaque tas reçoit sa mémoire, ou adopte celle fournie par le titre). `CreateConstantBufferView`, `CreateShaderResourceView`, `CreateUnorderedAccessView`, `CreateRenderTargetView`, `CreateDepthStencilView` et `CreateSampler` écrivent, **en plus** de la table interne `descriptors`, les mots GFX10 dans la case de 32 octets du handle : V# (CBV, vues de tampon : structuré / brut / typé), T# (textures 1D/2D/3D/Cube/tableaux/MSAA, mapping de composants appliqué), S# (`sampler_from_d3d12`). Moitié haute des V#/S# mise à zéro.
+- Les écritures n'ont lieu que dans les plages des tas de descripteurs créés par le bridge (`DESC_HEAP_RANGES`) : une adresse hors tas n'est jamais touchée. `CopyDescriptors` / `CopyDescriptorsSimple` copient ces octets (tests : égalité des mots + cohérence avec la table).
+- Tuilage (`gfx10_tiling`) : `detile_subresource` / `tile_subresource` (par `DXGI_FORMAT`, BC1..BC7 en blocs) et `detile_surface` / `tile_surface` (taille d'élément 1/2/4/8/16). Champ `D3D12ResourceObject::swizzle_mode: Option<TileMode>` (None par défaut) ; `CopyTextureRegion` (sous-ressource 0 entière, sans offset ni boîte) tuile l'upload dans la mémoire de la ressource (le GPU reçoit toujours l'image linéaire) et détuile le readback vers l'empreinte placée d'un tampon ; `CopyBufferRegion` entre tampon linéaire et texture marquée travaille sur l'image linéaire détuilée.
+
+**Non branché / limites** :
+- Aucun chemin de création ne pose `swizzle_mode` : le layout console explicite (`TextureLayout`) n'est pas documenté, donc toutes les ressources restent linéaires (comportement historique). `mark_resource_tiled` existe pour le jour où il est connu.
+- Tuilage : sous-ressource 0 / mip 0 seule (pas de mip tail, tableaux, XOR de tuile, ni 3D) ; une allocation plus petite que la surface tuilée retombe sur la copie linéaire.
+- RTV/DSV : on écrit le T# de la sous-ressource, pas les registres matériels `CB_COLORn` / `DB_Z_INFO`. T# : adresse = base de la ressource (`>> 8`, tronquée à 256 octets, pas de décalage de sous-ressource ni de plan) ; compteur UAV, `PlaneSlice`, vues de BVH ignorés.
+- Dispositions de descripteurs de vues = `d3d12.h` public ; les variantes console éventuelles ne sont pas devinées (descripteur illisible ou dimension inconnue : rien n'est écrit).
+- Les mots écrits ne sont pas encore lus par le chemin de rendu (les liaisons GPU utilisent toujours la table interne). `gfx10_descriptors` / `frame_pacer` / `root_signature` : seuls les descripteurs et le tuilage sont branchés ici.

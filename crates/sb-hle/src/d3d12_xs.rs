@@ -1806,6 +1806,10 @@ struct D3D12ResourceObject {
     fixed_addr: usize,
     /// Identifiant de texture GPU Vulkan (`usize::MAX` si pas encore téléversée).
     gpu_texture_id: std::sync::atomic::AtomicUsize,
+    /// Layout console tuilé de l'allocation (placée dans la mémoire XMem) : `None` tant que le
+    /// layout n'est pas connu explicitement (comportement linéaire historique). Voir
+    /// `mark_resource_tiled`.
+    swizzle_mode: Option<crate::gfx10_tiling::TileMode>,
 }
 
 extern "win64" fn res_qi(
@@ -2038,6 +2042,7 @@ fn alloc_d3d12_resource(desc: D3D12ResourceDesc, is_backbuffer: bool) -> *mut D3
         byte_len,
         fixed_addr,
         gpu_texture_id: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        swizzle_mode: None,
     });
     Box::into_raw(obj)
 }
@@ -2071,6 +2076,7 @@ fn alloc_placed_d3d12_resource(
         byte_len,
         fixed_addr,
         gpu_texture_id: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        swizzle_mode: None,
     });
     Ok(Box::into_raw(obj))
 }
@@ -2472,14 +2478,133 @@ extern "win64" fn cmdlist_dispatch(
     });
 }
 
+/// Marque une ressource comme tuilée (`swizzle_mode`) : à n'appeler que lorsque le layout console
+/// de l'allocation est connu explicitement. Sans marquage (`None`), les copies restent linéaires.
+///
+/// # Safety
+/// `res` doit désigner un `D3D12ResourceObject` valide, sans autre accès concurrent (à utiliser
+/// juste après la création de la ressource).
+#[allow(dead_code)]
+unsafe fn mark_resource_tiled(res: *mut D3D12ResourceObject, mode: crate::gfx10_tiling::TileMode) {
+    // SAFETY: garanti par l'appelant (voir ci-dessus).
+    unsafe { (*res).swizzle_mode = Some(mode) };
+}
+
+/// Paramètres de tuilage `(mode, largeur, hauteur, format)` de la sous-ressource 0 d'une texture
+/// marquée tuilée.
+fn tile_params(
+    res: &D3D12ResourceObject,
+) -> Option<(crate::gfx10_tiling::TileMode, u32, u32, u32)> {
+    let mode = res.swizzle_mode?;
+    if !(2..=3).contains(&res.desc.dimension) {
+        return None;
+    }
+    let fmt = if res.desc.format != 0 {
+        res.desc.format
+    } else {
+        28
+    };
+    Some((
+        mode,
+        res.desc.width.min(u64::from(u32::MAX)).max(1) as u32,
+        res.desc.height.max(1),
+        fmt,
+    ))
+}
+
+/// Tuile `linear` (image serrée) dans la mémoire de la ressource. `false` si l'allocation est trop
+/// petite pour la surface tuilée (l'appelant retombe alors sur le comportement linéaire).
+fn tile_into_resource(res: &D3D12ResourceObject, linear: &[u8]) -> bool {
+    let Some((mode, w, h, fmt)) = tile_params(res) else {
+        return false;
+    };
+    let Some(tiled) = crate::d3d12_views::tile_subresource(mode, w, h, fmt, linear) else {
+        return false;
+    };
+    let mut buf = res.backing.lock();
+    let end = res.heap_offset + tiled.len();
+    if end > buf.len() {
+        sb_warn!(
+            CHANNEL,
+            "ressource tuilée trop petite ({} octets pour {} tuilés) : copie linéaire",
+            buf.len().saturating_sub(res.heap_offset),
+            tiled.len()
+        );
+        return false;
+    }
+    buf[res.heap_offset..end].copy_from_slice(&tiled);
+    true
+}
+
+/// Détuile la sous-ressource 0 d'une ressource marquée tuilée en image linéaire serrée.
+fn detile_from_resource(res: &D3D12ResourceObject) -> Option<Vec<u8>> {
+    let (mode, w, h, fmt) = tile_params(res)?;
+    let (surf, _) = crate::d3d12_views::tiled_surface_for(mode, w, h, fmt)?;
+    let buf = res.backing.lock();
+    let tiled = buf.get(res.heap_offset..res.heap_offset + surf.tiled_size())?;
+    crate::d3d12_views::detile_subresource(mode, w, h, fmt, tiled)
+}
+
+/// `CopyBufferRegion` entre un tampon linéaire et une texture marquée tuilée : la région
+/// `[offset, offset + len)` s'exprime dans l'image linéaire (détuilée) de la sous-ressource 0.
+/// Renvoie `true` si la copie a été traitée ici ; `false` laisse la copie brute historique.
+fn copy_buffer_region_tiled(
+    dst: &D3D12ResourceObject,
+    d_off: usize,
+    src: &D3D12ResourceObject,
+    s_off: usize,
+    num_bytes: usize,
+) -> bool {
+    let (src_tiled, dst_tiled) = (tile_params(src).is_some(), tile_params(dst).is_some());
+    if src_tiled == dst_tiled {
+        return false; // aucune ou les deux tuilées : copie brute
+    }
+    if src_tiled && dst.desc.dimension == 1 {
+        let Some(linear) = detile_from_resource(src) else {
+            return false;
+        };
+        let n = num_bytes
+            .min(linear.len().saturating_sub(s_off))
+            .min(dst.byte_len.saturating_sub(d_off));
+        let mut out = dst.backing.lock();
+        let start = dst.heap_offset + d_off;
+        if n == 0 || start + n > out.len() {
+            return n == 0;
+        }
+        out[start..start + n].copy_from_slice(&linear[s_off..s_off + n]);
+        return true;
+    }
+    if dst_tiled && src.desc.dimension == 1 {
+        let Some(mut linear) = detile_from_resource(dst) else {
+            return false;
+        };
+        let n = num_bytes
+            .min(linear.len().saturating_sub(d_off))
+            .min(src.byte_len.saturating_sub(s_off));
+        if n == 0 {
+            return true;
+        }
+        {
+            let inp = src.backing.lock();
+            let start = src.heap_offset + s_off;
+            if start + n > inp.len() {
+                return false;
+            }
+            linear[d_off..d_off + n].copy_from_slice(&inp[start..start + n]);
+        }
+        return tile_into_resource(dst, &linear);
+    }
+    false
+}
+
 extern "win64" fn cmdlist_copy_texture_region(
     this: *mut D3D12CmdListObject,
     dst: *const D3D12TextureCopyLocation,
-    _dst_x: u32,
-    _dst_y: u32,
-    _dst_z: u32,
+    dst_x: u32,
+    dst_y: u32,
+    dst_z: u32,
     src: *const D3D12TextureCopyLocation,
-    _src_box: *const c_void,
+    src_box: *const c_void,
 ) {
     if this.is_null() || dst.is_null() || src.is_null() {
         return;
@@ -2493,6 +2618,32 @@ extern "win64" fn cmdlist_copy_texture_region(
     }
     let dst_res = unsafe { &*(d_loc.resource.cast::<D3D12ResourceObject>()) };
     let src_res = unsafe { &*(s_loc.resource.cast::<D3D12ResourceObject>()) };
+    // Copie de la sous-ressource entière uniquement (pas d'offset ni de boîte) : sinon le
+    // comportement linéaire historique s'applique.
+    let whole = dst_x == 0 && dst_y == 0 && dst_z == 0 && src_box.is_null();
+
+    // Texture tuilée -> tampon : détuile la sous-ressource 0 vers l'empreinte placée du tampon.
+    if whole
+        && d_loc.copy_type == 1
+        && s_loc.copy_type == 0
+        && s_loc.placed_footprint.offset as u32 == 0
+        && dst_res.desc.dimension == 1
+        && let Some((_, w, h, fmt)) = tile_params(src_res)
+        && let Some(linear) = detile_from_resource(src_res)
+    {
+        let (row_bytes, rows) = texture_row_layout(w, h, fmt);
+        let fp = d_loc.placed_footprint;
+        let pitch = (fp.footprint.row_pitch as usize).max(row_bytes);
+        let base = dst_res.heap_offset + fp.offset as usize;
+        let mut out = dst_res.backing.lock();
+        for y in 0..rows {
+            let o = base + y * pitch;
+            if o + row_bytes <= out.len() {
+                out[o..o + row_bytes].copy_from_slice(&linear[y * row_bytes..(y + 1) * row_bytes]);
+            }
+        }
+        return;
+    }
 
     let fmt = if s_loc.copy_type == 1 && s_loc.placed_footprint.footprint.format != 0 {
         s_loc.placed_footprint.footprint.format
@@ -2529,7 +2680,16 @@ extern "win64" fn cmdlist_copy_texture_region(
         }
     }
     drop(src_buf);
-    {
+    // Destination tuilée (sous-ressource 0 entière) : la mémoire reçoit l'image tuilée ; le GPU
+    // (`UploadTexture`) continue de recevoir l'image linéaire.
+    let tiled_done = whole
+        && d_loc.copy_type == 0
+        && s_loc.copy_type == 1
+        && d_loc.placed_footprint.offset as u32 == 0
+        && u64::from(w) == dst_res.desc.width
+        && h == dst_res.desc.height.max(1)
+        && tile_into_resource(dst_res, &data);
+    if !tiled_done {
         let mut dst_buf = dst_res.backing.lock();
         let copy_len = data.len().min(dst_res.byte_len);
         if dst_res.heap_offset + copy_len <= dst_buf.len() {
@@ -3432,7 +3592,15 @@ extern "win64" fn queue_execute_command_lists(
                         let avail_src = src_obj.byte_len.saturating_sub(s_off);
                         let avail_dst = dst_obj.byte_len.saturating_sub(d_off);
                         let len = (*num_bytes as usize).min(avail_src).min(avail_dst);
-                        if len > 0 {
+                        if copy_buffer_region_tiled(
+                            dst_obj,
+                            *dst_offset as usize,
+                            src_obj,
+                            *src_offset as usize,
+                            *num_bytes as usize,
+                        ) {
+                            // Copie traitée avec (dé)tuilage.
+                        } else if len > 0 {
                             // SAFETY: bornes vérifiées sur `src_obj.byte_len` et `dst_obj.byte_len`.
                             let tmp = unsafe {
                                 std::slice::from_raw_parts(
@@ -4298,6 +4466,65 @@ extern "win64" fn device_create_command_list(
     S_OK
 }
 
+/// Plages mémoire `(début, octets)` des tas de descripteurs créés par le bridge : seules ces
+/// zones reçoivent les mots matériels V#/T#/S# (jamais une adresse arbitraire du titre).
+static DESC_HEAP_RANGES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Écrit un emplacement de descripteur (32 octets) à `dest` s'il est dans un tas de descripteurs
+/// connu. Renvoie `false` (rien d'écrit) sinon.
+fn write_descriptor_slot(dest: usize, slot: &crate::d3d12_views::SlotBytes) -> bool {
+    let n = crate::d3d12_views::SLOT_BYTES;
+    if dest == 0 {
+        return false;
+    }
+    let known = DESC_HEAP_RANGES
+        .lock()
+        .iter()
+        .any(|&(b, l)| dest >= b && l >= n && dest - b <= l - n);
+    if !known {
+        return false;
+    }
+    // SAFETY: `dest..dest+32` est inclus dans une zone de tas de descripteurs (mapping RW du
+    // bridge ou réservation XMem fournie par le titre), vérifiée juste au-dessus.
+    unsafe { ptr::copy_nonoverlapping(slot.as_ptr(), dest as *mut u8, n) };
+    true
+}
+
+/// Lit `len` octets d'un descripteur de vue. `Ok(None)` si le pointeur est NUL (vue par défaut),
+/// `Err(())` si la mémoire n'est pas lisible.
+fn view_desc_bytes(desc: *const c_void, len: usize) -> Result<Option<Vec<u8>>, ()> {
+    if desc.is_null() {
+        return Ok(None);
+    }
+    let v = sb_loader::trampoline::peek_memory(desc as usize, len);
+    if v.is_empty() { Err(()) } else { Ok(Some(v)) }
+}
+
+/// Construit puis écrit la vue de ressource (`SRV`/`UAV`/`RTV`/`DSV`) à `dest`.
+fn write_resource_view(
+    resource: *mut D3D12ResourceObject,
+    desc: *const c_void,
+    desc_len: usize,
+    dest: usize,
+    build: fn(
+        &crate::d3d12_views::ResourceView,
+        Option<&[u8]>,
+    ) -> Option<crate::d3d12_views::SlotBytes>,
+) {
+    let Ok(bytes) = view_desc_bytes(desc, desc_len) else {
+        return;
+    };
+    // SAFETY: appelant : `resource` validé par `is_d3d12_resource`.
+    let res = unsafe { &*resource };
+    let view = crate::d3d12_views::ResourceView {
+        desc: &res.desc,
+        address: res.fixed_addr as u64,
+    };
+    if let Some(slot) = build(&view, bytes.as_deref()) {
+        write_descriptor_slot(dest, &slot);
+    }
+}
+
 extern "win64" fn device_create_descriptor_heap(
     _this: *mut D3D12DeviceObject,
     desc: *const D3D12DescriptorHeapDesc,
@@ -4365,6 +4592,7 @@ extern "win64" fn device_create_descriptor_heap(
             base = p as usize;
         }
     }
+    DESC_HEAP_RANGES.lock().push((base, count as usize * 32));
     let heap = Box::new(D3D12DescHeapObject {
         header: ComHeader::new(traced_vtbl(
             (&raw const D3D12_DESC_HEAP_VTBL).cast(),
@@ -4610,6 +4838,10 @@ extern "win64" fn device_create_cbv(
             size: d.size_in_bytes,
         },
     );
+    write_descriptor_slot(
+        dest_descriptor,
+        &crate::d3d12_views::cbv_slot(d.buffer_location, d.size_in_bytes),
+    );
 }
 
 /// `true` si `p` désigne une `ID3D12Resource` créée par le bridge. Sur console, un titre peut
@@ -4622,7 +4854,7 @@ fn is_d3d12_resource(p: usize) -> bool {
 extern "win64" fn device_create_srv(
     this: *mut D3D12DeviceObject,
     resource: *mut D3D12ResourceObject,
-    _desc: *const c_void,
+    desc: *const c_void,
     dest_descriptor: usize,
 ) {
     if this.is_null() || !is_d3d12_resource(resource as usize) {
@@ -4636,13 +4868,20 @@ extern "win64" fn device_create_srv(
             resource_ptr: resource as usize,
         },
     );
+    write_resource_view(
+        resource,
+        desc,
+        48,
+        dest_descriptor,
+        crate::d3d12_views::srv_slot,
+    );
 }
 
 extern "win64" fn device_create_uav(
     this: *mut D3D12DeviceObject,
     resource: *mut D3D12ResourceObject,
     _counter_resource: *mut c_void,
-    _desc: *const c_void,
+    desc: *const c_void,
     dest_descriptor: usize,
 ) {
     if this.is_null() || !is_d3d12_resource(resource as usize) {
@@ -4658,29 +4897,62 @@ extern "win64" fn device_create_uav(
             size: res.byte_len as u32,
         },
     );
+    write_resource_view(
+        resource,
+        desc,
+        48,
+        dest_descriptor,
+        crate::d3d12_views::uav_slot,
+    );
 }
 
 extern "win64" fn device_create_rtv(
     _this: *mut D3D12DeviceObject,
-    _resource: *mut D3D12ResourceObject,
-    _desc: *const c_void,
-    _dest_descriptor: usize,
+    resource: *mut D3D12ResourceObject,
+    desc: *const c_void,
+    dest_descriptor: usize,
 ) {
+    if is_d3d12_resource(resource as usize) {
+        write_resource_view(
+            resource,
+            desc,
+            32,
+            dest_descriptor,
+            crate::d3d12_views::rtv_slot,
+        );
+    }
 }
 
 extern "win64" fn device_create_dsv(
     _this: *mut D3D12DeviceObject,
-    _resource: *mut D3D12ResourceObject,
-    _desc: *const c_void,
-    _dest_descriptor: usize,
+    resource: *mut D3D12ResourceObject,
+    desc: *const c_void,
+    dest_descriptor: usize,
 ) {
+    if is_d3d12_resource(resource as usize) {
+        write_resource_view(
+            resource,
+            desc,
+            32,
+            dest_descriptor,
+            crate::d3d12_views::dsv_slot,
+        );
+    }
 }
 
+/// `ID3D12Device::CreateSampler(desc, destDescriptor)` : écrit le S# GFX10 à l'adresse du handle.
 extern "win64" fn device_create_sampler(
     _this: *mut D3D12DeviceObject,
-    _desc: *const c_void,
-    _dest_descriptor: usize,
+    desc: *const c_void,
+    dest_descriptor: usize,
 ) {
+    if desc.is_null() {
+        return;
+    }
+    let bytes = sb_loader::trampoline::peek_memory(desc as usize, 52);
+    if let Some(slot) = crate::d3d12_views::sampler_slot(&bytes) {
+        write_descriptor_slot(dest_descriptor, &slot);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5977,6 +6249,7 @@ extern "win64" fn device_create_placed_resource_x(
                 byte_len,
                 fixed_addr: addr,
                 gpu_texture_id: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                swizzle_mode: None,
             }))
         } else {
             alloc_d3d12_resource(d, false)
@@ -6672,6 +6945,10 @@ pub(crate) extern "win64" fn D3D12XboxSetProcessDebugFlags(flags: u32) {
 pub(crate) extern "win64" fn D3D12XboxUnloadDriverModule() -> HResult {
     S_OK
 }
+
+#[cfg(test)]
+#[path = "d3d12_xs_views_tests.rs"]
+mod views_tests;
 
 #[cfg(test)]
 mod xbox_ext_tests {
