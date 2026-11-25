@@ -40,10 +40,12 @@ pub(super) const CLSID: Guid = guid("af406016-e850-4aa8-a88d-2f3dcb9dac7e");
 const IID_IMPL1: Guid = guid("3720de07-e8e4-44a3-ad32-b359e8adbe55");
 const IID_IMPL2: Guid = guid("f92d8712-2b27-4d8a-bf01-11a6f8e3eb42");
 const IID_IMPL3: Guid = guid("e2a4734b-2f4a-456d-aa8f-d065e04fb209");
-const EXTRA: [Guid; 3] = [IID_IMPL1, IID_IMPL2, IID_IMPL3];
+/// `IXPackageImpl4` (GDK récent : étend `IXPackageImpl3` au-delà du slot 40).
+const IID_IMPL4: Guid = guid("0b9d556e-ab70-43f4-baa0-9999ac4cb040");
+const EXTRA: [Guid; 4] = [IID_IMPL1, IID_IMPL2, IID_IMPL3, IID_IMPL4];
 
-/// Nombre d'entrées de la vtable (IUnknown + 38 méthodes).
-pub(super) const VTBL_SLOTS: usize = 41;
+/// Nombre d'entrées de la vtable (IUnknown + 38 méthodes v1..v3 + 15 slots étendus v4).
+pub(super) const VTBL_SLOTS: usize = 56;
 
 /// `E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER`.
 pub(super) const E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER: HResult = 0x8924_5208_u32 as i32;
@@ -56,11 +58,35 @@ pub(super) const MOUNT_PATH: &str = "G:\\";
 const _: () = assert!(PACKAGE_ID.len() == 32);
 
 type InstalledCb = unsafe extern "win64" fn(*mut c_void, *const c_void);
+type ProgressCb = unsafe extern "win64" fn(*mut c_void, usize);
 type EnumCb = unsafe extern "win64" fn(*mut c_void, *const c_void) -> u8;
 type ChunkCb = unsafe extern "win64" fn(*mut c_void, *const c_void, u32) -> u8;
 
+/// `XPackageInstallationProgress` (`XPackage.h`, 32 octets).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct XPackageInstallationProgress {
+    total_bytes: u64,
+    installed_bytes: u64,
+    launch_bytes: u64,
+    launchable: u8,
+    completed: u8,
+    _pad: [u8; 6],
+}
+
+const _: () = {
+    assert!(size_of::<XPackageInstallationProgress>() == 32);
+    assert!(core::mem::offset_of!(XPackageInstallationProgress, total_bytes) == 0);
+    assert!(core::mem::offset_of!(XPackageInstallationProgress, installed_bytes) == 8);
+    assert!(core::mem::offset_of!(XPackageInstallationProgress, launch_bytes) == 16);
+    assert!(core::mem::offset_of!(XPackageInstallationProgress, launchable) == 24);
+    assert!(core::mem::offset_of!(XPackageInstallationProgress, completed) == 25);
+};
+
 static MOUNTS: LazyLock<HandleTable<()>> = LazyLock::new(|| HandleTable::new(0x8A00_0010));
 static TOKENS: LazyLock<HandleTable<()>> = LazyLock::new(|| HandleTable::new(0x8B00_0010));
+static MONITORS: LazyLock<HandleTable<()>> = LazyLock::new(|| HandleTable::new(0x8C00_0010));
+static PROGRESS_TOKENS: LazyLock<HandleTable<()>> = LazyLock::new(|| HandleTable::new(0x8D00_0010));
 
 fn is_current_package(p: *const u8) -> Result<(), HResult> {
     match read_cstr(p) {
@@ -123,7 +149,110 @@ extern "win64" fn is_packaged_process(_this: *mut c_void) -> u8 {
     ffi_guard!(CHANNEL, "XPackageIsPackagedProcess", 0u8, { 1u8 })
 }
 
-// 8 / 10 / 34 : BOOLEAN faux (aucun moniteur, aucune installation).
+// 5 : XPackageCreateInstallationMonitor(pkg, selectorCount, selectors, minUpdateMs, queue, &monitor)
+extern "win64" fn create_installation_monitor(
+    _this: *mut c_void,
+    pkg: *const u8,
+    selector_count: u32,
+    selectors: *const c_void,
+    _min_update_ms: u32,
+    _queue: usize,
+    out_monitor: *mut usize,
+) -> HResult {
+    ffi_guard!(CHANNEL, "XPackageCreateInstallationMonitor", E_FAIL, {
+        if out_monitor.is_null() {
+            return E_INVALIDARG;
+        }
+        write_out(out_monitor, 0);
+        if let Err(hr) =
+            is_current_package(pkg).and_then(|()| check_selectors(selector_count, selectors))
+        {
+            return hr;
+        }
+        write_out(out_monitor, MONITORS.insert(()));
+        S_OK
+    })
+}
+
+// 6 : XPackageGetInstallationProgress(monitor, &progress) ; paquet complet (100 %) hors ligne.
+extern "win64" fn get_installation_progress(
+    _this: *mut c_void,
+    monitor: usize,
+    out_progress: *mut XPackageInstallationProgress,
+) {
+    ffi_guard!(CHANNEL, "XPackageGetInstallationProgress", (), {
+        if out_progress.is_null() || !MONITORS.contains(monitor) {
+            return;
+        }
+        write_out(
+            out_progress,
+            XPackageInstallationProgress {
+                total_bytes: 1,
+                installed_bytes: 1,
+                launch_bytes: 1,
+                launchable: 1,
+                completed: 1,
+                _pad: [0; 6],
+            },
+        );
+    })
+}
+
+// 7 : XPackageCloseInstallationMonitorHandle(monitor)
+extern "win64" fn close_installation_monitor(_this: *mut c_void, monitor: usize) {
+    ffi_guard!(CHANNEL, "XPackageCloseInstallationMonitorHandle", (), {
+        MONITORS.remove(monitor);
+    })
+}
+
+// 8 : XPackageUpdateInstallationMonitor(monitor) -> bool (aucune progression restante)
+extern "win64" fn update_installation_monitor(_this: *mut c_void, _monitor: usize) -> u8 {
+    ffi_guard!(CHANNEL, "XPackageUpdateInstallationMonitor", 0u8, { 0u8 })
+}
+
+// 9 : XPackageRegisterInstallationProgressChanged(monitor, ctx, cb, &token)
+extern "win64" fn register_installation_progress_changed(
+    _this: *mut c_void,
+    monitor: usize,
+    _ctx: *mut c_void,
+    cb: Option<ProgressCb>,
+    out_token: *mut u64,
+) -> HResult {
+    ffi_guard!(
+        CHANNEL,
+        "XPackageRegisterInstallationProgressChanged",
+        E_FAIL,
+        {
+            if !MONITORS.contains(monitor) || cb.is_none() || out_token.is_null() {
+                return E_INVALIDARG;
+            }
+            write_out(out_token, PROGRESS_TOKENS.insert(()) as u64);
+            S_OK
+        }
+    )
+}
+
+// 10 : XPackageUnregisterInstallationProgressChanged(monitor, token, wait) -> bool
+extern "win64" fn unregister_installation_progress_changed(
+    _this: *mut c_void,
+    monitor: usize,
+    token: u64,
+    _wait: u8,
+) -> u8 {
+    ffi_guard!(
+        CHANNEL,
+        "XPackageUnregisterInstallationProgressChanged",
+        0u8,
+        {
+            if !MONITORS.contains(monitor) {
+                return 0;
+            }
+            u8::from(PROGRESS_TOKENS.remove(token as usize).is_some())
+        }
+    )
+}
+
+// 34 : BOOLEAN faux (aucune installation en cours).
 extern "win64" fn bool_false<const N: usize>(
     _this: *mut c_void,
     _a2: usize,
@@ -374,15 +503,15 @@ static VTBL: [VtblSlot; VTBL_SLOTS] = [
     vslot(com_release as *const c_void),
     vslot(get_current_process_package_identifier as *const c_void), // 3
     vslot(is_packaged_process as *const c_void),                    // 4
-    unimpl!(5),
-    unimpl!(6),
-    unimpl!(7),
-    vslot(bool_false::<8> as *const c_void),
-    unimpl!(9),
-    vslot(bool_false::<10> as *const c_void),
-    vslot(get_user_locale as *const c_void),         // 11
-    vslot(find_chunk_availability as *const c_void), // 12
-    vslot(enumerate_chunk_availability as *const c_void), // 13
+    vslot(create_installation_monitor as *const c_void),            // 5
+    vslot(get_installation_progress as *const c_void),              // 6
+    vslot(close_installation_monitor as *const c_void),             // 7
+    vslot(update_installation_monitor as *const c_void),            // 8
+    vslot(register_installation_progress_changed as *const c_void), // 9
+    vslot(unregister_installation_progress_changed as *const c_void), // 10
+    vslot(get_user_locale as *const c_void),                        // 11
+    vslot(find_chunk_availability as *const c_void),                // 12
+    vslot(enumerate_chunk_availability as *const c_void),           // 13
     unimpl!(14),
     unimpl!(15),
     unimpl!(16),
@@ -410,6 +539,21 @@ static VTBL: [VtblSlot; VTBL_SLOTS] = [
     vslot(mount_with_ui_result as *const c_void), // 38
     vslot(enumerate_packages as *const c_void), // 39
     vslot(register_package_installed as *const c_void), // 40
+    unimpl!(41),
+    unimpl!(42),
+    unimpl!(43),
+    unimpl!(44),
+    unimpl!(45),
+    unimpl!(46),
+    unimpl!(47),
+    unimpl!(48),
+    unimpl!(49),
+    unimpl!(50),
+    unimpl!(51),
+    unimpl!(52),
+    unimpl!(53),
+    unimpl!(54),
+    unimpl!(55),
 ];
 
 const _: () = assert!(VTBL.len() == VTBL_SLOTS);
@@ -437,11 +581,11 @@ mod tests {
 
     #[test]
     fn vtable_size_and_iunknown() {
-        const _: () = assert!(VTBL_SLOTS == 41);
+        const _: () = assert!(VTBL_SLOTS == 56);
         let obj = query_class(&CLSID);
         assert!(vcall!(obj, 1, () -> u32) >= 2);
         assert!(vcall!(obj, 2, () -> u32) >= 1);
-        for iid in [CLSID, IID_IMPL1, IID_IMPL2, IID_IMPL3] {
+        for iid in [CLSID, IID_IMPL1, IID_IMPL2, IID_IMPL3, IID_IMPL4] {
             let mut out: *mut c_void = core::ptr::null_mut();
             assert_eq!(
                 vcall!(obj, 0, (*const Guid, *mut *mut c_void) -> HResult, &iid, &mut out),
@@ -459,10 +603,9 @@ mod tests {
             crate::gdk_classes::query(&CLSID, &bad, &mut out),
             E_NOINTERFACE
         );
-        assert_eq!(
-            crate::gdk_classes::query(&CLSID, &IID_IMPL3, &mut out),
-            S_OK
-        );
+        for iid in [IID_IMPL3, IID_IMPL4] {
+            assert_eq!(crate::gdk_classes::query(&CLSID, &iid, &mut out), S_OK);
+        }
     }
 
     #[test]
@@ -698,13 +841,69 @@ mod tests {
     }
 
     #[test]
+    fn installation_monitor_reports_completed_offline() {
+        let obj = query_class(&CLSID);
+        let id = CString::new(PACKAGE_ID).expect("cstr");
+        let mut mon = 0usize;
+        assert_eq!(
+            vcall!(
+                obj,
+                5,
+                (*const u8, u32, *const c_void, u32, usize, *mut usize) -> HResult,
+                id.as_ptr().cast(),
+                0,
+                core::ptr::null(),
+                1000,
+                0,
+                &mut mon
+            ),
+            S_OK
+        );
+        assert_ne!(mon, 0);
+
+        let mut prog = XPackageInstallationProgress::default();
+        vcall!(
+            obj,
+            6,
+            (usize, *mut XPackageInstallationProgress) -> (),
+            mon,
+            &mut prog
+        );
+        assert_eq!(prog.launchable, 1);
+        assert_eq!(prog.completed, 1);
+        assert_eq!(prog.installed_bytes, prog.total_bytes);
+        assert!(prog.total_bytes > 0);
+        assert_eq!(vcall!(obj, 8, (usize) -> u8, mon), 0);
+
+        extern "win64" fn never_prog(_: *mut c_void, _: usize) {
+            panic!("jamais appelé");
+        }
+        let mut tok = 0u64;
+        assert_eq!(
+            vcall!(
+                obj,
+                9,
+                (usize, *mut c_void, Option<ProgressCb>, *mut u64) -> HResult,
+                mon,
+                core::ptr::null_mut(),
+                Some(never_prog as ProgressCb),
+                &mut tok
+            ),
+            S_OK
+        );
+        assert_ne!(tok, 0);
+        assert_eq!(vcall!(obj, 10, (usize, u64, u8) -> u8, mon, tok, 1), 1);
+        assert_eq!(vcall!(obj, 10, (usize, u64, u8) -> u8, mon, tok, 1), 0);
+
+        vcall!(obj, 7, (usize) -> (), mon);
+    }
+
+    #[test]
     fn install_related_slots_are_not_implemented() {
         let obj = query_class(&CLSID);
-        for n in [5usize, 9, 14, 15, 16, 17, 19, 20, 21, 27, 30, 31, 32] {
+        for n in [14usize, 15, 16, 17, 19, 20, 21, 27, 30, 31, 32] {
             assert_eq!(vcall!(obj, n, (usize) -> HResult, 0), E_NOTIMPL, "slot {n}");
         }
-        for n in [8usize, 10, 34] {
-            assert_eq!(vcall!(obj, n, (usize) -> u8, 0), 0, "slot {n}");
-        }
+        assert_eq!(vcall!(obj, 34, (usize) -> u8, 0), 0);
     }
 }

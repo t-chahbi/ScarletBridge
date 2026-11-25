@@ -325,7 +325,21 @@ pub static CTYPEW_ID: AtomicUsize = AtomicUsize::new(0);
 
 static GLOBAL_LOCIMP: AtomicPtr<Locimp> = AtomicPtr::new(ptr::null_mut());
 /// Objet `locale` statique renvoyé par `locale::classic()` (layout identique : un pointeur).
-static CLASSIC_LOCALE: AtomicPtr<Locimp> = AtomicPtr::new(ptr::null_mut());
+#[repr(C)]
+struct StaticLocale {
+    _empty_bases_pad: usize,
+    ptr: AtomicPtr<Locimp>,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<StaticLocale>() == core::mem::size_of::<Locale>());
+    assert!(core::mem::offset_of!(StaticLocale, ptr) == core::mem::offset_of!(Locale, ptr));
+};
+
+static CLASSIC_LOCALE: StaticLocale = StaticLocale {
+    _empty_bases_pad: 0,
+    ptr: AtomicPtr::new(ptr::null_mut()),
+};
 static CLASSIC_ONCE: Once = Once::new();
 
 /// `locale::id::operator size_t()`.
@@ -368,7 +382,7 @@ fn init_classic() {
                 id_value(&CODECVT_ID),
             );
         }
-        CLASSIC_LOCALE.store(imp, Ordering::Release);
+        CLASSIC_LOCALE.ptr.store(imp, Ordering::Release);
         GLOBAL_LOCIMP.store(imp, Ordering::Release);
     });
 }
@@ -416,9 +430,7 @@ pub fn new_locale_obj() -> *mut Locale {
         if p.is_null() {
             fatal_throw("std::bad_alloc", "bad allocation");
         }
-        p.write(Locale {
-            ptr: locale_init_imp(true),
-        });
+        p.write(Locale::new(locale_init_imp(true)));
         p
     }
 }
@@ -464,7 +476,7 @@ pub unsafe fn locale_copy_into(dst: *mut Locale, src: *const Locale) {
         if !imp.is_null() {
             v_incref(imp.cast());
         }
-        dst.write(Locale { ptr: imp });
+        dst.write(Locale::new(imp));
     }
 }
 

@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use sb_common::abi::{E_FAIL, E_INVALIDARG, E_NOTIMPL, E_POINTER, E_UNEXPECTED, HResult, S_OK};
@@ -131,6 +132,79 @@ pub const IID_IDXGIOUTPUT: Guid = Guid::new(
     0xC735,
     0x4690,
     [0x8D, 0x52, 0x5A, 0x8D, 0xC2, 0x02, 0x13, 0xAA],
+);
+/// `ID3D12Object` (`d3d12.h`).
+pub const IID_ID3D12OBJECT: Guid = Guid::new(
+    0xC4FE_C28F,
+    0x7966,
+    0x4E95,
+    [0x9F, 0x94, 0xF4, 0x31, 0xCB, 0x56, 0xC3, 0xB8],
+);
+/// `ID3D12Device1`..`ID3D12Device4` (`d3d12.h`).
+pub const IID_ID3D12DEVICE1: Guid = Guid::new(
+    0x77AC_CE80,
+    0x638E,
+    0x4E65,
+    [0x88, 0x95, 0xC1, 0xF2, 0x33, 0x86, 0x86, 0x3E],
+);
+pub const IID_ID3D12DEVICE2: Guid = Guid::new(
+    0x30BA_A41E,
+    0xB15B,
+    0x475C,
+    [0xA0, 0xBB, 0x1A, 0xF5, 0xC5, 0xB6, 0x43, 0x28],
+);
+pub const IID_ID3D12DEVICE3: Guid = Guid::new(
+    0x81DA_DC15,
+    0x2BAD,
+    0x4392,
+    [0x93, 0xC5, 0x10, 0x13, 0x45, 0xC4, 0xAA, 0x98],
+);
+pub const IID_ID3D12DEVICE4: Guid = Guid::new(
+    0xE865_DF17,
+    0xA9EE,
+    0x46F9,
+    [0xA4, 0x63, 0x30, 0x98, 0x31, 0x5A, 0xA2, 0xE5],
+);
+/// `ID3D12CommandSignature` (`d3d12.h`).
+pub const IID_ID3D12COMMANDSIGNATURE: Guid = Guid::new(
+    0xC36A_797C,
+    0xEC80,
+    0x4F0A,
+    [0x89, 0x85, 0xA7, 0xB2, 0x47, 0x50, 0x82, 0xD1],
+);
+/// `ID3D12QueryHeap` (`d3d12.h`).
+pub const IID_ID3D12QUERYHEAP: Guid = Guid::new(
+    0x0D96_58AE,
+    0xED45,
+    0x469E,
+    [0xA6, 0x1D, 0x97, 0x0E, 0xC5, 0x83, 0xCA, 0xB4],
+);
+/// `ID3D12GraphicsCommandList1` / `2` (`d3d12.h`).
+pub const IID_ID3D12GRAPHICSCOMMANDLIST1: Guid = Guid::new(
+    0x5531_03FB,
+    0x1FE7,
+    0x4557,
+    [0xBB, 0x38, 0x94, 0x6D, 0x7D, 0x0E, 0x7C, 0xA7],
+);
+pub const IID_ID3D12GRAPHICSCOMMANDLIST2: Guid = Guid::new(
+    0x38C3_E585,
+    0xFF17,
+    0x412C,
+    [0x91, 0x50, 0x4F, 0xC6, 0xF9, 0xD7, 0x2A, 0x28],
+);
+/// `ID3D12DmaCommandList` (liste DMA console Xbox Series X, type 6).
+pub const IID_ID3D12CONSDMACOMMANDLIST: Guid = Guid::new(
+    0x30BC_77B9,
+    0x8379,
+    0x4B25,
+    [0x95, 0xDE, 0xB8, 0x58, 0x8C, 0x42, 0x27, 0x5D],
+);
+/// `ID3D12Fence1` (`d3d12.h`).
+pub const IID_ID3D12FENCE1: Guid = Guid::new(
+    0x4336_85FE,
+    0xE22B,
+    0x4CA0,
+    [0xA8, 0xDB, 0xB5, 0xB4, 0xF4, 0xDD, 0x0E, 0x4A],
 );
 
 // ==================== Structs ABI Windows x86-64 (`d3d12.h` / `dxgi1_2.h`) ====================
@@ -466,6 +540,59 @@ pub struct DxgiSwapChainDesc1 {
     pub flags: u32,
 }
 
+/// `D3D12XBOX_PRESENT_PLANE_PARAMETERS` (ABI console Xbox Series X, 0x48 octets).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct D3D12XboxPresentPlaneParameters {
+    pub token: u64,
+    pub resource_count: u32,
+    pub _pad0: u32,
+    pub pp_resources: *const *mut c_void,
+    pub src_view_rects: *const c_void,
+    pub dest_placement_base: *const [f32; 4],
+    pub color_space: i32,
+    pub scale_filter: i32,
+    pub extended_desc_count: u32,
+    pub _pad1: u32,
+    pub extended_descs: *const c_void,
+    pub flags: u32,
+    pub _pad2: u32,
+}
+
+/// `D3D12XBOX_PRESENT_PARAMETERS` (ABI console Xbox Series X, 0x20 octets).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct D3D12XboxPresentParameters {
+    pub immediate_threshold_percent: f32,
+    pub view_count: u32,
+    pub extended_desc_count: u32,
+    pub _pad0: u32,
+    pub extended_descs: *const c_void,
+    pub flags: u32,
+    pub _pad1: u32,
+}
+
+/// `D3D12XBOX_FRAME_OBJECT_LIST` passé à `ScheduleFrameEventX` / `WaitFrameEventX` (0x18 octets).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct D3D12XboxFrameObjectList {
+    pub count: u32,
+    pub _pad0: u32,
+    pub objects: *const usize,
+    pub signaled: *mut i32,
+}
+
+/// Enregistrement de statistiques de frame retourné par `GetFrameStatisticsX` (0x20 octets).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12XboxFrameStatistics {
+    pub stat_type: u32,
+    pub _pad0: u32,
+    pub reserved: u64,
+    pub origin_time_us: u64,
+    pub flip_time_us: u64,
+}
+
 // Assertions ABI compile-time strictes contre `d3d12.h` x86-64 (Règle 3 AGENTS.md).
 const _: () = {
     assert!(size_of::<D3D12ShaderBytecode>() == 16);
@@ -517,6 +644,27 @@ const _: () = {
     assert!(offset_of!(D3D12RootSignatureDesc, flags) == 32);
     assert!(offset_of!(D3D12VersionedRootSignatureDesc, version) == 0);
     assert!(offset_of!(D3D12VersionedRootSignatureDesc, desc) == 8);
+    // Structs ABI console Xbox Series X (`PresentX` / frame pacing).
+    assert!(size_of::<D3D12XboxPresentPlaneParameters>() == 0x48);
+    assert!(offset_of!(D3D12XboxPresentPlaneParameters, token) == 0x00);
+    assert!(offset_of!(D3D12XboxPresentPlaneParameters, resource_count) == 0x08);
+    assert!(offset_of!(D3D12XboxPresentPlaneParameters, pp_resources) == 0x10);
+    assert!(offset_of!(D3D12XboxPresentPlaneParameters, color_space) == 0x28);
+    assert!(offset_of!(D3D12XboxPresentPlaneParameters, scale_filter) == 0x2C);
+    assert!(offset_of!(D3D12XboxPresentPlaneParameters, extended_desc_count) == 0x30);
+    assert!(offset_of!(D3D12XboxPresentPlaneParameters, extended_descs) == 0x38);
+    assert!(offset_of!(D3D12XboxPresentPlaneParameters, flags) == 0x40);
+    assert!(size_of::<D3D12XboxPresentParameters>() == 0x20);
+    assert!(offset_of!(D3D12XboxPresentParameters, immediate_threshold_percent) == 0x00);
+    assert!(offset_of!(D3D12XboxPresentParameters, view_count) == 0x04);
+    assert!(offset_of!(D3D12XboxPresentParameters, extended_descs) == 0x10);
+    assert!(offset_of!(D3D12XboxPresentParameters, flags) == 0x18);
+    assert!(size_of::<D3D12XboxFrameObjectList>() == 0x18);
+    assert!(offset_of!(D3D12XboxFrameObjectList, objects) == 0x08);
+    assert!(offset_of!(D3D12XboxFrameObjectList, signaled) == 0x10);
+    assert!(size_of::<D3D12XboxFrameStatistics>() == 0x20);
+    assert!(offset_of!(D3D12XboxFrameStatistics, origin_time_us) == 0x10);
+    assert!(offset_of!(D3D12XboxFrameStatistics, flip_time_us) == 0x18);
 };
 
 // ==================== Exports DLL (`d3d12_xs.dll` & `dxgi.dll`) ====================
@@ -538,6 +686,39 @@ pub fn d3d12_xs_exports() -> HashMap<&'static str, usize> {
         "D3D12SerializeVersionedRootSignature",
         D3D12SerializeVersionedRootSignature
     );
+    reg!(
+        "D3D12CreateRootSignatureDeserializer",
+        D3D12CreateRootSignatureDeserializer
+    );
+    reg!(
+        "D3D12CreateVersionedRootSignatureDeserializer",
+        D3D12CreateVersionedRootSignatureDeserializer
+    );
+    reg!(
+        "D3D12EnableExperimentalFeatures",
+        D3D12EnableExperimentalFeatures
+    );
+    reg!("D3D12UploadCustomMicrocodeX", D3D12UploadCustomMicrocodeX);
+    reg!("D3D12ZeroMemoryX", D3D12ZeroMemoryX);
+    reg!("D3D10CreateBlob", D3D10CreateBlob);
+    reg!("D3DFlushEntireCpuCache", D3DFlushEntireCpuCache);
+    reg!("DXGIXGetFrameStatistics", DXGIXGetFrameStatistics);
+    reg!("DXGIXPresentArray", DXGIXPresentArray);
+    reg!("DXGIXSetFrameNotification", DXGIXSetFrameNotification);
+    reg!("DXGIXSetVLineNotification", DXGIXSetVLineNotification);
+    reg!(
+        "D3D12XboxEnableMemoryProfiling",
+        D3D12XboxEnableMemoryProfiling
+    );
+    reg!(
+        "D3D12XboxGetProcessDebugFlags",
+        D3D12XboxGetProcessDebugFlags
+    );
+    reg!(
+        "D3D12XboxSetProcessDebugFlags",
+        D3D12XboxSetProcessDebugFlags
+    );
+    reg!("D3D12XboxUnloadDriverModule", D3D12XboxUnloadDriverModule);
     m
 }
 
@@ -569,6 +750,46 @@ struct SharedD3D12State {
     sdl_window: Mutex<Option<Sdl3Window>>,
     // Table des descripteurs SRV/CBV indexée par handle CPU/GPU D3D12.
     descriptors: Mutex<HashMap<usize, DescriptorBinding>>,
+    // Cadencement d'images console (`SetFrameIntervalX` / `WaitFrameEventX` / `PresentX`).
+    frame_interval_us: AtomicU32,
+    next_frame_token: AtomicU64,
+    present_count: AtomicU64,
+    start_instant: Instant,
+    /// `true` lorsque le périphérique a été créé via `D3D12XboxCreateDevice` (ou a reçu un
+    /// appel console `slot 48`) : les files de commandes démarrent alors directement dans le
+    /// layout console récent (`slot 18` = `GetTimestampFrequency` sur 8 octets, jamais `GetDesc`
+    /// sur 16 octets qui écraserait la pile de l'appelant).
+    is_console_device: AtomicBool,
+}
+
+impl SharedD3D12State {
+    fn new(renderer: VulkanRenderer) -> Self {
+        Self {
+            renderer: Mutex::new(renderer),
+            sdl_window: Mutex::new(None),
+            descriptors: Mutex::new(HashMap::new()),
+            frame_interval_us: AtomicU32::new(16_667),
+            // 0 est réservé (`D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL`) : commence à 1.
+            next_frame_token: AtomicU64::new(1),
+            present_count: AtomicU64::new(0),
+            start_instant: Instant::now(),
+            is_console_device: AtomicBool::new(false),
+        }
+    }
+
+    fn alloc_frame_token(&self) -> u64 {
+        let raw = self.next_frame_token.fetch_add(1, Ordering::AcqRel);
+        let masked = raw & 0x0000_FFFF_FFFF_FFFF;
+        if masked == 0 { 1 } else { masked }
+    }
+
+    fn elapsed_ns(&self) -> u64 {
+        (self.start_instant.elapsed().as_nanos() as u64).max(1)
+    }
+
+    fn elapsed_us(&self) -> u64 {
+        (self.start_instant.elapsed().as_micros() as u64).max(1)
+    }
 }
 
 fn is_headless() -> bool {
@@ -579,6 +800,201 @@ fn is_headless() -> bool {
 
 extern "win64" fn noop_ok() -> HResult {
     S_OK
+}
+
+/// `DXGI_ERROR_NOT_FOUND` (`0x887A0002`) : donnée privée absente dans `GetPrivateData`.
+const DXGI_ERROR_NOT_FOUND: HResult = 0x887A_0002u32 as i32;
+/// `DXGI_ERROR_MORE_DATA` (`0x887A0003`) : tampon insuffisant (`GetPrivateData`, `GetDisplayModeList`).
+const DXGI_ERROR_MORE_DATA: HResult = 0x887A_0003u32 as i32;
+
+/// Dernier `ID3D12Device` actif créé par le bridge (sert à `ID3D12DeviceChild::GetDevice`).
+static LAST_D3D12_DEVICE: AtomicUsize = AtomicUsize::new(0);
+
+enum PrivateDataEntry {
+    Bytes(Vec<u8>),
+    Interface(usize),
+}
+
+static PRIVATE_DATA: std::sync::LazyLock<Mutex<HashMap<(usize, Guid), PrivateDataEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `ID3D12Object::GetPrivateData` (slot 3) / `IDXGIObject::GetPrivateData` (slot 5).
+extern "win64" fn d3d12_obj_get_private_data(
+    this: *mut ComHeader,
+    guid: *const Guid,
+    data_size: *mut u32,
+    data: *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "GetPrivateData", E_UNEXPECTED, {
+        if this.is_null() || guid.is_null() || data_size.is_null() {
+            return E_INVALIDARG;
+        }
+        // SAFETY: `guid` et `data_size` vérifiés non-nuls.
+        let key = (this as usize, unsafe { ptr::read_unaligned(guid) });
+        let cap = unsafe { ptr::read_unaligned(data_size) } as usize;
+        let map = PRIVATE_DATA.lock();
+        let Some(entry) = map.get(&key) else {
+            return DXGI_ERROR_NOT_FOUND;
+        };
+        match entry {
+            PrivateDataEntry::Bytes(bytes) => {
+                let needed = bytes.len();
+                // SAFETY: `data_size` vérifié non-nul.
+                unsafe { ptr::write_unaligned(data_size, needed as u32) };
+                if data.is_null() {
+                    return S_OK;
+                }
+                if cap < needed {
+                    return DXGI_ERROR_MORE_DATA;
+                }
+                if needed > 0 {
+                    // SAFETY: `data` non-nul et `cap >= needed`.
+                    unsafe {
+                        ptr::copy_nonoverlapping(bytes.as_ptr(), data.cast::<u8>(), needed);
+                    }
+                }
+                S_OK
+            }
+            PrivateDataEntry::Interface(iface_ptr) => {
+                let needed = size_of::<usize>();
+                // SAFETY: `data_size` vérifié non-nul.
+                unsafe { ptr::write_unaligned(data_size, needed as u32) };
+                if data.is_null() {
+                    return S_OK;
+                }
+                if cap < needed {
+                    return DXGI_ERROR_MORE_DATA;
+                }
+                let ptr_val = *iface_ptr;
+                drop(map);
+                // Incrémenter le compteur COM (`IUnknown::AddRef`, slot 1) si l'objet est mappé.
+                if ptr_val >= 0x1_0000
+                    && sb_loader::trampoline::peek_memory(ptr_val, size_of::<usize>()).len()
+                        == size_of::<usize>()
+                {
+                    // SAFETY: `ptr_val` est un pointeur COM stocké via `SetPrivateDataInterface`.
+                    let vtbl = unsafe { *(ptr_val as *const *const usize) };
+                    if !vtbl.is_null()
+                        && sb_loader::trampoline::peek_memory(vtbl as usize, 16).len() == 16
+                    {
+                        // SAFETY: slot 1 de `IUnknown` = `extern "win64" fn(*mut c_void) -> u32`.
+                        let add_ref: extern "win64" fn(*mut c_void) -> u32 =
+                            unsafe { core::mem::transmute(*vtbl.add(1)) };
+                        let _ = add_ref(ptr_val as *mut c_void);
+                    }
+                }
+                // SAFETY: `data` non-nul et `cap >= size_of::<usize>()`.
+                unsafe { ptr::write_unaligned(data.cast::<usize>(), ptr_val) };
+                S_OK
+            }
+        }
+    })
+}
+
+/// `ID3D12Object::SetPrivateData` (slot 4) / `IDXGIObject::SetPrivateData` (slot 3).
+extern "win64" fn d3d12_obj_set_private_data(
+    this: *mut ComHeader,
+    guid: *const Guid,
+    data_size: u32,
+    data: *const c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "SetPrivateData", E_UNEXPECTED, {
+        if this.is_null() || guid.is_null() {
+            return E_INVALIDARG;
+        }
+        // SAFETY: `guid` vérifié non-nul.
+        let key = (this as usize, unsafe { ptr::read_unaligned(guid) });
+        let mut map = PRIVATE_DATA.lock();
+        if data_size == 0 || data.is_null() {
+            map.remove(&key);
+            return S_OK;
+        }
+        // SAFETY: l'appelant garantit `data_size` octets lisibles à `data`.
+        let slice = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), data_size as usize) };
+        map.insert(key, PrivateDataEntry::Bytes(slice.to_vec()));
+        sb_debug!(
+            CHANNEL,
+            "SetPrivateData(obj={this:p}, guid={}, len={data_size}) -> S_OK",
+            key.1
+        );
+        S_OK
+    })
+}
+
+/// `ID3D12Object::SetPrivateDataInterface` (slot 5) / `IDXGIObject::SetPrivateDataInterface` (slot 4).
+extern "win64" fn d3d12_obj_set_private_data_interface(
+    this: *mut ComHeader,
+    guid: *const Guid,
+    data: *const c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "SetPrivateDataInterface", E_UNEXPECTED, {
+        if this.is_null() || guid.is_null() {
+            return E_INVALIDARG;
+        }
+        // SAFETY: `guid` vérifié non-nul.
+        let key = (this as usize, unsafe { ptr::read_unaligned(guid) });
+        let mut map = PRIVATE_DATA.lock();
+        if data.is_null() {
+            map.remove(&key);
+            return S_OK;
+        }
+        map.insert(key, PrivateDataEntry::Interface(data as usize));
+        sb_debug!(
+            CHANNEL,
+            "SetPrivateDataInterface(obj={this:p}, guid={}, iface={data:p}) -> S_OK",
+            key.1
+        );
+        S_OK
+    })
+}
+
+/// `ID3D12Object::SetName` (slot 6).
+extern "win64" fn d3d12_obj_set_name(_this: *mut ComHeader, _name: *const u16) -> HResult {
+    S_OK
+}
+
+/// `ID3D12DeviceChild::GetDevice` (slot 7) : renvoie le périphérique `ID3D12Device` actif
+/// (ou `IDXGIDevice` si demandé via `riid`), avec incrément de référence COM.
+extern "win64" fn d3d12_child_get_device(
+    _this: *mut ComHeader,
+    riid: *const Guid,
+    ppv_device: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ID3D12DeviceChild::GetDevice", E_UNEXPECTED, {
+        if ppv_device.is_null() {
+            return E_POINTER;
+        }
+        let dev = LAST_D3D12_DEVICE.load(Ordering::Acquire);
+        if dev == 0 {
+            // SAFETY: `ppv_device` vérifié non-nul.
+            unsafe { *ppv_device = ptr::null_mut() };
+            return E_FAIL;
+        }
+        let hr = device_qi(dev as *mut ComHeader, riid, ppv_device);
+        sb_debug!(CHANNEL, "ID3D12DeviceChild::GetDevice() -> {hr:#x}");
+        hr
+    })
+}
+
+/// Remplit les slots `ID3D12Object` (`3..=6`) sur une vtable D3D12.
+const fn fill_d3d12_object_slots(slots: &mut [VtblSlot; VT_PAD_LEN]) {
+    slots[3] = vslot(d3d12_obj_get_private_data as *const c_void);
+    slots[4] = vslot(d3d12_obj_set_private_data as *const c_void);
+    slots[5] = vslot(d3d12_obj_set_private_data_interface as *const c_void);
+    slots[6] = vslot(d3d12_obj_set_name as *const c_void);
+}
+
+/// Remplit les slots `ID3D12DeviceChild` (`3..=7`) sur une vtable D3D12.
+const fn fill_d3d12_child_slots(slots: &mut [VtblSlot; VT_PAD_LEN]) {
+    fill_d3d12_object_slots(slots);
+    slots[7] = vslot(d3d12_child_get_device as *const c_void);
+}
+
+/// Remplit les slots `IDXGIObject` (`3..=5`) sur une vtable DXGI.
+const fn fill_dxgi_object_slots(slots: &mut [VtblSlot; VT_PAD_LEN]) {
+    slots[3] = vslot(d3d12_obj_set_private_data as *const c_void);
+    slots[4] = vslot(d3d12_obj_set_private_data_interface as *const c_void);
+    slots[5] = vslot(d3d12_obj_get_private_data as *const c_void);
 }
 
 // ==================== Slots de réserve des vtables D3D12 / DXGI ====================
@@ -670,10 +1086,18 @@ fn d3d_known_object_name(this: usize) -> Option<&'static str> {
     let vtbl = original_vtbl(usize::from_le_bytes([
         head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
     ]) as *const c_void) as usize;
-    let known: [(usize, &'static str); 12] = [
+    let known: &[(usize, &'static str)] = &[
         (
             (&raw const D3D12_ROOTSIG_VTBL) as usize,
             "ID3D12RootSignature",
+        ),
+        (
+            (&raw const D3D12_CMDSIG_VTBL) as usize,
+            "ID3D12CommandSignature",
+        ),
+        (
+            (&raw const D3D12_QUERY_HEAP_VTBL) as usize,
+            "ID3D12QueryHeap",
         ),
         ((&raw const D3D12_PSO_VTBL) as usize, "ID3D12PipelineState"),
         (
@@ -691,8 +1115,19 @@ fn d3d_known_object_name(this: usize) -> Option<&'static str> {
             (&raw const D3D12_CMDLIST_VTBL) as usize,
             "ID3D12GraphicsCommandList",
         ),
+        (
+            (&raw const D3D12_CONSOLE_CMDLIST_VTBL) as usize,
+            "ID3D12GraphicsCommandList",
+        ),
+        (
+            (&raw const D3D12_DMA_CMDLIST_VTBL) as usize,
+            "ID3D12DmaCommandList",
+        ),
         ((&raw const D3D12_QUEUE_VTBL) as usize, "ID3D12CommandQueue"),
         ((&raw const D3D12_DEVICE_VTBL) as usize, "ID3D12Device"),
+        ((&raw const DXGI_DEVICE_VTBL) as usize, "IDXGIDevice"),
+        ((&raw const DXGI_ADAPTER_VTBL) as usize, "IDXGIAdapter"),
+        ((&raw const DXGI_OUTPUT_VTBL) as usize, "IDXGIOutput"),
         ((&raw const DXGI_SC3_VTBL) as usize, "IDXGISwapChain3"),
         ((&raw const DXGI_FACTORY4_VTBL) as usize, "IDXGIFactory4"),
     ];
@@ -1038,18 +1473,146 @@ extern "win64" fn rootsig_qi(
 
 const fn build_rootsig_vtbl() -> D3D12RootSigVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 8 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(rootsig_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
     D3D12RootSigVtbl { slots }
 }
 
 static D3D12_ROOTSIG_VTBL: D3D12RootSigVtbl = build_rootsig_vtbl();
+
+// --- ID3D12CommandSignature ---
+
+#[repr(C)]
+struct D3D12CmdSigVtbl {
+    slots: [VtblSlot; VT_PAD_LEN],
+}
+
+#[repr(C)]
+struct D3D12CmdSigObject {
+    header: ComHeader,
+    byte_stride: u32,
+}
+
+extern "win64" fn cmdsig_qi(
+    this: *mut ComHeader,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    com_query_interface_list(
+        "ID3D12CommandSignature",
+        this,
+        riid,
+        ppv,
+        &[IID_ID3D12COMMANDSIGNATURE, IID_ID3D12OBJECT],
+    )
+}
+
+const fn build_cmdsig_vtbl() -> D3D12CmdSigVtbl {
+    let mut slots = UNIMPL_SLOTS;
+    slots[0] = vslot(cmdsig_qi as *const c_void);
+    slots[1] = vslot(com_add_ref as *const c_void);
+    slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
+    D3D12CmdSigVtbl { slots }
+}
+
+static D3D12_CMDSIG_VTBL: D3D12CmdSigVtbl = build_cmdsig_vtbl();
+
+// --- ID3D12QueryHeap (slot 42 : CreateQueryHeap) ---
+
+#[repr(C)]
+struct D3D12QueryHeapVtbl {
+    slots: [VtblSlot; VT_PAD_LEN],
+}
+
+#[repr(C)]
+struct D3D12QueryHeapObject {
+    header: ComHeader,
+    heap_type: u32,
+    count: u32,
+}
+
+extern "win64" fn query_heap_qi(
+    this: *mut ComHeader,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    com_query_interface_list(
+        "ID3D12QueryHeap",
+        this,
+        riid,
+        ppv,
+        &[IID_ID3D12QUERYHEAP, IID_ID3D12OBJECT],
+    )
+}
+
+const fn build_query_heap_vtbl() -> D3D12QueryHeapVtbl {
+    let mut slots = UNIMPL_SLOTS;
+    slots[0] = vslot(query_heap_qi as *const c_void);
+    slots[1] = vslot(com_add_ref as *const c_void);
+    slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
+    D3D12QueryHeapVtbl { slots }
+}
+
+static D3D12_QUERY_HEAP_VTBL: D3D12QueryHeapVtbl = build_query_heap_vtbl();
+
+// --- ID3D12RootSignatureDeserializer / ID3D12VersionedRootSignatureDeserializer ---
+
+#[repr(C)]
+struct D3D12RootSigDeserVtbl {
+    slots: [VtblSlot; 5],
+}
+
+#[repr(C)]
+struct D3D12RootSigDeserObject {
+    header: ComHeader,
+    desc: D3D12VersionedRootSignatureDesc,
+}
+
+extern "win64" fn rootsig_deser_qi(
+    this: *mut ComHeader,
+    riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> HResult {
+    com_query_interface_list("ID3D12RootSignatureDeserializer", this, riid, ppv, &[])
+}
+
+extern "win64" fn rootsig_deser_get_desc(
+    this: *mut D3D12RootSigDeserObject,
+) -> *const D3D12RootSignatureDesc {
+    if this.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: `this` est un `D3D12RootSigDeserObject` valide.
+    unsafe { &raw const (*this).desc.desc }
+}
+
+extern "win64" fn rootsig_deser_get_unconverted_desc(
+    this: *mut D3D12RootSigDeserObject,
+) -> *const D3D12VersionedRootSignatureDesc {
+    if this.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: `this` est un `D3D12RootSigDeserObject` valide.
+    unsafe { &raw const (*this).desc }
+}
+
+const fn build_rootsig_deser_vtbl() -> D3D12RootSigDeserVtbl {
+    D3D12RootSigDeserVtbl {
+        slots: [
+            vslot(rootsig_deser_qi as *const c_void),
+            vslot(com_add_ref as *const c_void),
+            vslot(com_release as *const c_void),
+            vslot(rootsig_deser_get_desc as *const c_void),
+            vslot(rootsig_deser_get_unconverted_desc as *const c_void),
+        ],
+    }
+}
+
+static D3D12_ROOTSIG_DESER_VTBL: D3D12RootSigDeserVtbl = build_rootsig_deser_vtbl();
 
 // --- ID3D12PipelineState ---
 
@@ -1081,14 +1644,10 @@ extern "win64" fn pso_qi(
 
 const fn build_pso_vtbl() -> D3D12PsoVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 9 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(pso_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
     D3D12PsoVtbl { slots }
 }
 
@@ -1122,6 +1681,19 @@ extern "win64" fn heap_qi(
     )
 }
 
+extern "win64" fn heap_get_desc(
+    this: *mut D3D12DescHeapObject,
+    out_desc: *mut D3D12DescriptorHeapDesc,
+) -> *mut D3D12DescriptorHeapDesc {
+    if !this.is_null() && !out_desc.is_null() {
+        // SAFETY: `this` et `out_desc` vérifiés non-nuls (ABI Win64 retour struct > 8o en RDX).
+        unsafe {
+            *out_desc = (*this).desc;
+        }
+    }
+    out_desc
+}
+
 extern "win64" fn heap_get_cpu_start(this: *mut D3D12DescHeapObject) -> usize {
     if this.is_null() {
         return 0;
@@ -1140,14 +1712,11 @@ extern "win64" fn heap_get_gpu_start(this: *mut D3D12DescHeapObject) -> u64 {
 
 const fn build_heap_vtbl() -> D3D12DescHeapVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 12 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(heap_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
+    slots[8] = vslot(heap_get_desc as *const c_void);
     // Slots 9 & 10 : ABI C / x86_64-pc-windows-gnu (retour `SIZE_T` / `UINT64` dans RAX).
     slots[9] = vslot(heap_get_cpu_start as *const c_void);
     slots[10] = vslot(heap_get_gpu_start as *const c_void);
@@ -1196,14 +1765,10 @@ extern "win64" fn d3dheap_get_desc(
 
 const fn build_d3dheap_vtbl() -> D3D12HeapVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 10 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(d3dheap_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
     slots[8] = vslot(d3dheap_get_desc as *const c_void);
     D3D12HeapVtbl { slots }
 }
@@ -1337,21 +1902,96 @@ extern "win64" fn res_write_to_subresource(
     S_OK
 }
 
+extern "win64" fn res_read_from_subresource(
+    this: *mut D3D12ResourceObject,
+    dst_data: *mut u8,
+    dst_row_pitch: u32,
+    _dst_depth_pitch: u32,
+    _src_subresource: u32,
+    _src_box: *const c_void,
+) -> HResult {
+    ffi_guard!(
+        CHANNEL,
+        "ID3D12Resource::ReadFromSubresource",
+        E_UNEXPECTED,
+        {
+            if this.is_null() || dst_data.is_null() {
+                return E_INVALIDARG;
+            }
+            // SAFETY: `this` et `dst_data` vérifiés non-nuls.
+            let res = unsafe { &*this };
+            let (row_bytes, num_rows) = texture_row_layout(
+                (res.desc.width as u32).max(1),
+                res.desc.height.max(1),
+                res.desc.format,
+            );
+            let pitch = (dst_row_pitch as usize).max(row_bytes);
+            let src = res.backing.lock();
+            for y in 0..num_rows {
+                let s_off = res.heap_offset + y * row_bytes;
+                if s_off + row_bytes > src.len() {
+                    break;
+                }
+                // SAFETY: l'appelant garantit `num_rows` lignes de `pitch` octets à `dst_data`.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        src[s_off..s_off + row_bytes].as_ptr(),
+                        dst_data.add(y * pitch),
+                        row_bytes,
+                    );
+                }
+            }
+            S_OK
+        }
+    )
+}
+
+extern "win64" fn res_get_heap_properties(
+    this: *mut D3D12ResourceObject,
+    out_props: *mut D3D12HeapProperties,
+    out_flags: *mut u32,
+) -> HResult {
+    ffi_guard!(
+        CHANNEL,
+        "ID3D12Resource::GetHeapProperties",
+        E_UNEXPECTED,
+        {
+            if this.is_null() {
+                return E_INVALIDARG;
+            }
+            if !out_props.is_null() {
+                let props = D3D12HeapProperties {
+                    heap_type: 4,              // D3D12_HEAP_TYPE_CUSTOM (UMA console)
+                    cpu_page_property: 3,      // D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+                    memory_pool_preference: 1, // D3D12_MEMORY_POOL_L0
+                    creation_node_mask: 1,
+                    visible_node_mask: 1,
+                };
+                // SAFETY: `out_props` vérifié non-nul.
+                unsafe { ptr::write_unaligned(out_props, props) };
+            }
+            if !out_flags.is_null() {
+                // SAFETY: `out_flags` vérifié non-nul.
+                unsafe { ptr::write_unaligned(out_flags, 0) };
+            }
+            S_OK
+        }
+    )
+}
+
 const fn build_res_vtbl() -> D3D12ResourceVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 16 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(res_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
     slots[8] = vslot(res_map as *const c_void);
     slots[9] = vslot(res_unmap as *const c_void);
     slots[10] = vslot(res_get_desc as *const c_void);
     slots[11] = vslot(res_get_gpu_va as *const c_void);
     slots[12] = vslot(res_write_to_subresource as *const c_void);
+    slots[13] = vslot(res_read_from_subresource as *const c_void);
+    slots[14] = vslot(res_get_heap_properties as *const c_void);
     D3D12ResourceVtbl { slots }
 }
 
@@ -1436,6 +2076,35 @@ struct D3D12FenceVtbl {
 struct D3D12FenceObject {
     header: ComHeader,
     completed: AtomicU64,
+    waiters: Mutex<Vec<(u64, usize)>>,
+}
+
+const _: () = {
+    assert!(offset_of!(D3D12FenceObject, completed) == 16);
+};
+
+impl D3D12FenceObject {
+    fn signal_value(&self, value: u64) {
+        let prev = self.completed.fetch_max(value, Ordering::AcqRel);
+        let now = prev.max(value);
+        let mut to_wake = Vec::new();
+        {
+            let mut waiters = self.waiters.lock();
+            waiters.retain(|&(target, handle)| {
+                if now >= target {
+                    to_wake.push(handle);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for handle in to_wake {
+            if handle != 0 {
+                sync::SetEvent(handle);
+            }
+        }
+    }
 }
 
 extern "win64" fn fence_qi(
@@ -1443,7 +2112,13 @@ extern "win64" fn fence_qi(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> HResult {
-    com_query_interface_list("ID3D12Fence", this, riid, ppv, &[IID_ID3D12FENCE])
+    com_query_interface_list(
+        "ID3D12Fence",
+        this,
+        riid,
+        ppv,
+        &[IID_ID3D12FENCE, IID_ID3D12FENCE1, IID_ID3D12OBJECT],
+    )
 }
 
 extern "win64" fn fence_get_completed(this: *mut D3D12FenceObject) -> u64 {
@@ -1451,7 +2126,8 @@ extern "win64" fn fence_get_completed(this: *mut D3D12FenceObject) -> u64 {
         return 0;
     }
     // SAFETY: `this` est un `D3D12FenceObject` valide.
-    unsafe { (*this).completed.load(Ordering::Acquire) }
+    let f = unsafe { &*this };
+    f.completed.load(Ordering::Acquire)
 }
 
 extern "win64" fn fence_set_event(
@@ -1463,9 +2139,16 @@ extern "win64" fn fence_set_event(
         return E_INVALIDARG;
     }
     // SAFETY: `this` est un `D3D12FenceObject` valide.
-    let current = unsafe { (*this).completed.load(Ordering::Acquire) };
-    if current >= value && event_handle != 0 {
+    let f = unsafe { &*this };
+    if event_handle == 0 {
+        return S_OK;
+    }
+    let mut waiters = f.waiters.lock();
+    if f.completed.load(Ordering::Acquire) >= value {
+        drop(waiters);
         sync::SetEvent(event_handle);
+    } else {
+        waiters.push((value, event_handle));
     }
     S_OK
 }
@@ -1475,25 +2158,36 @@ extern "win64" fn fence_signal(this: *mut D3D12FenceObject, value: u64) -> HResu
         return E_INVALIDARG;
     }
     // SAFETY: `this` est un `D3D12FenceObject` valide.
-    unsafe {
-        (*this).completed.store(value, Ordering::Release);
-    }
+    let f = unsafe { &*this };
+    f.signal_value(value);
     S_OK
+}
+
+/// `ID3D12Fence::slot 12` (console Xbox `d3d12_xs`) : retourne directement dans `RAX` le
+/// pointeur (`const volatile UINT64*`) vers le compteur 64 bits `completed` en mémoire unifiée,
+/// afin que le titre lise `*pCompletedValue` sans appel COM (et vérifie `!= UINT64_MAX`).
+extern "win64" fn fence_slot12_get_completed_address(this: *mut D3D12FenceObject) -> *const u64 {
+    ffi_guard!(CHANNEL, "ID3D12Fence::slot12", ptr::null(), {
+        if this.is_null() {
+            return ptr::null();
+        }
+        // SAFETY: `this` est un `D3D12FenceObject` immobile en tas dont `completed: AtomicU64`
+        // partage le layout mémoire exact d'un `u64` naturellement aligné (offset 16).
+        unsafe { core::ptr::addr_of!((*this).completed).cast::<u64>() }
+    })
 }
 
 const fn build_fence_vtbl() -> D3D12FenceVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 12 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(fence_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
     slots[8] = vslot(fence_get_completed as *const c_void);
     slots[9] = vslot(fence_set_event as *const c_void);
     slots[10] = vslot(fence_signal as *const c_void);
+    slots[11] = vslot(noop_ok as *const c_void); // ID3D12Fence1::GetCreationFlags -> 0
+    slots[12] = vslot(fence_slot12_get_completed_address as *const c_void);
     D3D12FenceVtbl { slots }
 }
 
@@ -1527,14 +2221,10 @@ extern "win64" fn alloc_qi(
 
 const fn build_alloc_vtbl() -> D3D12CmdAllocVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 10 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(alloc_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
     slots[8] = vslot(noop_ok as *const c_void); // Reset
     D3D12CmdAllocVtbl { slots }
 }
@@ -1551,6 +2241,13 @@ enum RecordedOp {
     CopyBufferResource {
         dst: usize,
         src: usize,
+    },
+    CopyBufferRegion {
+        dst: usize,
+        dst_offset: u64,
+        src: usize,
+        src_offset: u64,
+        num_bytes: u64,
     },
     UploadTexture {
         dst: usize,
@@ -1576,6 +2273,15 @@ enum RecordedOp {
         handle: usize,
         slot: u32,
     },
+    WriteValue32 {
+        address: u64,
+        value: u32,
+    },
+    WriteValue64 {
+        address: u64,
+        value: u64,
+        flags: u32,
+    },
 }
 
 #[repr(C)]
@@ -1586,11 +2292,24 @@ struct D3D12CmdListVtbl {
 #[repr(C)]
 struct D3D12CmdListObject {
     header: ComHeader,
+    /// En-tête de tampon de commandes en ligne de la console (`+0x10..+0x570`) : mis à zéro
+    /// pour que `write_ptr (+0x18) == buffer_end (+0x30) == 0`, ce qui force tout code inline
+    /// du SDK console à passer proprement par les appels virtuels COM sans corrompre l'état Rust.
+    console_inline_pad: [u8; 0x560],
     ops: Mutex<Vec<RecordedOp>>,
     closed: Mutex<bool>,
     graphics_root_regs: Mutex<Vec<u32>>,
     compute_root_regs: Mutex<Vec<u32>>,
+    /// Arènes d'upload allouées via `AllocateUploadMemory` (slot 148).
+    upload_arenas: Mutex<Vec<Vec<u8>>>,
+    /// Type de liste de commandes (`D3D12_COMMAND_LIST_TYPE` : 0=DIRECT, 2=COMPUTE, 3=COPY, 6=DMA).
+    list_type: u32,
 }
+
+const _: () = {
+    assert!(offset_of!(D3D12CmdListObject, console_inline_pad) == 0x10);
+    assert!(offset_of!(D3D12CmdListObject, ops) >= 0x570);
+};
 
 impl D3D12CmdListObject {
     fn resolve_gfx_slot(&self, root_param_idx: u32) -> u32 {
@@ -1629,7 +2348,13 @@ extern "win64" fn cmdlist_qi(
         this,
         riid,
         ppv,
-        &[IID_ID3D12GRAPHICSCOMMANDLIST],
+        &[
+            IID_ID3D12GRAPHICSCOMMANDLIST,
+            IID_ID3D12GRAPHICSCOMMANDLIST1,
+            IID_ID3D12GRAPHICSCOMMANDLIST2,
+            IID_ID3D12CONSDMACOMMANDLIST,
+            IID_ID3D12OBJECT,
+        ],
     )
 }
 
@@ -1657,8 +2382,8 @@ extern "win64" fn cmdlist_reset(
     ops.clear();
     cl.graphics_root_regs.lock().clear();
     cl.compute_root_regs.lock().clear();
-    if !initial_state.is_null() {
-        // SAFETY: `initial_state` est un `D3D12PsoObject` valide.
+    if d3d_known_object_name(initial_state as usize) == Some("ID3D12PipelineState") {
+        // SAFETY: `initial_state` validé comme `D3D12PsoObject` du bridge.
         let pso = unsafe { &*initial_state };
         let rc = if pso.is_compute {
             RenderCommand::SetComputePipeline {
@@ -1816,10 +2541,13 @@ extern "win64" fn cmdlist_copy_resource(
     dst: *mut D3D12ResourceObject,
     src: *mut D3D12ResourceObject,
 ) {
-    if this.is_null() || dst.is_null() || src.is_null() {
+    if this.is_null()
+        || d3d_known_object_name(dst as usize) != Some("ID3D12Resource")
+        || d3d_known_object_name(src as usize) != Some("ID3D12Resource")
+    {
         return;
     }
-    // SAFETY: `this`, `dst`, `src` vérifiés non-nuls.
+    // SAFETY: `this` non-nul, `dst` et `src` validés comme `ID3D12Resource` du bridge.
     let cl = unsafe { &*this };
     let src_is_bb = unsafe { (*src).is_backbuffer };
     if src_is_bb {
@@ -1840,12 +2568,17 @@ extern "win64" fn cmdlist_rs_set_viewports(
     num_viewports: u32,
     viewports: *const D3D12Viewport,
 ) {
-    if this.is_null() || num_viewports == 0 || viewports.is_null() {
+    if this.is_null()
+        || num_viewports == 0
+        || viewports.is_null()
+        || sb_loader::trampoline::peek_memory(viewports as usize, size_of::<D3D12Viewport>()).len()
+            != size_of::<D3D12Viewport>()
+    {
         return;
     }
-    // SAFETY: `this` et `viewports` vérifiés non-nuls.
+    // SAFETY: `this` non-nul et `viewports` lisible via `peek_memory`.
     let cl = unsafe { &*this };
-    let vp = unsafe { *viewports };
+    let vp = unsafe { ptr::read_unaligned(viewports) };
     cl.ops
         .lock()
         .push(RecordedOp::Render(RenderCommand::SetViewport {
@@ -1861,12 +2594,17 @@ extern "win64" fn cmdlist_rs_set_scissor_rects(
     num_rects: u32,
     rects: *const D3D12Rect,
 ) {
-    if this.is_null() || num_rects == 0 || rects.is_null() {
+    if this.is_null()
+        || num_rects == 0
+        || rects.is_null()
+        || sb_loader::trampoline::peek_memory(rects as usize, size_of::<D3D12Rect>()).len()
+            != size_of::<D3D12Rect>()
+    {
         return;
     }
-    // SAFETY: `this` et `rects` vérifiés non-nuls.
+    // SAFETY: `this` non-nul et `rects` lisible via `peek_memory`.
     let cl = unsafe { &*this };
-    let r = unsafe { *rects };
+    let r = unsafe { ptr::read_unaligned(rects) };
     let w = (r.right - r.left).max(1) as u32;
     let h = (r.bottom - r.top).max(1) as u32;
     cl.ops
@@ -1883,10 +2621,10 @@ extern "win64" fn cmdlist_set_pipeline_state(
     this: *mut D3D12CmdListObject,
     pso: *mut D3D12PsoObject,
 ) {
-    if this.is_null() || pso.is_null() {
+    if this.is_null() || d3d_known_object_name(pso as usize) != Some("ID3D12PipelineState") {
         return;
     }
-    // SAFETY: `this` et `pso` vérifiés non-nuls.
+    // SAFETY: `this` non-nul et `pso` validé comme `ID3D12PipelineState` du bridge.
     let cl = unsafe { &*this };
     let p = unsafe { &*pso };
     let rc = if p.is_compute {
@@ -1905,10 +2643,10 @@ extern "win64" fn cmdlist_set_compute_root_sig(
     this: *mut D3D12CmdListObject,
     root_sig: *mut D3D12RootSigObject,
 ) {
-    if this.is_null() || root_sig.is_null() {
+    if this.is_null() || d3d_known_object_name(root_sig as usize) != Some("ID3D12RootSignature") {
         return;
     }
-    // SAFETY: `this` et `root_sig` vérifiés non-nuls.
+    // SAFETY: `this` non-nul et `root_sig` validé comme `ID3D12RootSignature` du bridge.
     let cl = unsafe { &*this };
     let rs = unsafe { &*root_sig };
     *cl.compute_root_regs.lock() = rs.param_registers.clone();
@@ -1918,10 +2656,10 @@ extern "win64" fn cmdlist_set_graphics_root_sig(
     this: *mut D3D12CmdListObject,
     root_sig: *mut D3D12RootSigObject,
 ) {
-    if this.is_null() || root_sig.is_null() {
+    if this.is_null() || d3d_known_object_name(root_sig as usize) != Some("ID3D12RootSignature") {
         return;
     }
-    // SAFETY: `this` et `root_sig` vérifiés non-nuls.
+    // SAFETY: `this` non-nul et `root_sig` validé comme `ID3D12RootSignature` du bridge.
     let cl = unsafe { &*this };
     let rs = unsafe { &*root_sig };
     *cl.graphics_root_regs.lock() = rs.param_registers.clone();
@@ -1968,13 +2706,14 @@ extern "win64" fn cmdlist_set_compute_root_32bit_constants(
     src_data: *const u32,
     _dest_offset: u32,
 ) {
-    if this.is_null() || src_data.is_null() || num_32bit_values == 0 {
+    if this.is_null() || src_data.is_null() || num_32bit_values == 0 || num_32bit_values > 256 {
         return;
     }
-    // SAFETY: `src_data` pointe vers `num_32bit_values` mots 32 bits.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(src_data.cast::<u8>(), (num_32bit_values as usize) * 4).to_vec()
-    };
+    let byte_len = (num_32bit_values as usize) * 4;
+    let bytes = sb_loader::trampoline::peek_memory(src_data as usize, byte_len);
+    if bytes.len() != byte_len {
+        return;
+    }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
     let slot = cl.resolve_compute_slot(root_param_idx);
@@ -1993,13 +2732,14 @@ extern "win64" fn cmdlist_set_graphics_root_32bit_constants(
     src_data: *const u32,
     _dest_offset: u32,
 ) {
-    if this.is_null() || src_data.is_null() || num_32bit_values == 0 {
+    if this.is_null() || src_data.is_null() || num_32bit_values == 0 || num_32bit_values > 256 {
         return;
     }
-    // SAFETY: `src_data` pointe vers `num_32bit_values` mots 32 bits.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(src_data.cast::<u8>(), (num_32bit_values as usize) * 4).to_vec()
-    };
+    let byte_len = (num_32bit_values as usize) * 4;
+    let bytes = sb_loader::trampoline::peek_memory(src_data as usize, byte_len);
+    if bytes.len() != byte_len {
+        return;
+    }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
     let slot = cl.resolve_gfx_slot(root_param_idx);
@@ -2066,12 +2806,20 @@ extern "win64" fn cmdlist_ia_set_index_buffer(
     this: *mut D3D12CmdListObject,
     view: *const D3D12IndexBufferView,
 ) {
-    if this.is_null() || view.is_null() {
+    if this.is_null()
+        || view.is_null()
+        || sb_loader::trampoline::peek_memory(view as usize, size_of::<D3D12IndexBufferView>())
+            .len()
+            != size_of::<D3D12IndexBufferView>()
+    {
         return;
     }
-    // SAFETY: `view` valide.
-    let v = unsafe { *view };
-    if v.buffer_location == 0 || v.size_in_bytes == 0 {
+    // SAFETY: `view` vérifié lisible via `peek_memory`.
+    let v = unsafe { ptr::read_unaligned(view) };
+    if v.buffer_location == 0
+        || v.size_in_bytes == 0
+        || sb_loader::trampoline::peek_memory(v.buffer_location as usize, 1).is_empty()
+    {
         return;
     }
     // SAFETY: `v.buffer_location` pointe vers `v.size_in_bytes` octets d'indices.
@@ -2096,12 +2844,21 @@ extern "win64" fn cmdlist_ia_set_vertex_buffers(
     num_views: u32,
     views: *const D3D12VertexBufferView,
 ) {
-    if this.is_null() || num_views == 0 || views.is_null() {
+    if this.is_null()
+        || num_views == 0
+        || views.is_null()
+        || sb_loader::trampoline::peek_memory(views as usize, size_of::<D3D12VertexBufferView>())
+            .len()
+            != size_of::<D3D12VertexBufferView>()
+    {
         return;
     }
-    // SAFETY: `views` pointe vers au moins `num_views` `D3D12VertexBufferView`.
-    let view = unsafe { *views };
-    if view.buffer_location == 0 || view.size_in_bytes == 0 {
+    // SAFETY: `views` vérifié lisible pour au moins un `D3D12VertexBufferView`.
+    let view = unsafe { ptr::read_unaligned(views) };
+    if view.buffer_location == 0
+        || view.size_in_bytes == 0
+        || sb_loader::trampoline::peek_memory(view.buffer_location as usize, 1).is_empty()
+    {
         return;
     }
     let bytes = unsafe {
@@ -2147,18 +2904,146 @@ extern "win64" fn cmdlist_clear_rtv(
     _num_rects: u32,
     _rects: *const D3D12Rect,
 ) {
-    if this.is_null() || color_rgba.is_null() {
+    if this.is_null()
+        || color_rgba.is_null()
+        || sb_loader::trampoline::peek_memory(color_rgba as usize, 16).len() != 16
+    {
         return;
     }
-    // SAFETY: `this` et `color_rgba` vérifiés non-nuls.
+    // SAFETY: `this` et `color_rgba` vérifiés lisibles.
     let cl = unsafe { &*this };
-    let rgba = unsafe { *color_rgba };
+    let rgba = unsafe { ptr::read_unaligned(color_rgba) };
     cl.ops
         .lock()
         .push(RecordedOp::Render(RenderCommand::Clear { rgba }));
 }
 
-extern "win64" fn cmdlist_noop_void() {}
+extern "win64" fn cmdlist_copy_buffer_region(
+    this: *mut D3D12CmdListObject,
+    dst: *mut D3D12ResourceObject,
+    dst_offset: u64,
+    src: *mut D3D12ResourceObject,
+    src_offset: u64,
+    num_bytes: u64,
+) {
+    if this.is_null() || dst.is_null() || src.is_null() || num_bytes == 0 {
+        return;
+    }
+    if !is_d3d12_resource(dst as usize) || !is_d3d12_resource(src as usize) {
+        return;
+    }
+    // SAFETY: `this` vérifié non-nul.
+    let cl = unsafe { &*this };
+    cl.ops.lock().push(RecordedOp::CopyBufferRegion {
+        dst: dst as usize,
+        dst_offset,
+        src: src as usize,
+        src_offset,
+        num_bytes,
+    });
+}
+
+extern "win64" fn cmdlist_write_value32(
+    this: *mut D3D12CmdListObject,
+    address: u64,
+    value: u32,
+    _flush: u32,
+    _flags: u32,
+) {
+    if this.is_null() || address == 0 {
+        return;
+    }
+    // SAFETY: `this` vérifié non-nul.
+    let cl = unsafe { &*this };
+    cl.ops
+        .lock()
+        .push(RecordedOp::WriteValue32 { address, value });
+}
+
+extern "win64" fn cmdlist_write_value64(
+    this: *mut D3D12CmdListObject,
+    address: u64,
+    value: u64,
+    _flush: u32,
+    flags: u32,
+) {
+    if this.is_null() || address == 0 {
+        return;
+    }
+    // SAFETY: `this` vérifié non-nul.
+    let cl = unsafe { &*this };
+    cl.ops.lock().push(RecordedOp::WriteValue64 {
+        address,
+        value,
+        flags,
+    });
+}
+
+extern "win64" fn cmdlist_wait_value32(
+    _this: *mut D3D12CmdListObject,
+    address: u64,
+    value: u32,
+    mask: u32,
+    _flags: u32,
+) {
+    sb_trace!(
+        CHANNEL,
+        "ID3D12GraphicsCommandList::WaitValue32(addr={address:#x}, val={value:#x}, mask={mask:#x})"
+    );
+}
+
+extern "win64" fn cmdlist_wait_value64(
+    _this: *mut D3D12CmdListObject,
+    address: u64,
+    value: u64,
+    mask: u64,
+    _flags: u32,
+) {
+    sb_trace!(
+        CHANNEL,
+        "ID3D12GraphicsCommandList::WaitValue64(addr={address:#x}, val={value:#x}, mask={mask:#x})"
+    );
+}
+
+/// `ID3D12GraphicsCommandList::AllocateUploadMemory` (slot 148 console) : alloue un tampon
+/// aligné dans la mémoire unifiée CPU/GPU (adresse directe utilisable en écriture CPU et en
+/// `GPUVirtualAddress` côté shaders).
+extern "win64" fn cmdlist_allocate_upload_memory(
+    this: *mut D3D12CmdListObject,
+    size: u64,
+    alignment: u64,
+) -> *mut c_void {
+    ffi_guard!(CHANNEL, "AllocateUploadMemory", ptr::null_mut(), {
+        if this.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: `this` vérifié non-nul.
+        let cl = unsafe { &*this };
+        let align = (alignment as usize).max(16).next_power_of_two().min(65536);
+        let sz = (size as usize).max(16);
+        let mut buf = vec![0u8; sz + align];
+        let raw = buf.as_mut_ptr() as usize;
+        let aligned = (raw + align - 1) & !(align - 1);
+        ALLOCATED_BUFFER_SIZES.lock().insert(aligned, sz);
+        cl.upload_arenas.lock().push(buf);
+        aligned as *mut c_void
+    })
+}
+
+/// `ID3D12CommandList::GetType` (slot 8).
+extern "win64" fn cmdlist_get_type(this: *mut D3D12CmdListObject) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    // SAFETY: `this` est un `D3D12CmdListObject` valide.
+    unsafe { (*this).list_type }
+}
+
+/// Retourne `S_OK` (0 dans `RAX`) : sans effet pour les méthodes `void` (registre `RAX`
+/// volatile en ABI Win64) et sûr si un slot console renvoie un `HRESULT`.
+extern "win64" fn cmdlist_noop_void() -> HResult {
+    S_OK
+}
 
 const fn build_cmdlist_vtbl() -> D3D12CmdListVtbl {
     let mut slots = UNIMPL_SLOTS;
@@ -2170,16 +3055,21 @@ const fn build_cmdlist_vtbl() -> D3D12CmdListVtbl {
     slots[0] = vslot(cmdlist_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
+    slots[8] = vslot(cmdlist_get_type as *const c_void);
     slots[9] = vslot(cmdlist_close as *const c_void);
     slots[10] = vslot(cmdlist_reset as *const c_void);
     slots[12] = vslot(cmdlist_draw_instanced as *const c_void);
     slots[13] = vslot(cmdlist_draw_indexed_instanced as *const c_void);
     slots[14] = vslot(cmdlist_dispatch as *const c_void);
+    slots[15] = vslot(cmdlist_copy_buffer_region as *const c_void);
     slots[16] = vslot(cmdlist_copy_texture_region as *const c_void);
     slots[17] = vslot(cmdlist_copy_resource as *const c_void);
+    slots[20] = vslot(cmdlist_noop_void as *const c_void); // IASetPrimitiveTopology
     slots[21] = vslot(cmdlist_rs_set_viewports as *const c_void);
     slots[22] = vslot(cmdlist_rs_set_scissor_rects as *const c_void);
     slots[25] = vslot(cmdlist_set_pipeline_state as *const c_void);
+    slots[26] = vslot(cmdlist_noop_void as *const c_void); // ResourceBarrier
     slots[29] = vslot(cmdlist_set_compute_root_sig as *const c_void);
     slots[30] = vslot(cmdlist_set_graphics_root_sig as *const c_void);
     slots[31] = vslot(cmdlist_set_compute_root_desc_table as *const c_void);
@@ -2194,10 +3084,122 @@ const fn build_cmdlist_vtbl() -> D3D12CmdListVtbl {
     slots[44] = vslot(cmdlist_ia_set_vertex_buffers as *const c_void);
     slots[47] = vslot(cmdlist_clear_dsv as *const c_void);
     slots[48] = vslot(cmdlist_clear_rtv as *const c_void);
+    // Extensions console Xbox Series X (ABI publique d3d12_xs).
+    slots[70] = vslot(cmdlist_noop_void as *const c_void); // OMSetDepthBounds
+    slots[71] = vslot(cmdlist_write_value32 as *const c_void);
+    slots[72] = vslot(cmdlist_write_value64 as *const c_void);
+    slots[73] = vslot(cmdlist_wait_value32 as *const c_void);
+    slots[74] = vslot(cmdlist_wait_value64 as *const c_void);
+    slots[75] = vslot(cmdlist_noop_void as *const c_void); // SetPixelShaderDepthOrderX
+    slots[80] = vslot(cmdlist_noop_void as *const c_void); // ExecuteIndirect
+    slots[83] = vslot(cmdlist_copy_texture_region as *const c_void); // CopyTextureRegionX (ancien layout)
+    slots[85] = vslot(cmdlist_copy_texture_region as *const c_void); // CopyTextureRegionX (nouveau layout)
+    slots[108] = vslot(cmdlist_noop_void as *const c_void); // ResolveSubresourceRegion
+    slots[131] = vslot(cmdlist_noop_void as *const c_void); // Réglage console de liste de commandes
+    slots[132] = vslot(cmdlist_noop_void as *const c_void); // Réglage console de liste de commandes
+    slots[139] = vslot(cmdlist_reset as *const c_void); // Reset (console)
+    slots[146] = vslot(cmdlist_noop_void as *const c_void); // Barrier (enhanced)
+    slots[148] = vslot(cmdlist_allocate_upload_memory as *const c_void); // AllocateUploadMemory
     D3D12CmdListVtbl { slots }
 }
 
 static D3D12_CMDLIST_VTBL: D3D12CmdListVtbl = build_cmdlist_vtbl();
+
+/// Vtable `ID3D12GraphicsCommandList` **console Xbox Series X** (`d3d12_xs.h`) :
+/// décalage `+4` à partir de `SetDescriptorHeaps` (slot 32 au lieu de 28 sur PC), jusqu'à
+/// `ClearRenderTargetView` (slot 52 au lieu de 48), suivi des extensions console (`70..=148`).
+const fn build_console_cmdlist_vtbl() -> D3D12CmdListVtbl {
+    let mut slots = UNIMPL_SLOTS;
+    let mut pad = 0;
+    while pad < 64 {
+        slots[pad] = vslot(cmdlist_noop_void as *const c_void);
+        pad += 1;
+    }
+    slots[0] = vslot(cmdlist_qi as *const c_void);
+    slots[1] = vslot(com_add_ref as *const c_void);
+    slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
+    slots[8] = vslot(cmdlist_get_type as *const c_void);
+    slots[9] = vslot(cmdlist_close as *const c_void);
+    slots[10] = vslot(cmdlist_reset as *const c_void);
+    slots[12] = vslot(cmdlist_draw_instanced as *const c_void);
+    slots[13] = vslot(cmdlist_draw_indexed_instanced as *const c_void);
+    slots[14] = vslot(cmdlist_dispatch as *const c_void);
+    slots[15] = vslot(cmdlist_copy_buffer_region as *const c_void);
+    slots[16] = vslot(cmdlist_copy_texture_region as *const c_void);
+    slots[17] = vslot(cmdlist_copy_resource as *const c_void);
+    slots[20] = vslot(cmdlist_noop_void as *const c_void); // IASetPrimitiveTopology
+    slots[21] = vslot(cmdlist_rs_set_viewports as *const c_void);
+    slots[22] = vslot(cmdlist_rs_set_scissor_rects as *const c_void);
+    slots[25] = vslot(cmdlist_set_pipeline_state as *const c_void);
+    slots[26] = vslot(cmdlist_noop_void as *const c_void); // ResourceBarrier
+    // Décalage +4 console Xbox (`d3d12_xs_console_abi.md` §5.3).
+    slots[32] = vslot(cmdlist_noop_void as *const c_void); // SetDescriptorHeaps
+    slots[33] = vslot(cmdlist_set_compute_root_sig as *const c_void);
+    slots[34] = vslot(cmdlist_set_graphics_root_sig as *const c_void);
+    slots[35] = vslot(cmdlist_set_compute_root_desc_table as *const c_void);
+    slots[36] = vslot(cmdlist_set_graphics_root_desc_table as *const c_void);
+    slots[37] = vslot(cmdlist_noop_void as *const c_void); // SetComputeRoot32BitConstant
+    slots[38] = vslot(cmdlist_noop_void as *const c_void); // SetGraphicsRoot32BitConstant
+    slots[39] = vslot(cmdlist_set_compute_root_32bit_constants as *const c_void);
+    slots[40] = vslot(cmdlist_set_graphics_root_32bit_constants as *const c_void);
+    slots[41] = vslot(cmdlist_set_compute_root_cbv as *const c_void);
+    slots[42] = vslot(cmdlist_set_graphics_root_cbv as *const c_void);
+    slots[43] = vslot(cmdlist_set_compute_root_storage as *const c_void); // SetComputeRootSRV
+    slots[44] = vslot(cmdlist_set_graphics_root_cbv as *const c_void); // SetGraphicsRootSRV
+    slots[45] = vslot(cmdlist_set_compute_root_storage as *const c_void); // SetComputeRootUAV
+    slots[46] = vslot(cmdlist_set_graphics_root_cbv as *const c_void); // SetGraphicsRootUAV
+    slots[47] = vslot(cmdlist_ia_set_index_buffer as *const c_void);
+    slots[48] = vslot(cmdlist_ia_set_vertex_buffers as *const c_void);
+    slots[51] = vslot(cmdlist_clear_dsv as *const c_void);
+    slots[52] = vslot(cmdlist_clear_rtv as *const c_void);
+    // Extensions console Xbox Series X.
+    slots[70] = vslot(cmdlist_noop_void as *const c_void); // OMSetDepthBounds
+    slots[71] = vslot(cmdlist_write_value32 as *const c_void);
+    slots[72] = vslot(cmdlist_write_value64 as *const c_void);
+    slots[73] = vslot(cmdlist_wait_value32 as *const c_void);
+    slots[74] = vslot(cmdlist_wait_value64 as *const c_void);
+    slots[75] = vslot(cmdlist_noop_void as *const c_void); // SetPixelShaderDepthOrderX
+    slots[80] = vslot(cmdlist_noop_void as *const c_void); // ExecuteIndirect
+    slots[83] = vslot(cmdlist_copy_texture_region as *const c_void); // CopyTextureRegionX (ancien)
+    slots[85] = vslot(cmdlist_copy_texture_region as *const c_void); // CopyTextureRegionX (nouveau)
+    slots[108] = vslot(cmdlist_noop_void as *const c_void); // ResolveSubresourceRegion
+    slots[126] = vslot(cmdlist_noop_void as *const c_void); // Réglage console
+    slots[131] = vslot(cmdlist_noop_void as *const c_void); // Réglage console
+    slots[132] = vslot(cmdlist_noop_void as *const c_void); // Réglage console
+    slots[139] = vslot(cmdlist_reset as *const c_void); // Reset (console)
+    slots[142] = vslot(cmdlist_noop_void as *const c_void); // Réglage / marqueur console
+    slots[146] = vslot(cmdlist_noop_void as *const c_void); // Barrier (enhanced)
+    slots[148] = vslot(cmdlist_allocate_upload_memory as *const c_void); // AllocateUploadMemory
+    D3D12CmdListVtbl { slots }
+}
+
+static D3D12_CONSOLE_CMDLIST_VTBL: D3D12CmdListVtbl = build_console_cmdlist_vtbl();
+
+/// Vtable `ID3D12DmaCommandList` (type 6, IID `30bc77b9-8379-4b25-95de-b8588c42275d`) :
+/// slots 9 = `Close`, 10 = `Reset`, 11 = `CopyBufferRegion`, 12 = `CopyTextureRegion`,
+/// 13 = `CopyResource`. Partage la structure `D3D12CmdListObject`.
+const fn build_dma_cmdlist_vtbl() -> D3D12CmdListVtbl {
+    let mut slots = UNIMPL_SLOTS;
+    let mut pad = 0;
+    while pad < 24 {
+        slots[pad] = vslot(cmdlist_noop_void as *const c_void);
+        pad += 1;
+    }
+    slots[0] = vslot(cmdlist_qi as *const c_void);
+    slots[1] = vslot(com_add_ref as *const c_void);
+    slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
+    slots[8] = vslot(cmdlist_get_type as *const c_void);
+    slots[9] = vslot(cmdlist_close as *const c_void);
+    slots[10] = vslot(cmdlist_reset as *const c_void);
+    slots[11] = vslot(cmdlist_copy_buffer_region as *const c_void);
+    slots[12] = vslot(cmdlist_copy_texture_region as *const c_void);
+    slots[13] = vslot(cmdlist_copy_resource as *const c_void);
+    D3D12CmdListVtbl { slots }
+}
+
+static D3D12_DMA_CMDLIST_VTBL: D3D12CmdListVtbl = build_dma_cmdlist_vtbl();
 
 // --- ID3D12CommandQueue ---
 
@@ -2209,8 +3211,16 @@ struct D3D12QueueVtbl {
 #[repr(C)]
 struct D3D12QueueObject {
     header: ComHeader,
+    /// Doit rester juste après `header` (même offset que `D3D12DeviceObject::shared`).
     shared: Arc<SharedD3D12State>,
+    desc: D3D12CommandQueueDesc,
+    /// Détecte automatiquement le layout console récent (+2 slots à partir de `Signal` en 16).
+    detected_newer_layout: AtomicBool,
 }
+
+const _: () = {
+    assert!(offset_of!(D3D12QueueObject, shared) == offset_of!(D3D12DeviceObject, shared));
+};
 
 extern "win64" fn queue_qi(
     this: *mut ComHeader,
@@ -2397,6 +3407,77 @@ extern "win64" fn queue_execute_command_lists(
                             }
                         }
                     }
+                    RecordedOp::CopyBufferRegion {
+                        dst,
+                        dst_offset,
+                        src,
+                        src_offset,
+                        num_bytes,
+                    } => {
+                        flush_render(&mut renderer, &mut render_cmds);
+                        let src_obj = unsafe { &*(*src as *const D3D12ResourceObject) };
+                        let dst_obj = unsafe { &*(*dst as *const D3D12ResourceObject) };
+                        let s_off = (*src_offset as usize).min(src_obj.byte_len);
+                        let d_off = (*dst_offset as usize).min(dst_obj.byte_len);
+                        let avail_src = src_obj.byte_len.saturating_sub(s_off);
+                        let avail_dst = dst_obj.byte_len.saturating_sub(d_off);
+                        let len = (*num_bytes as usize).min(avail_src).min(avail_dst);
+                        if len > 0 {
+                            // SAFETY: bornes vérifiées sur `src_obj.byte_len` et `dst_obj.byte_len`.
+                            let tmp = unsafe {
+                                std::slice::from_raw_parts(
+                                    (src_obj.fixed_addr + s_off) as *const u8,
+                                    len,
+                                )
+                                .to_vec()
+                            };
+                            unsafe {
+                                ptr::copy_nonoverlapping(
+                                    tmp.as_ptr(),
+                                    (dst_obj.fixed_addr + d_off) as *mut u8,
+                                    len,
+                                );
+                            }
+                        }
+                    }
+                    RecordedOp::WriteValue32 { address, value } => {
+                        flush_render(&mut renderer, &mut render_cmds);
+                        let addr = *address as usize;
+                        if addr >= 0x1_0000
+                            && sb_loader::trampoline::peek_memory(addr, 4).len() == 4
+                        {
+                            std::sync::atomic::fence(Ordering::Release);
+                            // SAFETY: `addr` vérifié lisible/mappé sur 4 octets.
+                            unsafe {
+                                ptr::write_unaligned(addr as *mut u32, *value);
+                            }
+                            std::sync::atomic::fence(Ordering::SeqCst);
+                        }
+                    }
+                    RecordedOp::WriteValue64 {
+                        address,
+                        value,
+                        flags,
+                    } => {
+                        flush_render(&mut renderer, &mut render_cmds);
+                        let addr = *address as usize;
+                        if addr >= 0x1_0000
+                            && sb_loader::trampoline::peek_memory(addr, 8).len() == 8
+                        {
+                            // Drapeaux 1 ou 2 = horodatage GPU / QPC monotone (1 GHz).
+                            let written = if *flags == 1 || *flags == 2 {
+                                q.shared.elapsed_ns()
+                            } else {
+                                *value
+                            };
+                            std::sync::atomic::fence(Ordering::Release);
+                            // SAFETY: `addr` vérifié lisible/mappé sur 8 octets.
+                            unsafe {
+                                ptr::write_unaligned(addr as *mut u64, written);
+                            }
+                            std::sync::atomic::fence(Ordering::SeqCst);
+                        }
+                    }
                     RecordedOp::CopyBackbufferToResource { dst } => {
                         flush_render(&mut renderer, &mut render_cmds);
                         match renderer.readback_rgba() {
@@ -2478,26 +3559,211 @@ extern "win64" fn queue_signal(
 ) -> HResult {
     if !fence.is_null() {
         // SAFETY: `fence` vérifié non-nul.
-        unsafe {
-            (*fence).completed.store(value, Ordering::Release);
-        }
+        let f = unsafe { &*fence };
+        f.signal_value(value);
         sb_trace!(CHANNEL, "ID3D12CommandQueue::Signal(value={value})");
     }
     S_OK
 }
 
+extern "win64" fn queue_wait(
+    _this: *mut D3D12QueueObject,
+    _fence: *mut D3D12FenceObject,
+    _value: u64,
+) -> HResult {
+    S_OK
+}
+
+/// Slot 16 de `ID3D12CommandQueue` (double layout console) :
+/// - si `arg1` est un `ID3D12Fence` du bridge → layout récent `Signal(fence, value)` ;
+/// - sinon → layout PC / ancien `GetTimestampFrequency(out_freq)`.
+extern "win64" fn queue_slot16_signal_or_freq(
+    this: *mut D3D12QueueObject,
+    arg1: usize,
+    arg2: u64,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ID3D12CommandQueue::slot16", E_UNEXPECTED, {
+        if d3d_known_object_name(arg1) == Some("ID3D12Fence") {
+            if !this.is_null() {
+                // SAFETY: `this` vérifié non-nul.
+                unsafe { (*this).detected_newer_layout.store(true, Ordering::Release) };
+            }
+            return queue_signal(this, arg1 as *mut D3D12FenceObject, arg2);
+        }
+        if arg1 == 0 {
+            return E_POINTER;
+        }
+        // SAFETY: `arg1` est un `*mut u64` fourni par l'appelant pour `GetTimestampFrequency`.
+        unsafe {
+            ptr::write_unaligned(arg1 as *mut u64, 1_000_000_000u64);
+        }
+        S_OK
+    })
+}
+
+/// Slot 17 de `ID3D12CommandQueue` (double layout console) :
+/// - si `arg1` est un `ID3D12Fence` du bridge → layout récent `Wait(fence, value)` ;
+/// - sinon → layout PC / ancien `GetClockCalibration(out_gpu, out_cpu)`.
+extern "win64" fn queue_slot17_wait_or_clock(
+    this: *mut D3D12QueueObject,
+    arg1: usize,
+    arg2: u64,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ID3D12CommandQueue::slot17", E_UNEXPECTED, {
+        if d3d_known_object_name(arg1) == Some("ID3D12Fence") {
+            if !this.is_null() {
+                // SAFETY: `this` vérifié non-nul.
+                unsafe { (*this).detected_newer_layout.store(true, Ordering::Release) };
+            }
+            return queue_wait(this, arg1 as *mut D3D12FenceObject, arg2);
+        }
+        queue_get_clock_calibration(this, arg1 as *mut u64, arg2 as *mut u64)
+    })
+}
+
+extern "win64" fn queue_get_clock_calibration(
+    this: *mut D3D12QueueObject,
+    out_gpu: *mut u64,
+    out_cpu: *mut u64,
+) -> HResult {
+    let ts = if this.is_null() {
+        1u64
+    } else {
+        // SAFETY: `this` vérifié non-nul.
+        unsafe { (*this).shared.elapsed_ns() }
+    };
+    if !out_gpu.is_null() {
+        // SAFETY: `out_gpu` non-nul.
+        unsafe { ptr::write_unaligned(out_gpu, ts) };
+    }
+    if !out_cpu.is_null() {
+        // SAFETY: `out_cpu` non-nul.
+        unsafe { ptr::write_unaligned(out_cpu, ts) };
+    }
+    S_OK
+}
+
+/// Slot 18 de `ID3D12CommandQueue` :
+/// - en layout console récent → `GetTimestampFrequency(out_freq) -> HResult` (`0`) ;
+/// - en layout PC / ancien → `GetDesc(out_desc) -> *mut D3D12CommandQueueDesc`.
+extern "win64" fn queue_slot18_freq_or_desc(this: *mut D3D12QueueObject, arg1: usize) -> usize {
+    if this.is_null() {
+        return 0;
+    }
+    // SAFETY: `this` vérifié non-nul.
+    let q = unsafe { &*this };
+    if q.detected_newer_layout.load(Ordering::Acquire) {
+        if arg1 == 0 {
+            return E_POINTER as usize;
+        }
+        // SAFETY: `arg1` est `*mut u64` (`GetTimestampFrequency`).
+        unsafe {
+            ptr::write_unaligned(arg1 as *mut u64, 1_000_000_000u64);
+        }
+        return S_OK as usize;
+    }
+    if arg1 != 0 {
+        // SAFETY: `arg1` est `*mut D3D12CommandQueueDesc` (`GetDesc`).
+        unsafe {
+            ptr::write_unaligned(arg1 as *mut D3D12CommandQueueDesc, q.desc);
+        }
+    }
+    arg1
+}
+
+/// `ID3D12CommandQueue::PresentX` (slot 30 ancien layout / slot 32 nouveau layout).
+extern "win64" fn queue_present_x(
+    this: *mut D3D12QueueObject,
+    plane_count: u32,
+    planes: *const D3D12XboxPresentPlaneParameters,
+    _params: *const D3D12XboxPresentParameters,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ID3D12CommandQueue::PresentX", E_UNEXPECTED, {
+        if this.is_null() {
+            return E_INVALIDARG;
+        }
+        // SAFETY: `this` vérifié non-nul.
+        let q = unsafe { &*this };
+        let token = if plane_count > 0 && !planes.is_null() {
+            // SAFETY: `planes` pointe vers au moins un `D3D12XboxPresentPlaneParameters`.
+            unsafe { (*planes).token }
+        } else {
+            0
+        };
+
+        let mut renderer = q.shared.renderer.lock();
+        if let Ok(path_str) = std::env::var("SB_DUMP_FRAME")
+            && !path_str.is_empty()
+        {
+            let path = PathBuf::from(&path_str);
+            if let Err(err) = renderer.save_ppm(&path) {
+                sb_warn!(CHANNEL, "PresentX SB_DUMP_FRAME échoué: {err}");
+            }
+        }
+        if let Err(err) = renderer.present_to_surface() {
+            sb_warn!(CHANNEL, "PresentX present_to_surface: {err}");
+        }
+        let frame_no = q.shared.present_count.fetch_add(1, Ordering::AcqRel) + 1;
+        sb_debug!(
+            CHANNEL,
+            "ID3D12CommandQueue::PresentX(frame #{frame_no}, planes={plane_count}, token={token:#x}) -> S_OK"
+        );
+        S_OK
+    })
+}
+
+extern "win64" fn queue_present_x_newer(
+    this: *mut D3D12QueueObject,
+    plane_count: u32,
+    planes: *const D3D12XboxPresentPlaneParameters,
+    params: *const D3D12XboxPresentParameters,
+) -> HResult {
+    if !this.is_null() {
+        // SAFETY: `this` vérifié non-nul.
+        unsafe { (*this).detected_newer_layout.store(true, Ordering::Release) };
+    }
+    queue_present_x(this, plane_count, planes, params)
+}
+
+/// `ID3D12CommandQueue::GetDesc` (slot 20 en layout console récent).
+extern "win64" fn queue_get_desc(
+    this: *mut D3D12QueueObject,
+    out_desc: *mut D3D12CommandQueueDesc,
+) -> *mut D3D12CommandQueueDesc {
+    if !this.is_null() && !out_desc.is_null() {
+        // SAFETY: `this` et `out_desc` vérifiés non-nuls.
+        unsafe {
+            ptr::write_unaligned(out_desc, (*this).desc);
+        }
+    }
+    out_desc
+}
+
 const fn build_queue_vtbl() -> D3D12QueueVtbl {
     let mut slots = UNIMPL_SLOTS;
     let mut pad = 0;
-    while pad < 20 {
+    while pad < 21 {
         slots[pad] = vslot(noop_ok as *const c_void);
         pad += 1;
     }
     slots[0] = vslot(queue_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_child_slots(&mut slots);
     slots[10] = vslot(queue_execute_command_lists as *const c_void);
     slots[14] = vslot(queue_signal as *const c_void);
+    slots[15] = vslot(queue_wait as *const c_void);
+    slots[16] = vslot(queue_slot16_signal_or_freq as *const c_void);
+    slots[17] = vslot(queue_slot17_wait_or_clock as *const c_void);
+    slots[18] = vslot(queue_slot18_freq_or_desc as *const c_void);
+    slots[19] = vslot(queue_get_clock_calibration as *const c_void);
+    slots[20] = vslot(queue_get_desc as *const c_void);
+    slots[23] = vslot(queue_signal as *const c_void); // SignalX (ancien layout)
+    slots[25] = vslot(queue_signal as *const c_void); // SignalX (nouveau layout)
+    slots[30] = vslot(queue_present_x as *const c_void); // PresentX (ancien layout)
+    slots[31] = vslot(noop_ok as *const c_void); // CopyPageMappingsBatchX (nouveau layout)
+    slots[32] = vslot(queue_present_x_newer as *const c_void); // PresentX (nouveau layout)
+    slots[35] = vslot(queue_execute_command_lists as *const c_void); // ExecuteCommandListsX (console)
     D3D12QueueVtbl { slots }
 }
 
@@ -2524,21 +3790,42 @@ extern "win64" fn device_qi(
     if ppv.is_null() {
         return E_POINTER;
     }
-    // `IDXGIDevice` : les titres demandent l'adaptateur DXGI via le périphérique D3D12.
-    if !riid.is_null() && unsafe { *riid } == IID_IDXGIDEVICE {
-        let dev = this as usize;
-        let obj = Box::new(DxgiDeviceObject {
-            header: ComHeader::new(traced_vtbl(
-                (&raw const DXGI_DEVICE_VTBL).cast(),
-                "IDXGIDevice",
-            )),
-            device: dev,
-        });
-        // SAFETY: `ppv` vérifié non-nul ; `obj` est un objet du bridge.
-        unsafe { *ppv = Box::into_raw(obj).cast() };
-        return S_OK;
+    // `IDXGIDevice` / `IDXGIDevice1..3` : les titres demandent l'adaptateur DXGI via le périphérique D3D12.
+    if !riid.is_null() {
+        // SAFETY: `riid` vérifié non-nul.
+        let wanted = unsafe { ptr::read_unaligned(riid) };
+        if wanted == IID_IDXGIDEVICE
+            || wanted == crate::com::IID_IDXGIDEVICE1
+            || wanted == crate::com::IID_IDXGIDEVICE2
+            || wanted == crate::com::IID_IDXGIDEVICE3
+        {
+            let dev = this as usize;
+            let obj = Box::new(DxgiDeviceObject {
+                header: ComHeader::new(traced_vtbl(
+                    (&raw const DXGI_DEVICE_VTBL).cast(),
+                    "IDXGIDevice",
+                )),
+                device: dev,
+            });
+            // SAFETY: `ppv` vérifié non-nul ; `obj` est un objet du bridge.
+            unsafe { *ppv = Box::into_raw(obj).cast() };
+            return S_OK;
+        }
     }
-    com_query_interface_list("ID3D12Device", this, riid, ppv, &[IID_ID3D12DEVICE])
+    com_query_interface_list(
+        "ID3D12Device",
+        this,
+        riid,
+        ppv,
+        &[
+            IID_ID3D12DEVICE,
+            IID_ID3D12DEVICE1,
+            IID_ID3D12DEVICE2,
+            IID_ID3D12DEVICE3,
+            IID_ID3D12DEVICE4,
+            IID_ID3D12OBJECT,
+        ],
+    )
 }
 
 extern "win64" fn device_get_node_count(_this: *mut D3D12DeviceObject) -> u32 {
@@ -2547,7 +3834,7 @@ extern "win64" fn device_get_node_count(_this: *mut D3D12DeviceObject) -> u32 {
 
 extern "win64" fn device_create_command_queue(
     this: *mut D3D12DeviceObject,
-    _desc: *const D3D12CommandQueueDesc,
+    desc: *const D3D12CommandQueueDesc,
     _riid: *const Guid,
     out_queue: *mut *mut c_void,
 ) -> HResult {
@@ -2556,12 +3843,22 @@ extern "win64" fn device_create_command_queue(
     }
     // SAFETY: `this` et `out_queue` vérifiés non-nuls.
     let dev = unsafe { &*this };
+    let q_desc = if desc.is_null() {
+        D3D12CommandQueueDesc::default()
+    } else {
+        // SAFETY: `desc` vérifié non-nul.
+        unsafe { ptr::read_unaligned(desc) }
+    };
     let q = Box::new(D3D12QueueObject {
         header: ComHeader::new(traced_vtbl(
             (&raw const D3D12_QUEUE_VTBL).cast(),
             "ID3D12CommandQueue",
         )),
         shared: Arc::clone(&dev.shared),
+        desc: q_desc,
+        detected_newer_layout: AtomicBool::new(
+            dev.shared.is_console_device.load(Ordering::Acquire),
+        ),
     });
     unsafe {
         *out_queue = Box::into_raw(q).cast();
@@ -2856,25 +4153,51 @@ extern "win64" fn device_check_feature_support(
 
         match feature {
             0 => {
-                // D3D12_FEATURE_D3D12_OPTIONS
+                // D3D12_FEATURE_D3D12_OPTIONS (0x3C octets PC, 0x40 octets console)
                 bytes.fill(0);
+                write_u32(bytes, 4, 1); // OutputMergerLogicOp
+                write_u32(bytes, 8, 3); // MinPrecisionSupport (10-bit | 16-bit)
                 write_u32(bytes, 12, 3); // TiledResourcesTier = 3
                 write_u32(bytes, 16, 3); // ResourceBindingTier = TIER_3
+                write_u32(bytes, 20, 1); // PSSpecifiedStencilRefSupported
                 write_u32(bytes, 24, 1); // TypedUAVLoadAdditionalFormats
+                write_u32(bytes, 28, 1); // ROVsSupported
+                write_u32(bytes, 32, 3); // ConservativeRasterizationTier = 3
                 write_u32(bytes, 36, 40); // MaxGPUVirtualAddressBitsPerResource
                 write_u32(bytes, 40, 1); // StandardSwizzle64KBSupported
+                write_u32(bytes, 48, 1); // CrossAdapterRowMajorTextureSupported
                 write_u32(bytes, 52, 1); // VPAndRTArrayIndex...
                 write_u32(bytes, 56, 2); // ResourceHeapTier = TIER_2
+            }
+            1 => {
+                // D3D12_FEATURE_ARCHITECTURE : conserve NodeIndex (+0), signale UMA cohérente.
+                write_u32(bytes, 4, 0); // TileBasedRenderer = FALSE
+                write_u32(bytes, 8, 1); // UMA = TRUE
+                write_u32(bytes, 12, 1); // CacheCoherentUMA = TRUE
             }
             2 => {
                 // D3D12_FEATURE_FEATURE_LEVELS : MaxSupportedFeatureLevel à l'offset 16
                 write_u32(bytes, 16, 0xC100); // D3D_FEATURE_LEVEL_12_1
+            }
+            4 => {
+                // D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT
+                bytes.fill(0);
+                write_u32(bytes, 0, 40); // MaxGPUVirtualAddressBitsPerResource
+                write_u32(bytes, 4, 40); // MaxGPUVirtualAddressBitsPerProcess
             }
             7 => {
                 // D3D12_FEATURE_SHADER_MODEL : plafonne à SM 6.6 (0x66)
                 if bytes.len() >= 4 {
                     let req = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                     let supported = req.clamp(0x51, 0x66);
+                    write_u32(bytes, 0, supported);
+                }
+            }
+            12 => {
+                // D3D12_FEATURE_ROOT_SIGNATURE : plafonne à 1.1 (2)
+                if bytes.len() >= 4 {
+                    let req = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    let supported = if req == 1 { 1 } else { 2 };
                     write_u32(bytes, 0, supported);
                 }
             }
@@ -2899,20 +4222,20 @@ extern "win64" fn device_check_feature_support(
 }
 
 extern "win64" fn device_create_command_list(
-    _this: *mut D3D12DeviceObject,
+    this: *mut D3D12DeviceObject,
     _node_mask: u32,
-    _list_type: u32,
+    list_type: u32,
     _allocator: *mut c_void,
     initial_state: *mut D3D12PsoObject,
-    _riid: *const Guid,
+    riid: *const Guid,
     out_list: *mut *mut c_void,
 ) -> HResult {
     if out_list.is_null() {
         return E_POINTER;
     }
     let mut ops = Vec::new();
-    if !initial_state.is_null() {
-        // SAFETY: `initial_state` est un `D3D12PsoObject` valide.
+    if d3d_known_object_name(initial_state as usize) == Some("ID3D12PipelineState") {
+        // SAFETY: `initial_state` validé comme `D3D12PsoObject` du bridge.
         let pso = unsafe { &*initial_state };
         let rc = if pso.is_compute {
             RenderCommand::SetComputePipeline {
@@ -2925,15 +4248,38 @@ extern "win64" fn device_create_command_list(
         };
         ops.push(RecordedOp::Render(rc));
     }
-    let cl = Box::new(D3D12CmdListObject {
-        header: ComHeader::new(traced_vtbl(
+    let is_dma = list_type == 6
+        || (!riid.is_null()
+            // SAFETY: `riid` vérifié non-nul.
+            && unsafe { ptr::read_unaligned(riid) } == IID_ID3D12CONSDMACOMMANDLIST);
+    let is_console = !this.is_null()
+        // SAFETY: `this` vérifié non-nul.
+        && unsafe { (&*this).shared.is_console_device.load(Ordering::Acquire) };
+    let vtbl = if is_dma {
+        traced_vtbl(
+            (&raw const D3D12_DMA_CMDLIST_VTBL).cast(),
+            "ID3D12DmaCommandList",
+        )
+    } else if is_console {
+        traced_vtbl(
+            (&raw const D3D12_CONSOLE_CMDLIST_VTBL).cast(),
+            "ID3D12GraphicsCommandList",
+        )
+    } else {
+        traced_vtbl(
             (&raw const D3D12_CMDLIST_VTBL).cast(),
             "ID3D12GraphicsCommandList",
-        )),
+        )
+    };
+    let cl = Box::new(D3D12CmdListObject {
+        header: ComHeader::new(vtbl),
+        console_inline_pad: [0u8; 0x560],
         ops: Mutex::new(ops),
         closed: Mutex::new(false),
         graphics_root_regs: Mutex::new(Vec::new()),
         compute_root_regs: Mutex::new(Vec::new()),
+        upload_arenas: Mutex::new(Vec::new()),
+        list_type,
     });
     // SAFETY: `out_list` vérifié non-nul.
     unsafe {
@@ -3206,6 +4552,10 @@ extern "win64" fn device_create_root_signature(
     unsafe {
         *out_rs = Box::into_raw(rs).cast();
     }
+    sb_debug!(
+        CHANNEL,
+        "ID3D12Device::CreateRootSignature(blob_len={blob_len}) -> S_OK"
+    );
     S_OK
 }
 
@@ -3214,12 +4564,35 @@ extern "win64" fn device_create_cbv(
     desc: *const D3D12ConstantBufferViewDesc,
     dest_descriptor: usize,
 ) {
-    if this.is_null() || desc.is_null() {
+    if this.is_null()
+        || desc.is_null()
+        || sb_loader::trampoline::peek_memory(
+            desc as usize,
+            size_of::<D3D12ConstantBufferViewDesc>(),
+        )
+        .len()
+            != size_of::<D3D12ConstantBufferViewDesc>()
+    {
         return;
     }
-    // SAFETY: `this` et `desc` vérifiés non-nuls.
+    // SAFETY: `this` non-nul et `desc` vérifié lisible via `peek_memory`.
     let dev = unsafe { &*this };
-    let d = unsafe { *desc };
+    let d = unsafe { ptr::read_unaligned(desc) };
+    if dev.shared.is_console_device.load(Ordering::Acquire)
+        && !crate::gdk_xs::is_xmem_address(dest_descriptor)
+    {
+        static LOGGED_LOCAL: AtomicU32 = AtomicU32::new(0);
+        if LOGGED_LOCAL.fetch_add(1, Ordering::Relaxed) < 2 {
+            let raw_desc = sb_loader::trampoline::peek_memory(desc as usize, 16);
+            let raw_dest = sb_loader::trampoline::peek_memory(dest_descriptor, 16);
+            sb_info!(
+                CHANNEL,
+                "ID3D12Device::CreateConstantBufferView console hors-XMem (va={:#x}, taille={:#x}, dest={dest_descriptor:#x}, desc={raw_desc:02x?}, dest_avant={raw_dest:02x?})",
+                d.buffer_location,
+                d.size_in_bytes
+            );
+        }
+    }
     dev.shared.descriptors.lock().insert(
         dest_descriptor,
         DescriptorBinding::Cbv {
@@ -3484,6 +4857,7 @@ extern "win64" fn device_create_fence(
             "ID3D12Fence",
         )),
         completed: AtomicU64::new(initial_value),
+        waiters: Mutex::new(Vec::new()),
     });
     // SAFETY: `out_fence` vérifié non-nul.
     unsafe {
@@ -3625,13 +4999,18 @@ extern "win64" fn device_slot48(
             flags: word(8),
             node_mask: word(12),
         };
-        if desc.queue_type > 3 {
+        if desc.queue_type > 3 && desc.queue_type != 6 {
             sb_warn!(
                 CHANNEL,
                 "slot 48 (file de commandes) : type {} invalide -> E_INVALIDARG",
                 desc.queue_type
             );
             return E_INVALIDARG;
+        }
+        if !this.is_null() {
+            // SAFETY: `this` vérifié non-nul (appel console `slot 48`).
+            let dev = unsafe { &*this };
+            dev.shared.is_console_device.store(true, Ordering::Release);
         }
         let hr = device_create_command_queue(this, &desc, riid, out);
         if hr == S_OK {
@@ -3684,6 +5063,9 @@ extern "win64" fn device_slot73(
             // SAFETY: `riid` non-nul ; GUID lu sans exigence d'alignement.
             let wanted = unsafe { ptr::read_unaligned(riid) };
             if wanted != IID_ID3D12GRAPHICSCOMMANDLIST
+                && wanted != IID_ID3D12GRAPHICSCOMMANDLIST1
+                && wanted != IID_ID3D12GRAPHICSCOMMANDLIST2
+                && wanted != IID_ID3D12CONSDMACOMMANDLIST
                 && wanted != crate::com::IID_IUNKNOWN
                 && let Some(other) = crate::com::known_iid_name(&wanted)
             {
@@ -3694,14 +5076,19 @@ extern "win64" fn device_slot73(
                 return sb_common::abi::E_NOINTERFACE;
             }
         }
-        // Type de liste : premier mot du descripteur (0 = direct, 1 = bundle, 2 = calcul, 3 = copie).
+        // Type de liste : premier mot du descripteur (0 = direct, 1 = bundle, 2 = calcul, 3 = copie, 6 = DMA console).
         let raw = sb_loader::trampoline::peek_memory(desc as usize, 4);
         let list_type = if raw.len() == 4 {
             u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
         } else {
             0
         };
-        if list_type > 3 {
+        if !this.is_null() {
+            // SAFETY: `this` vérifié non-nul (appel console `slot 73`).
+            let dev = unsafe { &*this };
+            dev.shared.is_console_device.store(true, Ordering::Release);
+        }
+        if list_type > 3 && list_type != 6 {
             sb_warn!(
                 CHANNEL,
                 "slot 73 : type de liste {list_type} invalide -> E_INVALIDARG"
@@ -3746,35 +5133,81 @@ extern "win64" fn device_enqueue_make_resident(
             return E_INVALIDARG;
         }
         // SAFETY: `fence` provient de `CreateFence` (objet du bridge, jamais libéré).
-        unsafe { (*fence).completed.fetch_max(fence_value, Ordering::AcqRel) };
+        let f = unsafe { &*fence };
+        f.signal_value(fence_value);
         S_OK
     })
 }
 
-/// Slot 70 du périphérique **console** : création d'un tampon (variante console de
-/// `CreateCommittedResource` pour un buffer). Signature déduite :
-/// `(this, D3D12_RESOURCE_DESC*, void* state, void* out)`.
+/// Lit un `Guid` à l'adresse `addr` s'il est mappé et lisible.
+fn try_read_guid(addr: usize) -> Option<Guid> {
+    if addr < 0x1_0000 {
+        return None;
+    }
+    let bytes = sb_loader::trampoline::peek_memory(addr, size_of::<Guid>());
+    if bytes.len() != size_of::<Guid>() {
+        return None;
+    }
+    // SAFETY: `bytes.len() == size_of::<Guid>()`.
+    Some(unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<Guid>()) })
+}
+
+/// Slot 70 du périphérique **console** : sur console Xbox Series X, sert à créer une vue
+/// (SRV/UAV) directement depuis un `D3D12_RESOURCE_DESC*` en `a2` vers un descripteur en `a4`
+/// (sans allouer de ressource), ou une ressource si une paire `(REFIID == IID_ID3D12Resource, ppv)`
+/// est fournie dans `a3..=a8`.
+#[allow(clippy::too_many_arguments)]
 extern "win64" fn device_slot70(
     _this: *mut D3D12DeviceObject,
     desc: *const D3D12ResourceDesc,
-    _state: *const c_void,
-    _out: *mut c_void,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    a8: usize,
 ) -> HResult {
-    if desc.is_null() {
+    if desc.is_null()
+        || sb_loader::trampoline::peek_memory(desc as usize, size_of::<D3D12ResourceDesc>()).len()
+            != size_of::<D3D12ResourceDesc>()
+    {
         return E_POINTER;
     }
-    // SAFETY: `desc` est un `D3D12ResourceDesc` valide fourni par le titre.
-    let d = unsafe { *desc };
-    let res = alloc_d3d12_resource(d, false);
-    static LOGGED: AtomicU32 = AtomicU32::new(0);
-    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
-        sb_info!(
-            CHANNEL,
-            "slot 70 : tampon console créé (dim={}, w={}) -> {res:p}",
-            d.dimension,
-            d.width
-        );
+    // SAFETY: `desc` vérifié lisible via `peek_memory`.
+    let d = unsafe { ptr::read_unaligned(desc) };
+    let tail = [a3, a4, a5, a6, a7, a8];
+    for i in 0..tail.len() - 1 {
+        if let Some(g) = try_read_guid(tail[i])
+            && (g == IID_ID3D12RESOURCE || g == IID_ID3D12OBJECT || g == crate::com::IID_IUNKNOWN)
+        {
+            let ppv = tail[i + 1];
+            if ppv >= 0x1_0000
+                && sb_loader::trampoline::peek_memory(ppv, size_of::<usize>()).len()
+                    == size_of::<usize>()
+            {
+                let res = alloc_d3d12_resource(d, false);
+                // SAFETY: `ppv` suit immédiatement `REFIID == IID_ID3D12Resource` et est mappé.
+                unsafe { *(ppv as *mut *mut c_void) = res.cast() };
+                sb_debug!(
+                    CHANNEL,
+                    "slot 70 : ressource console créée (dim={}, w={}, h={}, fmt={}) -> {res:p}",
+                    d.dimension,
+                    d.width,
+                    d.height,
+                    d.format
+                );
+                return S_OK;
+            }
+        }
     }
+    sb_debug!(
+        CHANNEL,
+        "slot 70 : vue console depuis descripteur (dim={}, w={}, h={}, fmt={}, view_desc={a3:#x}, dest={a4:#x}) -> S_OK",
+        d.dimension,
+        d.width,
+        d.height,
+        d.format
+    );
     S_OK
 }
 
@@ -3822,57 +5255,742 @@ extern "win64" fn device_slot127(
     S_OK
 }
 
-/// Slot 108 du périphérique **console** : variante de `GetResourceAllocationInfo` qui écrit le
-/// couple `{SizeInBytes, Alignment}` (16 octets) dans le pointeur de retour caché `rcx` (le
-/// périphérique est en `rdx`, convention console non-COM, comme le slot 25). L'alignement rendu
-/// est celui du descripteur (0x1000 pour un tampon) ; le titre vérifie `Alignment == desc.alignment`
-/// et `SizeInBytes < 4 Gio` (assertion `int3` sinon).
+/// `D3D12_RESOURCE_ALLOCATION_INFO1` (24 octets) renseigné par `GetResourceAllocationInfo1`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct D3D12ResourceAllocationInfo1 {
+    offset: u64,
+    alignment: u64,
+    size_in_bytes: u64,
+}
+
+const _: () = {
+    assert!(size_of::<D3D12ResourceAllocationInfo1>() == 24);
+    assert!(offset_of!(D3D12ResourceAllocationInfo1, offset) == 0);
+    assert!(offset_of!(D3D12ResourceAllocationInfo1, alignment) == 8);
+    assert!(offset_of!(D3D12ResourceAllocationInfo1, size_in_bytes) == 16);
+};
+
+/// Slot 108 du périphérique **console** : variante console de `GetResourceAllocationInfo1` qui
+/// écrit `{SizeInBytes, Alignment}` (16 octets) dans le pointeur de retour caché `rcx` (et le
+/// retourne dans `rax` conformément à l'ABI Win64 pour un retour struct > 8 octets), et remplit
+/// `out_info1` (`D3D12_RESOURCE_ALLOCATION_INFO1[num_descs]`) lorsqu'il est non nul.
 extern "win64" fn device_slot108(
     out: *mut [u64; 2],
     _this: *mut D3D12DeviceObject,
-    _a3: u32,
-    _a4: u32,
+    _visible_mask: u32,
+    num_descs: u32,
     desc: *const D3D12ResourceDesc,
-    _out2: *mut c_void,
-) -> HResult {
+    out_info1: *mut D3D12ResourceAllocationInfo1,
+) -> *mut [u64; 2] {
     if out.is_null() {
-        return E_POINTER;
+        return ptr::null_mut();
     }
-    let (size, alignment) = if desc.is_null() {
-        (0u64, 0x1000u64)
+    let count = if desc.is_null() {
+        0usize
+    } else if num_descs == 0 {
+        1usize
     } else {
-        // SAFETY: `desc` est un `D3D12ResourceDesc` valide fourni par le titre.
-        let d = unsafe { *desc };
-        (resource_allocation_size(&d), d.alignment.max(0x1000))
+        (num_descs as usize).min(1024)
     };
+    let info1_bytes = count.saturating_mul(size_of::<D3D12ResourceAllocationInfo1>());
+    let write_info1 = !out_info1.is_null()
+        && info1_bytes > 0
+        && sb_loader::trampoline::peek_memory(out_info1 as usize, info1_bytes).len() == info1_bytes;
+
+    let mut total = 0u64;
+    let mut max_align = 0x1000u64;
+    let mut first_dim = 0u32;
+    for i in 0..count {
+        // SAFETY: `desc` non-nul et contient `count` descripteurs consécutifs.
+        let d = unsafe { ptr::read_unaligned(desc.add(i)) };
+        if i == 0 {
+            first_dim = d.dimension;
+        }
+        let size = resource_allocation_size(&d);
+        let align = d.alignment.max(0x1000);
+        let offset = total.next_multiple_of(align);
+        total = offset.saturating_add(size);
+        max_align = max_align.max(align);
+        if write_info1 {
+            // SAFETY: `out_info1` vérifié mappé pour `count` entrées via `peek_memory`.
+            unsafe {
+                ptr::write_unaligned(
+                    out_info1.add(i),
+                    D3D12ResourceAllocationInfo1 {
+                        offset,
+                        alignment: align,
+                        size_in_bytes: size,
+                    },
+                );
+            }
+        }
+    }
     // SAFETY: `out` vérifié non-nul (16 octets).
-    unsafe { *out = [size, alignment] };
+    unsafe { *out = [total, max_align] };
     static LOGGED: AtomicU32 = AtomicU32::new(0);
     if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
-        let dim = if desc.is_null() {
-            0
-        } else {
-            // SAFETY: `desc` non-nul.
-            unsafe { (*desc).dimension }
-        };
         sb_info!(
             CHANNEL,
-            "slot 108 : GetResourceAllocationInfo console (dim={dim}) -> taille {size:#x}, alignement {alignment:#x}"
+            "slot 108 : GetResourceAllocationInfo console (n={count}, dim={first_dim}) -> taille {total:#x}, alignement {max_align:#x}"
         );
+    }
+    out
+}
+
+/// `ID3D12Device::GetCustomHeapProperties(nodeMask, heapType)` (slot 26).
+/// Retourne la structure `D3D12_HEAP_PROPERTIES` (20 octets) par pointeur de retour caché.
+/// Tolère les deux ordres de registres (`(out, this, ...)` et `(this, out, ...)`).
+extern "win64" fn device_get_custom_heap_properties(
+    a1: usize,
+    a2: usize,
+    node_mask: u32,
+    heap_type: u32,
+) -> *mut D3D12HeapProperties {
+    let out = if d3d_known_object_name(a1) == Some("ID3D12Device") {
+        a2 as *mut D3D12HeapProperties
+    } else {
+        a1 as *mut D3D12HeapProperties
+    };
+    if !out.is_null() {
+        let mask = node_mask.max(1);
+        let cpu_page_property = match heap_type {
+            2 => 2, // UPLOAD -> WRITE_COMBINE
+            3 => 3, // READBACK -> WRITE_BACK
+            _ => 1, // DEFAULT -> NOT_AVAILABLE
+        };
+        // SAFETY: `out` est le tampon de retour caché fourni par l'appelant (20 octets).
+        unsafe {
+            ptr::write_unaligned(
+                out,
+                D3D12HeapProperties {
+                    heap_type: 4, // D3D12_HEAP_TYPE_CUSTOM
+                    cpu_page_property,
+                    memory_pool_preference: 1, // D3D12_MEMORY_POOL_L0 (UMA)
+                    creation_node_mask: mask,
+                    visible_node_mask: mask,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// `ID3D12Device::CreateReservedResource(pDesc, InitialState, pOptimizedClearValue, riid, ppvResource)`
+/// (slot 30) : alloue une ressource unifiée équivalente pour les ressources tuilées/réservées.
+extern "win64" fn device_create_reserved_resource(
+    _this: *mut D3D12DeviceObject,
+    desc: *const D3D12ResourceDesc,
+    _initial_state: u32,
+    _clear_value: *const c_void,
+    _riid: *const Guid,
+    out_resource: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "CreateReservedResource", E_UNEXPECTED, {
+        if desc.is_null() || out_resource.is_null() {
+            return E_POINTER;
+        }
+        // SAFETY: `desc` vérifié non-nul.
+        let d = unsafe { ptr::read_unaligned(desc) };
+        let res = alloc_d3d12_resource(d, false);
+        // SAFETY: `out_resource` vérifié non-nul.
+        unsafe { *out_resource = res.cast() };
+        sb_debug!(
+            CHANNEL,
+            "ID3D12Device::CreateReservedResource(dim={}, w={}, h={}, fmt={}) -> {res:p}",
+            d.dimension,
+            d.width,
+            d.height,
+            d.format
+        );
+        S_OK
+    })
+}
+
+/// Slot 39 de `ID3D12Device` :
+/// - Sur PC (`d3d12.h`), `GetResourceTiling(pTiledResource, ...)` où `a2` est une `ID3D12Resource`.
+/// - Sur console Xbox (`d3d12_xs.h`, décalage `-3` sans les méthodes PC shared/residency),
+///   `CreateQueryHeap(pDesc, REFIID, ppvHeap)` où `a2` est un `D3D12_QUERY_HEAP_DESC*`, `a3` un
+///   `REFIID` (en `.rdata` lecture seule) et `a4` le pointeur de sortie `void**`.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn device_slot39_dispatch(
+    this: *mut D3D12DeviceObject,
+    a2: *mut c_void,
+    a3: *mut c_void,
+    a4: *mut c_void,
+    a5: *mut c_void,
+    a6: *mut c_void,
+    a7: u32,
+    a8: *mut c_void,
+) -> HResult {
+    if is_d3d12_resource(a2 as usize) {
+        device_get_resource_tiling(
+            this,
+            a2.cast(),
+            a3.cast(),
+            a4.cast(),
+            a5.cast(),
+            a6.cast(),
+            a7,
+            a8.cast(),
+        );
+        return S_OK;
+    }
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+        let desc_words =
+            if !a2.is_null() && sb_loader::trampoline::peek_memory(a2 as usize, 12).len() == 12 {
+                // SAFETY: 12 octets vérifiés lisibles via `peek_memory`.
+                unsafe { ptr::read_unaligned(a2.cast::<[u32; 3]>()) }
+            } else {
+                [0; 3]
+            };
+        sb_info!(
+            CHANNEL,
+            "slot 39 : CreateQueryHeap console (desc={desc_words:?}, riid={}, ppv={a4:p})",
+            crate::com::format_guid_opt(a3.cast())
+        );
+    }
+    device_create_query_heap(this, a2.cast(), a3.cast(), a4.cast())
+}
+
+/// `ID3D12Device::GetResourceTiling` (PC slot 39) : renseigne des paramètres de tuilage 64 Kio
+/// cohérents pour les ressources réservées/tuilées.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn device_get_resource_tiling(
+    _this: *mut D3D12DeviceObject,
+    resource: *mut D3D12ResourceObject,
+    num_tiles_total: *mut u32,
+    packed_mip_desc: *mut [u32; 3],
+    standard_tile_shape: *mut [u32; 3],
+    num_subresource_tilings: *mut u32,
+    _first_subresource: u32,
+    subresource_tilings: *mut [u32; 3],
+) {
+    let tiles = if is_d3d12_resource(resource as usize) {
+        // SAFETY: `resource` validé comme `ID3D12Resource` du bridge.
+        let len = unsafe { (*resource).byte_len };
+        ((len.div_ceil(65536)).max(1)).min(u32::MAX as usize) as u32
+    } else {
+        1u32
+    };
+    if !num_tiles_total.is_null() {
+        // SAFETY: `num_tiles_total` vérifié non-nul.
+        unsafe { ptr::write_unaligned(num_tiles_total, tiles) };
+    }
+    if !packed_mip_desc.is_null() {
+        // NumStandardMips=1, NumPackedMips=0, NumTilesForPackedMips=0, StartTileIndex=0.
+        // SAFETY: `packed_mip_desc` vérifié non-nul (12 octets).
+        unsafe { ptr::write_unaligned(packed_mip_desc, [1u32, 0u32, 0u32]) };
+    }
+    if !standard_tile_shape.is_null() {
+        // 128 x 128 x 1 texels par tuile 64 Kio (RGBA8).
+        // SAFETY: `standard_tile_shape` vérifié non-nul (12 octets).
+        unsafe { ptr::write_unaligned(standard_tile_shape, [128u32, 128u32, 1u32]) };
+    }
+    if !num_subresource_tilings.is_null() {
+        // SAFETY: `num_subresource_tilings` vérifié non-nul.
+        let cap = unsafe { ptr::read_unaligned(num_subresource_tilings) };
+        if cap > 0 && !subresource_tilings.is_null() {
+            // WidthInTiles=tiles, HeightInTiles=1, DepthInTiles=1, StartTileIndex=0.
+            let packed_hd = (1u32) | (1u32 << 16);
+            // SAFETY: `subresource_tilings` vérifié non-nul et `cap >= 1`.
+            unsafe { ptr::write_unaligned(subresource_tilings, [tiles, packed_hd, 0u32]) };
+            // SAFETY: `num_subresource_tilings` vérifié non-nul.
+            unsafe { ptr::write_unaligned(num_subresource_tilings, 1) };
+        } else {
+            // SAFETY: `num_subresource_tilings` vérifié non-nul.
+            unsafe { ptr::write_unaligned(num_subresource_tilings, 1) };
+        }
+    }
+}
+
+/// `ID3D12Device::GetAdapterLuid()` (slot 40) : LUID 64 bits non nul stable.
+extern "win64" fn device_get_adapter_luid(_this: *mut D3D12DeviceObject) -> u64 {
+    1
+}
+
+/// `ID3D12Device::CreateQueryHeap(pDesc, riid, ppvHeap)` (slot 42).
+extern "win64" fn device_create_query_heap(
+    _this: *mut D3D12DeviceObject,
+    desc: *const c_void,
+    _riid: *const Guid,
+    out_heap: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "CreateQueryHeap", E_UNEXPECTED, {
+        if out_heap.is_null() {
+            return E_POINTER;
+        }
+        let (heap_type, count) = if desc.is_null() {
+            (0, 0)
+        } else {
+            // SAFETY: `D3D12_QUERY_HEAP_DESC` débute par `{ UINT Type; UINT Count; }`.
+            let words = unsafe { ptr::read_unaligned(desc.cast::<[u32; 2]>()) };
+            (words[0], words[1])
+        };
+        let obj = Box::new(D3D12QueryHeapObject {
+            header: ComHeader::new(traced_vtbl(
+                (&raw const D3D12_QUERY_HEAP_VTBL).cast(),
+                "ID3D12QueryHeap",
+            )),
+            heap_type,
+            count,
+        });
+        // SAFETY: `out_heap` vérifié non-nul.
+        unsafe { *out_heap = Box::into_raw(obj).cast() };
+        sb_debug!(
+            CHANNEL,
+            "ID3D12Device::CreateQueryHeap(type={heap_type}, count={count}) -> S_OK"
+        );
+        S_OK
+    })
+}
+
+/// `ID3D12Device::CreateCommandSignature(pDesc, pRootSignature, riid, ppvCommandSignature)` (slot 41).
+extern "win64" fn device_create_command_signature(
+    _this: *mut D3D12DeviceObject,
+    desc: *const c_void,
+    _root_sig: *mut c_void,
+    _riid: *const Guid,
+    out_sig: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "CreateCommandSignature", E_UNEXPECTED, {
+        if out_sig.is_null() {
+            return E_POINTER;
+        }
+        let byte_stride = if desc.is_null() {
+            0
+        } else {
+            // SAFETY: le premier champ de `D3D12_COMMAND_SIGNATURE_DESC` est `UINT ByteStride`.
+            unsafe { ptr::read_unaligned(desc.cast::<u32>()) }
+        };
+        let obj = Box::new(D3D12CmdSigObject {
+            header: ComHeader::new(traced_vtbl(
+                (&raw const D3D12_CMDSIG_VTBL).cast(),
+                "ID3D12CommandSignature",
+            )),
+            byte_stride,
+        });
+        // SAFETY: `out_sig` vérifié non-nul.
+        unsafe {
+            *out_sig = Box::into_raw(obj).cast();
+        }
+        sb_debug!(
+            CHANNEL,
+            "ID3D12Device::CreateCommandSignature(byte_stride={byte_stride}) -> S_OK"
+        );
+        S_OK
+    })
+}
+
+/// Slot 52 console : `SetDebugFlags(flags)`.
+extern "win64" fn device_set_debug_flags(_this: *mut D3D12DeviceObject, flags: u32) -> HResult {
+    PROCESS_DEBUG_FLAGS.store(flags, Ordering::Relaxed);
+    sb_debug!(CHANNEL, "ID3D12Device::SetDebugFlags({flags:#x}) -> S_OK");
+    S_OK
+}
+
+/// Slot 55 console : création d'un PSO dérivé.
+extern "win64" fn device_create_derived_pso(
+    _this: *mut D3D12DeviceObject,
+    base_pso: *mut D3D12PsoObject,
+    _desc: *const c_void,
+    _riid: *const Guid,
+    out_pso: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "CreateDerivedPipelineState", E_UNEXPECTED, {
+        if out_pso.is_null() {
+            return E_POINTER;
+        }
+        let (pipeline_id, is_compute) =
+            if d3d_known_object_name(base_pso as usize) == Some("ID3D12PipelineState") {
+                // SAFETY: `base_pso` authentifié comme `D3D12PsoObject`.
+                let base = unsafe { &*base_pso };
+                (base.pipeline_id, base.is_compute)
+            } else {
+                (0, false)
+            };
+        let pso = Box::new(D3D12PsoObject {
+            header: ComHeader::new(traced_vtbl(
+                (&raw const D3D12_PSO_VTBL).cast(),
+                "ID3D12PipelineState",
+            )),
+            pipeline_id,
+            is_compute,
+        });
+        // SAFETY: `out_pso` vérifié non-nul.
+        unsafe { *out_pso = Box::into_raw(pso).cast() };
+        sb_debug!(
+            CHANNEL,
+            "ID3D12Device::CreateDerivedPipelineState(base={base_pso:p}) -> S_OK"
+        );
+        S_OK
+    })
+}
+
+/// Slot 62 console : `CreateComputePipelineState` forme console à 6 arguments
+/// `(this, pDesc, pExtra1, pExtra2, riid, ppvPipelineState)`.
+extern "win64" fn device_create_compute_pso_console(
+    this: *mut D3D12DeviceObject,
+    desc: *const D3D12ComputePipelineStateDesc,
+    _extra1: *const c_void,
+    _extra2: *const c_void,
+    riid: *const Guid,
+    out_pso: *mut *mut c_void,
+) -> HResult {
+    device_create_compute_pso(this, desc, riid, out_pso)
+}
+
+/// Crée un `ID3D12PipelineState` console en localisant automatiquement la paire
+/// `(REFIID == IID_ID3D12PipelineState, void** ppv)` parmi `a2..=a7` (les variantes console
+/// `Deserialize*PipelineStateX` / `CreatePipelineStateX` peuvent prendre 4, 5 ou 6 arguments).
+#[allow(clippy::too_many_arguments)]
+fn create_console_pso_multi_arg(
+    label: &str,
+    is_compute: bool,
+    logged: &AtomicU32,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+) -> HResult {
+    let args = [a2, a3, a4, a5, a6, a7];
+    let mut matched: Option<(usize, usize)> = None;
+    for i in 0..args.len() - 1 {
+        if let Some(g) = try_read_guid(args[i])
+            && (g == IID_ID3D12PIPELINESTATE
+                || g == IID_ID3D12OBJECT
+                || g == crate::com::IID_IUNKNOWN)
+        {
+            matched = Some((i + 2, args[i + 1]));
+            break;
+        }
+    }
+    let out_addr = match matched {
+        Some((_, ppv)) => ppv,
+        None => a4,
+    };
+    if out_addr < 0x1_0000
+        || sb_loader::trampoline::peek_memory(out_addr, size_of::<usize>()).len()
+            != size_of::<usize>()
+    {
+        return E_POINTER;
+    }
+    let pso = Box::new(D3D12PsoObject {
+        header: ComHeader::new(traced_vtbl(
+            (&raw const D3D12_PSO_VTBL).cast(),
+            "ID3D12PipelineState",
+        )),
+        pipeline_id: 0,
+        is_compute,
+    });
+    let raw = Box::into_raw(pso).cast::<c_void>();
+    // SAFETY: `out_addr` est vérifié mappé (`peek_memory`) et suit `REFIID` (ou `a4` par défaut).
+    unsafe { *(out_addr as *mut *mut c_void) = raw };
+    if logged.fetch_add(1, Ordering::Relaxed) < 2 {
+        sb_info!(
+            CHANNEL,
+            "ID3D12Device::{label}(a2={a2:#x}, a3={a3:#x}, a4={a4:#x}, a5={a5:#x}, a6={a6:#x}, a7={a7:#x}, riid_slot={:?}) -> {raw:p}",
+            matched.map(|(slot, _)| slot)
+        );
+    } else {
+        sb_debug!(CHANNEL, "ID3D12Device::{label} -> {raw:p}");
     }
     S_OK
 }
 
+/// Slots 56 / 57 / 66 console : `DeserializeGraphicsPipelineStateX(..., riid, ppvPipelineState)`.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn device_deserialize_graphics_pso_x(
+    _this: *mut D3D12DeviceObject,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+) -> HResult {
+    ffi_guard!(
+        CHANNEL,
+        "DeserializeGraphicsPipelineStateX",
+        E_UNEXPECTED,
+        {
+            static LOGGED: AtomicU32 = AtomicU32::new(0);
+            create_console_pso_multi_arg(
+                "DeserializeGraphicsPipelineStateX",
+                false,
+                &LOGGED,
+                a2,
+                a3,
+                a4,
+                a5,
+                a6,
+                a7,
+            )
+        }
+    )
+}
+
+/// Slot 67 console : `DeserializeComputePipelineStateX(..., riid, ppvPipelineState)`.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn device_deserialize_compute_pso_x(
+    _this: *mut D3D12DeviceObject,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+) -> HResult {
+    ffi_guard!(CHANNEL, "DeserializeComputePipelineStateX", E_UNEXPECTED, {
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        create_console_pso_multi_arg(
+            "DeserializeComputePipelineStateX",
+            true,
+            &LOGGED,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+        )
+    })
+}
+
+/// Slot 78 console : `SetFrameIntervalX(pOutput, intervalUs, period, flags)`.
+extern "win64" fn device_set_frame_interval_x(
+    this: *mut D3D12DeviceObject,
+    _output: *mut c_void,
+    interval_us: u32,
+    period: u32,
+    flags: u32,
+) -> HResult {
+    ffi_guard!(CHANNEL, "SetFrameIntervalX", E_UNEXPECTED, {
+        if this.is_null() {
+            return E_INVALIDARG;
+        }
+        // SAFETY: `this` vérifié non-nul.
+        let dev = unsafe { &*this };
+        let clamped = interval_us.max(1);
+        dev.shared
+            .frame_interval_us
+            .store(clamped, Ordering::Release);
+        sb_debug!(
+            CHANNEL,
+            "ID3D12Device::SetFrameIntervalX(interval_us={clamped}, period={period}, flags={flags:#x}) -> S_OK"
+        );
+        S_OK
+    })
+}
+
+/// Slot 79 console : `ScheduleFrameEventX(eventType, offsetUs, pAncillary, flags)`.
+extern "win64" fn device_schedule_frame_event_x(
+    this: *mut D3D12DeviceObject,
+    event_type: u32,
+    offset_us: u64,
+    ancillary: *const D3D12XboxFrameObjectList,
+    flags: u32,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ScheduleFrameEventX", E_UNEXPECTED, {
+        if this.is_null() {
+            return E_INVALIDARG;
+        }
+        if !ancillary.is_null() {
+            // SAFETY: `ancillary` pointe vers un `D3D12XboxFrameObjectList` valide.
+            let list = unsafe { ptr::read_unaligned(ancillary) };
+            let n = (list.count as usize).min(64);
+            for i in 0..n {
+                if !list.objects.is_null() {
+                    // SAFETY: `objects[i]` est un handle/pointeur dans la liste de taille `count`.
+                    let handle = unsafe { ptr::read_unaligned(list.objects.add(i)) };
+                    let _ = sync::SetEvent(handle);
+                }
+                if !list.signaled.is_null() {
+                    // SAFETY: `signaled[i]` appartient au tableau de taille `count`.
+                    unsafe { ptr::write_unaligned(list.signaled.add(i), 1) };
+                }
+            }
+        }
+        sb_trace!(
+            CHANNEL,
+            "ID3D12Device::ScheduleFrameEventX(event={event_type}, offset_us={offset_us}, flags={flags:#x}) -> S_OK"
+        );
+        S_OK
+    })
+}
+
+/// Slot 80 console : `WaitFrameEventX(eventType, timeoutMs, pAncillary, flags, pOutToken)`.
+/// Retourne toujours un jeton 64 bits non nul (`0 == D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL`).
+extern "win64" fn device_wait_frame_event_x(
+    this: *mut D3D12DeviceObject,
+    event_type: u32,
+    timeout_ms: u32,
+    _ancillary: *const c_void,
+    flags: u32,
+    out_token: *mut u64,
+) -> HResult {
+    ffi_guard!(CHANNEL, "WaitFrameEventX", E_UNEXPECTED, {
+        if this.is_null() {
+            return E_INVALIDARG;
+        }
+        // SAFETY: `this` vérifié non-nul.
+        let dev = unsafe { &*this };
+        let token = dev.shared.alloc_frame_token();
+        if !out_token.is_null() {
+            // SAFETY: `out_token` vérifié non-nul.
+            unsafe { ptr::write_unaligned(out_token, token) };
+        }
+        sb_trace!(
+            CHANNEL,
+            "ID3D12Device::WaitFrameEventX(event={event_type}, timeout={timeout_ms}ms, flags={flags:#x}) -> token={token:#x}"
+        );
+        S_OK
+    })
+}
+
+/// Slot 81 console : `GetFrameStatisticsX(token, typeMask, pInOutCount, pStats)`.
+extern "win64" fn device_get_frame_statistics_x(
+    this: *mut D3D12DeviceObject,
+    _token: u64,
+    type_mask: u32,
+    in_out_count: *mut u32,
+    stats: *mut D3D12XboxFrameStatistics,
+) -> HResult {
+    ffi_guard!(CHANNEL, "GetFrameStatisticsX", E_UNEXPECTED, {
+        if this.is_null() {
+            return E_INVALIDARG;
+        }
+        if in_out_count.is_null() {
+            return E_POINTER;
+        }
+        // SAFETY: `this` et `in_out_count` vérifiés non-nuls.
+        let dev = unsafe { &*this };
+        let cap = unsafe { ptr::read_unaligned(in_out_count) };
+        if cap == 0 || stats.is_null() {
+            // SAFETY: `in_out_count` vérifié non-nul.
+            unsafe { ptr::write_unaligned(in_out_count, 1) };
+            return S_OK;
+        }
+        let now_us = dev.shared.elapsed_us();
+        let interval = u64::from(dev.shared.frame_interval_us.load(Ordering::Acquire));
+        let stat_type = if type_mask != 0 {
+            1u32 << type_mask.trailing_zeros()
+        } else {
+            1
+        };
+        let rec = D3D12XboxFrameStatistics {
+            stat_type,
+            _pad0: 0,
+            reserved: 0,
+            origin_time_us: now_us,
+            flip_time_us: now_us.saturating_add(interval),
+        };
+        // SAFETY: `stats` vérifié non-nul et `cap >= 1`.
+        unsafe {
+            ptr::write_unaligned(stats, rec);
+            ptr::write_unaligned(in_out_count, 1);
+        }
+        S_OK
+    })
+}
+
+/// Slot 86 console : `CreatePipelineStateX(..., riid, ppvPipelineState)`.
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn device_create_pipeline_state_x(
+    _this: *mut D3D12DeviceObject,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+) -> HResult {
+    ffi_guard!(CHANNEL, "CreatePipelineStateX", E_UNEXPECTED, {
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        create_console_pso_multi_arg(
+            "CreatePipelineStateX",
+            false,
+            &LOGGED,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+        )
+    })
+}
+
+/// Slot 133 console : `ID3D12DeviceX::CreatePlacedResourceX(gpuVirtualAddress, pDesc,
+/// initialState, pOptimizedClearValue, riid, ppvResource)`.
+///
+/// Place une ressource directement à une adresse virtuelle GPU unifiée fournie par le titre
+/// (sans copie lorsque la plage mémoire est déjà mappée, afin que `GetGPUVirtualAddress()` et
+/// `Map()` restituent exactement `gpu_va`).
+#[allow(clippy::too_many_arguments)]
+extern "win64" fn device_create_placed_resource_x(
+    _this: *mut D3D12DeviceObject,
+    gpu_va: u64,
+    desc: *const D3D12ResourceDesc,
+    _initial_state: u32,
+    _clear_value: *const c_void,
+    _riid: *const Guid,
+    out_resource: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "CreatePlacedResourceX", E_UNEXPECTED, {
+        if desc.is_null() || out_resource.is_null() {
+            return E_POINTER;
+        }
+        // SAFETY: `desc` vérifié non-nul.
+        let d = unsafe { ptr::read_unaligned(desc) };
+        let byte_len = compute_resource_byte_len(d);
+        let addr = gpu_va as usize;
+        let res = if addr >= 0x1_0000 && sb_loader::trampoline::peek_memory(addr, 1).len() == 1 {
+            ALLOCATED_BUFFER_SIZES.lock().insert(addr, byte_len);
+            // SAFETY: `addr` appartient à une région mémoire mappée par le titre ; on retient
+            // une référence sur l'`Arc` (jamais relâchée) pour ne jamais libérer cette mémoire.
+            let backing = unsafe { Vec::from_raw_parts(addr as *mut u8, byte_len, byte_len) };
+            let backing = Arc::new(Mutex::new(backing));
+            std::mem::forget(Arc::clone(&backing));
+            Box::into_raw(Box::new(D3D12ResourceObject {
+                header: ComHeader::new(traced_vtbl(
+                    (&raw const D3D12_RESOURCE_VTBL).cast(),
+                    "ID3D12Resource",
+                )),
+                desc: d,
+                is_backbuffer: false,
+                backing,
+                heap_offset: 0,
+                byte_len,
+                fixed_addr: addr,
+                gpu_texture_id: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            }))
+        } else {
+            alloc_d3d12_resource(d, false)
+        };
+        // SAFETY: `out_resource` vérifié non-nul.
+        unsafe { *out_resource = res.cast() };
+        sb_debug!(
+            CHANNEL,
+            "ID3D12Device::CreatePlacedResourceX(va={gpu_va:#x}, dim={}, w={}, h={}, fmt={}) -> {res:p}",
+            d.dimension,
+            d.width,
+            d.height,
+            d.format
+        );
+        S_OK
+    })
+}
+
 const fn build_device_vtbl() -> D3D12DeviceVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 45 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(device_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_d3d12_object_slots(&mut slots);
     slots[7] = vslot(device_get_node_count as *const c_void);
     slots[8] = vslot(device_create_command_queue as *const c_void);
     slots[9] = vslot(device_create_command_allocator as *const c_void);
@@ -3892,19 +6010,50 @@ const fn build_device_vtbl() -> D3D12DeviceVtbl {
     slots[23] = vslot(device_copy_descriptors as *const c_void);
     slots[24] = vslot(device_copy_descriptors_simple as *const c_void);
     slots[25] = vslot(device_get_resource_allocation_info as *const c_void);
+    slots[26] = vslot(device_get_custom_heap_properties as *const c_void);
     slots[27] = vslot(device_create_committed_resource as *const c_void);
     slots[28] = vslot(device_create_heap as *const c_void);
     slots[29] = vslot(device_create_placed_resource as *const c_void);
+    slots[30] = vslot(device_create_reserved_resource as *const c_void);
+    // Slots 31..33 (`CreateSharedHandle`/`OpenSharedHandle*` sur PC) laissés en `UNIMPL_SLOTS`
+    // pour détecter tout décalage console éventuel au lieu d'un `noop_ok` silencieux.
+    slots[34] = vslot(noop_ok as *const c_void); // MakeResident
+    slots[35] = vslot(noop_ok as *const c_void); // Evict
     slots[36] = vslot(device_create_fence as *const c_void);
+    slots[37] = vslot(noop_ok as *const c_void); // GetDeviceRemovedReason -> S_OK
     slots[38] = vslot(device_get_copyable_footprints as *const c_void);
-    // `ID3D12Device1` à `ID3D12Device3` (slots 44..50) : seuls ceux de sémantique non ambiguë.
+    slots[39] = vslot(device_slot39_dispatch as *const c_void);
+    slots[40] = vslot(device_get_adapter_luid as *const c_void);
+    slots[41] = vslot(device_create_command_signature as *const c_void);
+    slots[42] = vslot(device_create_query_heap as *const c_void);
+    // Slot 43 (`SetStablePowerState` sur PC) laissé en `UNIMPL_SLOTS` pour détecter tout usage console.
+    slots[44] = vslot(device_create_placed_resource as *const c_void); // CreatePlacedResource console
+    // `ID3D12Device1` à `ID3D12Device3` + extensions console Xbox Series X.
     slots[46] = vslot(device_set_residency_priority as *const c_void);
     slots[48] = vslot(device_slot48 as *const c_void);
-    slots[73] = vslot(device_slot73 as *const c_void);
     slots[50] = vslot(device_enqueue_make_resident as *const c_void);
+    slots[52] = vslot(device_set_debug_flags as *const c_void);
+    slots[55] = vslot(device_create_derived_pso as *const c_void);
+    slots[56] = vslot(device_deserialize_graphics_pso_x as *const c_void);
+    slots[57] = vslot(device_deserialize_graphics_pso_x as *const c_void); // DeserializeGraphicsPipelineStateX
+    slots[60] = vslot(device_create_graphics_pso as *const c_void); // CreateGraphicsPipelineState console
+    slots[61] = vslot(device_create_sampler as *const c_void); // CreateSamplerX
+    slots[62] = vslot(device_create_compute_pso_console as *const c_void); // CreateComputePipelineState (6 args)
+    slots[66] = vslot(device_deserialize_graphics_pso_x as *const c_void);
+    slots[67] = vslot(device_deserialize_compute_pso_x as *const c_void); // DeserializeComputePipelineStateX
     slots[70] = vslot(device_slot70 as *const c_void);
-    slots[127] = vslot(device_slot127 as *const c_void);
+    slots[73] = vslot(device_slot73 as *const c_void);
+    slots[74] = vslot(noop_ok as *const c_void); // RegisterPagePoolX
+    slots[75] = vslot(noop_ok as *const c_void); // UnregisterPagePoolX
+    slots[76] = vslot(device_create_committed_resource as *const c_void); // CreateCommittedResource console
+    slots[78] = vslot(device_set_frame_interval_x as *const c_void);
+    slots[79] = vslot(device_schedule_frame_event_x as *const c_void);
+    slots[80] = vslot(device_wait_frame_event_x as *const c_void);
+    slots[81] = vslot(device_get_frame_statistics_x as *const c_void);
+    slots[86] = vslot(device_create_pipeline_state_x as *const c_void);
     slots[108] = vslot(device_slot108 as *const c_void);
+    slots[127] = vslot(device_slot127 as *const c_void);
+    slots[133] = vslot(device_create_placed_resource_x as *const c_void); // CreatePlacedResourceX
     D3D12DeviceVtbl { slots }
 }
 
@@ -3957,15 +6106,13 @@ pub(crate) extern "win64" fn D3D12CreateDevice(
                     (&raw const D3D12_DEVICE_VTBL).cast(),
                     "ID3D12Device",
                 )),
-                shared: Arc::new(SharedD3D12State {
-                    renderer: Mutex::new(renderer),
-                    sdl_window: Mutex::new(None),
-                    descriptors: Mutex::new(HashMap::new()),
-                }),
+                shared: Arc::new(SharedD3D12State::new(renderer)),
             });
+            let raw = Box::into_raw(dev);
+            LAST_D3D12_DEVICE.store(raw as usize, Ordering::Release);
             // SAFETY: `out_device` vérifié non-nul.
             unsafe {
-                *out_device = Box::into_raw(dev).cast();
+                *out_device = raw.cast();
             }
         }
         S_OK
@@ -4044,7 +6191,10 @@ pub(crate) extern "win64" fn D3D12SerializeVersionedRootSignature(
     } else {
         // SAFETY: `desc` pointe vers un `D3D12_VERSIONED_ROOT_SIGNATURE_DESC` valide.
         let vdesc = unsafe { &*(desc.cast::<D3D12VersionedRootSignatureDesc>()) };
-        (core::ptr::from_ref(&vdesc.desc).cast::<c_void>(), vdesc.version)
+        (
+            core::ptr::from_ref(&vdesc.desc).cast::<c_void>(),
+            vdesc.version,
+        )
     };
     D3D12SerializeRootSignature(inner, version, out_blob, out_error_blob)
 }
@@ -4311,7 +6461,17 @@ pub(crate) extern "win64" fn D3D12XboxCreateDevice(
             p.version,
             p.process_debug_flags
         );
-        D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_2, riid, out_device)
+        let hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_2, riid, out_device);
+        if hr == S_OK && !out_device.is_null() {
+            // SAFETY: `out_device` vient d'être rempli par `D3D12CreateDevice` (`D3D12DeviceObject*`).
+            let dev_ptr = unsafe { *out_device }.cast::<D3D12DeviceObject>();
+            if !dev_ptr.is_null() {
+                // SAFETY: `dev_ptr` est un `D3D12DeviceObject` fraîchement alloué.
+                let dev = unsafe { &*dev_ptr };
+                dev.shared.is_console_device.store(true, Ordering::Release);
+            }
+        }
+        hr
     })
 }
 
@@ -4335,6 +6495,172 @@ pub(crate) extern "win64" fn D3D12ConfigureVirtualMemoryX(config: *const u32) ->
         *VIRTUAL_MEMORY_CONFIG.lock() = Some(block);
         S_OK
     })
+}
+
+/// Drapeaux de débogage processus (`D3D12XboxGetProcessDebugFlags` / `SetProcessDebugFlags`).
+static PROCESS_DEBUG_FLAGS: AtomicU32 = AtomicU32::new(0);
+
+/// `void D3D12ZeroMemoryX(void* dst, size_t size)` : mise à zéro directe mémoire unifiée.
+pub(crate) extern "win64" fn D3D12ZeroMemoryX(dst: *mut u8, size: usize) {
+    ffi_guard!(CHANNEL, "D3D12ZeroMemoryX", (), {
+        if !dst.is_null() && size > 0 {
+            // SAFETY: `dst[..size]` est un tampon inscriptible fourni par l'appelant.
+            unsafe { ptr::write_bytes(dst, 0, size) };
+        }
+    });
+}
+
+/// `HRESULT D3D10CreateBlob(SIZE_T NumBytes, LPD3D10BLOB* ppBuffer)`.
+pub(crate) extern "win64" fn D3D10CreateBlob(
+    num_bytes: usize,
+    out_blob: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(CHANNEL, "D3D10CreateBlob", E_UNEXPECTED, {
+        if out_blob.is_null() {
+            return E_POINTER;
+        }
+        let blob = Box::new(D3DBlobObject {
+            header: ComHeader::new((&raw const D3D_BLOB_VTBL).cast()),
+            data: vec![0u8; num_bytes],
+        });
+        // SAFETY: `out_blob` vérifié non-nul.
+        unsafe { *out_blob = Box::into_raw(blob).cast() };
+        S_OK
+    })
+}
+
+/// `HRESULT D3D12CreateRootSignatureDeserializer(pSrcData, SrcDataSizeInBytes, pInterface, ppDeserializer)`.
+pub(crate) extern "win64" fn D3D12CreateRootSignatureDeserializer(
+    _src_data: *const c_void,
+    _src_len: usize,
+    _riid: *const Guid,
+    out_deserializer: *mut *mut c_void,
+) -> HResult {
+    ffi_guard!(
+        CHANNEL,
+        "D3D12CreateRootSignatureDeserializer",
+        E_UNEXPECTED,
+        {
+            if out_deserializer.is_null() {
+                return E_POINTER;
+            }
+            let obj = Box::new(D3D12RootSigDeserObject {
+                header: ComHeader::new((&raw const D3D12_ROOTSIG_DESER_VTBL).cast()),
+                desc: D3D12VersionedRootSignatureDesc {
+                    version: 1,
+                    _pad0: 0,
+                    desc: D3D12RootSignatureDesc {
+                        num_parameters: 0,
+                        _pad0: 0,
+                        parameters: ptr::null(),
+                        num_static_samplers: 0,
+                        _pad1: 0,
+                        static_samplers: ptr::null(),
+                        flags: 0,
+                        _pad2: 0,
+                    },
+                },
+            });
+            // SAFETY: `out_deserializer` vérifié non-nul.
+            unsafe { *out_deserializer = Box::into_raw(obj).cast() };
+            sb_debug!(
+                CHANNEL,
+                "D3D12CreateRootSignatureDeserializer(len={_src_len}) -> S_OK"
+            );
+            S_OK
+        }
+    )
+}
+
+/// `HRESULT D3D12CreateVersionedRootSignatureDeserializer(...)`.
+pub(crate) extern "win64" fn D3D12CreateVersionedRootSignatureDeserializer(
+    src_data: *const c_void,
+    src_len: usize,
+    riid: *const Guid,
+    out_deserializer: *mut *mut c_void,
+) -> HResult {
+    D3D12CreateRootSignatureDeserializer(src_data, src_len, riid, out_deserializer)
+}
+
+pub(crate) extern "win64" fn D3D12EnableExperimentalFeatures(
+    num_features: u32,
+    _iids: *const Guid,
+    _configs: *const c_void,
+    _config_sizes: *const u32,
+) -> HResult {
+    sb_debug!(
+        CHANNEL,
+        "D3D12EnableExperimentalFeatures(count={num_features}) -> S_OK"
+    );
+    S_OK
+}
+
+pub(crate) extern "win64" fn D3D12UploadCustomMicrocodeX(
+    _a1: usize,
+    _a2: usize,
+    _a3: usize,
+    _a4: usize,
+) -> HResult {
+    sb_debug!(CHANNEL, "D3D12UploadCustomMicrocodeX -> S_OK");
+    S_OK
+}
+
+pub(crate) extern "win64" fn D3DFlushEntireCpuCache() {
+    std::sync::atomic::fence(Ordering::SeqCst);
+}
+
+/// `HRESULT DXGIXGetFrameStatistics(UINT count, DXGIX_FRAME_STATISTICS* pStats)`.
+pub(crate) extern "win64" fn DXGIXGetFrameStatistics(count: u32, out_stats: *mut u8) -> HResult {
+    ffi_guard!(CHANNEL, "DXGIXGetFrameStatistics", E_UNEXPECTED, {
+        if !out_stats.is_null() && count > 0 {
+            let bytes = (count as usize).min(16) * 64;
+            // SAFETY: `out_stats` pointe vers `count` structures de 64 octets.
+            unsafe { ptr::write_bytes(out_stats, 0, bytes) };
+        }
+        S_OK
+    })
+}
+
+pub(crate) extern "win64" fn DXGIXPresentArray(
+    _sync_interval: u32,
+    _present_immediate_threshold: u32,
+    _flags: u32,
+    _num_swapchains: u32,
+    _swapchains: *const *mut c_void,
+    _params: *const c_void,
+) -> HResult {
+    S_OK
+}
+
+pub(crate) extern "win64" fn DXGIXSetFrameNotification(
+    _device: *mut c_void,
+    _event: usize,
+) -> HResult {
+    S_OK
+}
+
+pub(crate) extern "win64" fn DXGIXSetVLineNotification(
+    _device: *mut c_void,
+    _vline: u32,
+    _event: usize,
+) -> HResult {
+    S_OK
+}
+
+pub(crate) extern "win64" fn D3D12XboxEnableMemoryProfiling(_enable: i32) -> HResult {
+    S_OK
+}
+
+pub(crate) extern "win64" fn D3D12XboxGetProcessDebugFlags() -> u32 {
+    PROCESS_DEBUG_FLAGS.load(Ordering::Relaxed)
+}
+
+pub(crate) extern "win64" fn D3D12XboxSetProcessDebugFlags(flags: u32) {
+    PROCESS_DEBUG_FLAGS.store(flags, Ordering::Relaxed);
+}
+
+pub(crate) extern "win64" fn D3D12XboxUnloadDriverModule() -> HResult {
+    S_OK
 }
 
 #[cfg(test)]
@@ -4371,6 +6697,154 @@ mod xbox_ext_tests {
         );
         assert_eq!(r, &mut out as *mut _);
         assert_eq!(out, [65536 + 131072, 65536]);
+    }
+
+    #[test]
+    fn slot108_returns_hidden_pointer_and_populates_info1() {
+        let descs = [
+            D3D12ResourceDesc {
+                dimension: 3,
+                alignment: 0x1000,
+                width: 64,
+                height: 64,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: 28,
+                ..Default::default()
+            },
+            D3D12ResourceDesc {
+                dimension: 1,
+                alignment: 0x10000,
+                width: 80000,
+                height: 1,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                ..Default::default()
+            },
+        ];
+        let mut out = [0u64; 2];
+        let mut info1 = [D3D12ResourceAllocationInfo1::default(); 2];
+        let r = device_slot108(
+            &mut out,
+            core::ptr::null_mut(),
+            0,
+            2,
+            descs.as_ptr(),
+            info1.as_mut_ptr(),
+        );
+        assert_eq!(r, &mut out as *mut _);
+        assert_eq!(out, [65536 + 131072, 0x10000]);
+        assert_eq!(
+            info1[0],
+            D3D12ResourceAllocationInfo1 {
+                offset: 0,
+                alignment: 0x1000,
+                size_in_bytes: 65536,
+            }
+        );
+        assert_eq!(
+            info1[1],
+            D3D12ResourceAllocationInfo1 {
+                offset: 65536,
+                alignment: 0x10000,
+                size_in_bytes: 131072,
+            }
+        );
+    }
+
+    #[test]
+    fn device_slots_26_30_39_40_42_return_valid_objects_and_data() {
+        let mut props = D3D12HeapProperties::default();
+        let rp = device_get_custom_heap_properties((&raw mut props) as usize, 0, 1, 2);
+        assert_eq!(rp, &mut props as *mut _);
+        assert_eq!(props.heap_type, 4);
+        assert_eq!(props.cpu_page_property, 2);
+        assert_eq!(props.memory_pool_preference, 1);
+
+        let desc = D3D12ResourceDesc {
+            dimension: 3,
+            width: 256,
+            height: 256,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28,
+            ..Default::default()
+        };
+        let mut res: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            device_create_reserved_resource(
+                core::ptr::null_mut(),
+                &desc,
+                0,
+                core::ptr::null(),
+                &IID_ID3D12RESOURCE,
+                &mut res,
+            ),
+            S_OK
+        );
+        assert!(!res.is_null());
+
+        let mut tiles = 0u32;
+        let mut packed = [0u32; 3];
+        let mut shape = [0u32; 3];
+        let mut sub_n = 1u32;
+        let mut sub = [0u32; 3];
+        assert_eq!(
+            device_slot39_dispatch(
+                core::ptr::null_mut(),
+                res,
+                (&raw mut tiles).cast(),
+                (&raw mut packed).cast(),
+                (&raw mut shape).cast(),
+                (&raw mut sub_n).cast(),
+                0,
+                (&raw mut sub).cast(),
+            ),
+            S_OK
+        );
+        assert!(tiles >= 4);
+        assert_eq!(shape, [128, 128, 1]);
+        assert_eq!(sub_n, 1);
+        assert_eq!(sub[0], tiles);
+
+        // Slot 39 console : CreateQueryHeap(this, pDesc, REFIID, ppvHeap) ne touche pas à REFIID.
+        let qdesc = [1u32, 64u32, 0u32];
+        let qheap_iid = IID_ID3D12QUERYHEAP;
+        let mut qheap_console: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            device_slot39_dispatch(
+                core::ptr::null_mut(),
+                qdesc.as_ptr().cast_mut().cast(),
+                (&raw const qheap_iid).cast_mut().cast(),
+                (&raw mut qheap_console).cast(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+            ),
+            S_OK
+        );
+        assert!(!qheap_console.is_null());
+
+        assert_ne!(device_get_adapter_luid(core::ptr::null_mut()), 0);
+
+        let mut qheap: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            device_create_query_heap(
+                core::ptr::null_mut(),
+                qdesc.as_ptr().cast(),
+                &IID_ID3D12QUERYHEAP,
+                &mut qheap,
+            ),
+            S_OK
+        );
+        assert!(!qheap.is_null());
+        let mut qi_out: *mut c_void = core::ptr::null_mut();
+        assert_eq!(
+            query_heap_qi(qheap.cast(), &IID_ID3D12QUERYHEAP, &mut qi_out),
+            S_OK
+        );
+        assert_eq!(qi_out, qheap);
     }
 
     /// Variante console de `CreateDescriptorHeap` : une adresse XMem placée après le descripteur
@@ -4618,23 +7092,21 @@ mod xbox_ext_tests {
                 (&raw const D3D12_QUEUE_VTBL).cast(),
                 "ID3D12CommandQueue",
             )),
-            shared: Arc::new(SharedD3D12State {
-                renderer: parking_lot::Mutex::new(
-                    match VulkanRenderer::new(
-                        match GpuContext::new(false) {
-                            Ok(g) => g,
-                            Err(_) => return, // pas de GPU Vulkan ici
-                        },
-                        64,
-                        64,
-                    ) {
-                        Ok(r) => r,
-                        Err(_) => return,
+            shared: Arc::new(SharedD3D12State::new(
+                match VulkanRenderer::new(
+                    match GpuContext::new(false) {
+                        Ok(g) => g,
+                        Err(_) => return, // pas de GPU Vulkan ici
                     },
-                ),
-                sdl_window: parking_lot::Mutex::new(None),
-                descriptors: parking_lot::Mutex::new(HashMap::new()),
-            }),
+                    64,
+                    64,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => return,
+                },
+            )),
+            desc: D3D12CommandQueueDesc::default(),
+            detected_newer_layout: AtomicBool::new(false),
         };
         let qptr = (&raw const queue) as usize;
         assert_eq!(d3d_known_object_name(qptr), Some("ID3D12CommandQueue"));
@@ -4647,6 +7119,155 @@ mod xbox_ext_tests {
             text.contains("mot 0") && text.contains("ID3D12CommandQueue"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn console_queue_slot18_writes_only_8_byte_timestamp_freq() {
+        let params = D3D12XboxCreateDeviceParametersPrefix {
+            version: 0x20004,
+            ..Default::default()
+        };
+        let mut dev: *mut c_void = ptr::null_mut();
+        if D3D12XboxCreateDevice(ptr::null_mut(), &params, &IID_ID3D12DEVICE, &mut dev) != S_OK {
+            return;
+        }
+        let desc = D3D12CommandQueueDesc {
+            queue_type: 0,
+            priority: 0,
+            flags: 0,
+            node_mask: 1,
+        };
+        let mut q: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_queue(dev.cast(), &desc, &IID_ID3D12COMMANDQUEUE, &mut q),
+            S_OK
+        );
+        // `slot 18` sur une file console doit écrire 8 octets (fréquence 1 GHz) sans toucher aux
+        // 8 octets suivants sur la pile (qui contenaient jadis `flags=0, node_mask=1` = 0x100000000).
+        let mut buf: [u64; 2] = [0, 0xDEAD_BEEF_CAFE_BABEu64];
+        let rc = queue_slot18_freq_or_desc(q.cast(), buf.as_mut_ptr() as usize);
+        assert_eq!(rc, S_OK as usize);
+        assert_eq!(buf[0], 1_000_000_000u64);
+        assert_eq!(buf[1], 0xDEAD_BEEF_CAFE_BABEu64);
+    }
+
+    #[test]
+    fn console_cmdlist_uses_xbox_slot_layout_and_guards_pointers() {
+        let params = D3D12XboxCreateDeviceParametersPrefix {
+            version: 0x20004,
+            ..Default::default()
+        };
+        let mut dev: *mut c_void = ptr::null_mut();
+        if D3D12XboxCreateDevice(ptr::null_mut(), &params, &IID_ID3D12DEVICE, &mut dev) != S_OK {
+            return;
+        }
+        let mut alloc: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_allocator(dev.cast(), 0, &IID_ID3D12COMMANDALLOCATOR, &mut alloc),
+            S_OK
+        );
+        let mut cl: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_list(
+                dev.cast(),
+                0,
+                0,
+                alloc,
+                ptr::null_mut(),
+                &IID_ID3D12GRAPHICSCOMMANDLIST,
+                &mut cl
+            ),
+            S_OK
+        );
+        assert_eq!(
+            d3d_known_object_name(cl as usize),
+            Some("ID3D12GraphicsCommandList")
+        );
+
+        // Sur console Xbox Series X, le slot 44 est `SetGraphicsRootShaderResourceView(root_idx, gpu_va)`
+        // (décalage +4 par rapport au PC où slot 44 était `IASetVertexBuffers(start, num, views)`).
+        // Un appelant console avec R9=0x300 (non utilisé par SetGraphicsRootShaderResourceView)
+        // ne doit plus jamais déréférencer 0x300.
+        // SAFETY: `cl` est un `D3D12CmdListObject` valide créé par `device_create_command_list`.
+        let vtbl_slots = unsafe { *(cl as *const *const usize) };
+        let slot44: extern "win64" fn(*mut c_void, u32, u64, usize) =
+            unsafe { core::mem::transmute(*vtbl_slots.add(44)) };
+        slot44(cl, 0, 0x0000_7000_0000_0000, 0x300);
+
+        // Les slots console 126 et 142 doivent aussi être mappés sans panic.
+        let slot126: extern "win64" fn(*mut c_void, usize, usize, usize) -> i32 =
+            unsafe { core::mem::transmute(*vtbl_slots.add(126)) };
+        let slot142: extern "win64" fn(*mut c_void, usize, usize, usize) -> i32 =
+            unsafe { core::mem::transmute(*vtbl_slots.add(142)) };
+        assert_eq!(slot126(cl, 0, 0, 0), S_OK);
+        assert_eq!(slot142(cl, 0, 0, 0), S_OK);
+
+        // Défense supplémentaire : même un appel direct à `IASetVertexBuffers` avec un pointeur
+        // invalide (`0x300`) ne doit pas segfaulter côté hôte.
+        cmdlist_ia_set_vertex_buffers(cl.cast(), 0, 1, 0x300 as *const D3D12VertexBufferView);
+        cmdlist_rs_set_viewports(cl.cast(), 1, 0x300 as *const D3D12Viewport);
+        cmdlist_rs_set_scissor_rects(cl.cast(), 1, 0x300 as *const D3D12Rect);
+    }
+
+    #[test]
+    fn slot70_writes_resource_pointer_following_refiid() {
+        let desc = D3D12ResourceDesc {
+            dimension: 1,
+            width: 4096,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            ..Default::default()
+        };
+        let iid = IID_ID3D12RESOURCE;
+        let mut out: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_slot70(
+                ptr::null_mut(),
+                &desc,
+                0,
+                0,
+                (&raw const iid) as usize,
+                (&raw mut out) as usize,
+                0,
+                0,
+            ),
+            S_OK
+        );
+        assert!(!out.is_null());
+        assert_eq!(d3d_known_object_name(out as usize), Some("ID3D12Resource"));
+    }
+
+    #[test]
+    fn descriptor_heap_slot8_returns_desc_pointer() {
+        let desc = D3D12DescriptorHeapDesc {
+            heap_type: 2,
+            num_descriptors: 64,
+            flags: 0,
+            node_mask: 1,
+        };
+        let mut heap: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_descriptor_heap(
+                ptr::null_mut(),
+                &desc,
+                &IID_ID3D12DESCRIPTORHEAP,
+                &mut heap
+            ),
+            S_OK
+        );
+        let mut got = D3D12DescriptorHeapDesc::default();
+        // SAFETY: `heap` est un `D3D12DescHeapObject` valide.
+        let vtbl_slots = unsafe { *(heap as *const *const usize) };
+        let slot8: extern "win64" fn(
+            *mut c_void,
+            *mut D3D12DescriptorHeapDesc,
+        ) -> *mut D3D12DescriptorHeapDesc = unsafe { core::mem::transmute(*vtbl_slots.add(8)) };
+        let ret = slot8(heap, &mut got);
+        assert_eq!(ret, &raw mut got);
+        assert_eq!(got.heap_type, 2);
+        assert_eq!(got.num_descriptors, 64);
+        assert_eq!(got.node_mask, 1);
     }
 
     /// Slot 73 de la console : liste de commandes créée avec un descripteur étendu et un allocateur.
@@ -4744,6 +7365,7 @@ mod xbox_ext_tests {
                 "ID3D12Fence",
             )),
             completed: AtomicU64::new(3),
+            waiters: Mutex::new(Vec::new()),
         });
         let fence = Box::into_raw(fence);
         let dev = ptr::null_mut();
@@ -4761,6 +7383,32 @@ mod xbox_ext_tests {
             device_enqueue_make_resident(dev, 0, 2, ptr::null(), fence, 1),
             E_INVALIDARG
         );
+    }
+
+    #[test]
+    fn fence_slot12_exposes_live_completed_value_pointer_and_wakes_waiters() {
+        let mut fence_raw: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_fence(ptr::null_mut(), 5, 0, &IID_ID3D12FENCE, &mut fence_raw),
+            S_OK
+        );
+        assert!(!fence_raw.is_null());
+
+        let completed_ptr = fence_slot12_get_completed_address(fence_raw.cast());
+        assert!(!completed_ptr.is_null());
+        // SAFETY: `completed_ptr` pointe vers `(*fence).completed`.
+        assert_eq!(unsafe { *completed_ptr }, 5);
+
+        let ev = sync::CreateEventW(ptr::null_mut(), 1, 0, ptr::null());
+        assert_ne!(ev, 0);
+        assert_eq!(fence_set_event(fence_raw.cast(), 10, ev), S_OK);
+        // Pas encore signalé (5 < 10).
+        assert_eq!(sync::WaitForSingleObject(ev, 0), 0x0000_0102);
+
+        assert_eq!(queue_signal(ptr::null_mut(), fence_raw.cast(), 10), S_OK);
+        // SAFETY: le pointeur retourné par le slot 12 reflète immédiatement la nouvelle valeur.
+        assert_eq!(unsafe { *completed_ptr }, 10);
+        assert_eq!(sync::WaitForSingleObject(ev, 0), 0);
     }
 
     #[test]
@@ -4811,6 +7459,449 @@ mod xbox_ext_tests {
         assert!(resource_write_bytes(res.cast(), 120, &[0; 16]).is_err());
         resource_write_bytes(res.cast(), 120, &[9; 8]).expect("écriture octets");
     }
+
+    /// Cadencement d'images console (`SetFrameIntervalX` 78 -> `ScheduleFrameEventX` 79 ->
+    /// `WaitFrameEventX` 80 -> `PresentX` 30/32 -> `GetFrameStatisticsX` 81).
+    #[test]
+    fn console_frame_pacing_and_present_x_sequence() {
+        let mut dev: *mut c_void = ptr::null_mut();
+        if D3D12CreateDevice(ptr::null_mut(), 0xC200, &IID_ID3D12DEVICE, &mut dev) != S_OK {
+            return; // pas de GPU Vulkan dans l'environnement CI
+        }
+
+        // Slots 78..81 via la vtable du périphérique.
+        assert_eq!(
+            device_set_frame_interval_x(dev.cast(), ptr::null_mut(), 16_667, 1, 0),
+            S_OK
+        );
+        let mut signaled = [0i32; 2];
+        let handles = [0usize; 2];
+        let ancillary = D3D12XboxFrameObjectList {
+            count: 2,
+            _pad0: 0,
+            objects: handles.as_ptr(),
+            signaled: signaled.as_mut_ptr(),
+        };
+        assert_eq!(
+            device_schedule_frame_event_x(dev.cast(), 0, 0, &ancillary, 0),
+            S_OK
+        );
+        assert_eq!(signaled, [1, 1]);
+
+        let mut token1 = 0u64;
+        let mut token2 = 0u64;
+        assert_eq!(
+            device_wait_frame_event_x(dev.cast(), 0, 1000, ptr::null(), 0, &mut token1),
+            S_OK
+        );
+        assert_eq!(
+            device_wait_frame_event_x(dev.cast(), 0, 1000, ptr::null(), 0, &mut token2),
+            S_OK
+        );
+        assert_ne!(
+            token1, 0,
+            "le jeton de pipeline de frame ne doit jamais être 0"
+        );
+        assert!(token2 > token1);
+
+        let mut queue: *mut c_void = ptr::null_mut();
+        let q_desc = D3D12CommandQueueDesc::default();
+        assert_eq!(
+            device_create_command_queue(dev.cast(), &q_desc, &IID_ID3D12COMMANDQUEUE, &mut queue),
+            S_OK
+        );
+        let plane = D3D12XboxPresentPlaneParameters {
+            token: token1,
+            resource_count: 0,
+            _pad0: 0,
+            pp_resources: ptr::null(),
+            src_view_rects: ptr::null(),
+            dest_placement_base: ptr::null(),
+            color_space: 0,
+            scale_filter: 0,
+            extended_desc_count: 0,
+            _pad1: 0,
+            extended_descs: ptr::null(),
+            flags: 0,
+            _pad2: 0,
+        };
+        let params = D3D12XboxPresentParameters {
+            immediate_threshold_percent: 0.0,
+            view_count: 1,
+            extended_desc_count: 0,
+            _pad0: 0,
+            extended_descs: ptr::null(),
+            flags: 0,
+            _pad1: 0,
+        };
+        assert_eq!(queue_present_x(queue.cast(), 1, &plane, &params), S_OK);
+        assert_eq!(
+            queue_present_x_newer(queue.cast(), 1, &plane, &params),
+            S_OK
+        );
+
+        let mut count = 2u32;
+        let mut stats = [D3D12XboxFrameStatistics::default(); 2];
+        assert_eq!(
+            device_get_frame_statistics_x(dev.cast(), token1, 0x4, &mut count, stats.as_mut_ptr()),
+            S_OK
+        );
+        assert_eq!(count, 1);
+        assert_eq!(stats[0].stat_type, 0x4);
+        assert!(stats[0].origin_time_us > 0);
+        assert!(stats[0].flip_time_us >= stats[0].origin_time_us);
+    }
+
+    /// Double layout de `ID3D12CommandQueue` (slots 16/17/18) + `ID3D12CommandSignature` (slot 41) +
+    /// `QueryInterface` `IDXGIDevice1` / `ID3D12Device4` + `CheckFeatureSupport` console.
+    #[test]
+    fn console_queue_dual_layout_and_device_console_slots() {
+        let mut dev: *mut c_void = ptr::null_mut();
+        if D3D12CreateDevice(ptr::null_mut(), 0xC200, &IID_ID3D12DEVICE, &mut dev) != S_OK {
+            return;
+        }
+
+        // QI IDXGIDevice1 & ID3D12Device4
+        let mut dxgi1: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_qi(dev.cast(), &crate::com::IID_IDXGIDEVICE1, &mut dxgi1),
+            S_OK
+        );
+        assert_eq!(d3d_known_object_name(dxgi1 as usize), Some("IDXGIDevice"));
+        let mut dev4: *mut c_void = ptr::null_mut();
+        assert_eq!(device_qi(dev.cast(), &IID_ID3D12DEVICE4, &mut dev4), S_OK);
+        assert_eq!(dev4, dev);
+
+        // CheckFeatureSupport : ARCHITECTURE (1), GPU_VA (4), ROOT_SIGNATURE (12), OPTIONS (0, 0x40o)
+        let mut arch = [0u32; 4];
+        assert_eq!(
+            device_check_feature_support(dev.cast(), 1, arch.as_mut_ptr().cast(), 16),
+            S_OK
+        );
+        assert_eq!(
+            (arch[2], arch[3]),
+            (1, 1),
+            "UMA + CacheCoherentUMA attendus"
+        );
+        let mut gpu_va = [0u32; 2];
+        assert_eq!(
+            device_check_feature_support(dev.cast(), 4, gpu_va.as_mut_ptr().cast(), 8),
+            S_OK
+        );
+        assert_eq!(gpu_va, [40, 40]);
+        let mut rs_ver = 2u32;
+        assert_eq!(
+            device_check_feature_support(dev.cast(), 12, (&raw mut rs_ver).cast(), 4),
+            S_OK
+        );
+        assert_eq!(rs_ver, 2);
+
+        // Slot 41 : CreateCommandSignature + slot 67 : DeserializeComputePipelineStateX
+        let csig_desc = [16u32, 0, 0, 0];
+        let mut cmdsig: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_signature(
+                dev.cast(),
+                csig_desc.as_ptr().cast(),
+                ptr::null_mut(),
+                &IID_ID3D12COMMANDSIGNATURE,
+                &mut cmdsig
+            ),
+            S_OK
+        );
+        assert_eq!(
+            d3d_known_object_name(cmdsig as usize),
+            Some("ID3D12CommandSignature")
+        );
+        // SAFETY: `cmdsig` vient d'être créé ci-dessus.
+        assert_eq!(
+            unsafe { (*cmdsig.cast::<D3D12CmdSigObject>()).byte_stride },
+            16
+        );
+
+        let pso_iid = IID_ID3D12PIPELINESTATE;
+        let mut cpso: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_deserialize_compute_pso_x(
+                dev.cast(),
+                0,
+                (&raw const pso_iid) as usize,
+                (&raw mut cpso) as usize,
+                0,
+                0,
+                0,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            d3d_known_object_name(cpso as usize),
+            Some("ID3D12PipelineState")
+        );
+
+        // Slot 57 : DeserializeGraphicsPipelineStateX (forme 4 args et forme 5 args blob+len+riid+ppv)
+        let mut gpso: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_deserialize_graphics_pso_x(
+                dev.cast(),
+                0,
+                (&raw const pso_iid) as usize,
+                (&raw mut gpso) as usize,
+                0,
+                0,
+                0,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            d3d_known_object_name(gpso as usize),
+            Some("ID3D12PipelineState")
+        );
+        let mut gpso5: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_pipeline_state_x(
+                dev.cast(),
+                0,
+                64,
+                (&raw const pso_iid) as usize,
+                (&raw mut gpso5) as usize,
+                0,
+                0,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            d3d_known_object_name(gpso5 as usize),
+            Some("ID3D12PipelineState")
+        );
+
+        let mut guest_pool = vec![0x42u8; 4096];
+        let pool_va = guest_pool.as_mut_ptr() as u64;
+        let placed_desc = D3D12ResourceDesc {
+            dimension: 1,
+            width: 4096,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            ..Default::default()
+        };
+        let mut placed_res: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_placed_resource_x(
+                dev.cast(),
+                pool_va,
+                &placed_desc,
+                0xFFFF_FFFF,
+                ptr::null(),
+                &IID_ID3D12RESOURCE,
+                &mut placed_res
+            ),
+            S_OK
+        );
+        assert_eq!(res_get_gpu_va(placed_res.cast()), pool_va);
+        let mut mapped: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            res_map(placed_res.cast(), 0, ptr::null(), &mut mapped),
+            S_OK
+        );
+        assert_eq!(mapped as u64, pool_va);
+        // SAFETY: `mapped` pointe vers `guest_pool[0]`.
+        assert_eq!(unsafe { *mapped.cast::<u8>() }, 0x42);
+
+        // File de commandes : test des deux layouts en slot 16/17/18
+        let mut queue: *mut c_void = ptr::null_mut();
+        let q_desc = D3D12CommandQueueDesc {
+            queue_type: 2,
+            priority: 100,
+            flags: 0,
+            node_mask: 1,
+        };
+        assert_eq!(
+            device_create_command_queue(dev.cast(), &q_desc, &IID_ID3D12COMMANDQUEUE, &mut queue),
+            S_OK
+        );
+        // Avant tout Fence en slot 16 : slot 16 = GetTimestampFrequency, slot 18 = GetDesc
+        let mut freq = 0u64;
+        assert_eq!(
+            queue_slot16_signal_or_freq(queue.cast(), (&raw mut freq) as usize, 0),
+            S_OK
+        );
+        assert_eq!(freq, 1_000_000_000);
+        let mut got_desc = D3D12CommandQueueDesc::default();
+        let ret = queue_slot18_freq_or_desc(queue.cast(), (&raw mut got_desc) as usize);
+        assert_eq!(ret, (&raw mut got_desc) as usize);
+        assert_eq!(got_desc.queue_type, 2);
+
+        // Dès qu'une Fence arrive en slot 16 → bascule en layout console récent !
+        let mut fence: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_fence(dev.cast(), 0, 0, &IID_ID3D12FENCE, &mut fence),
+            S_OK
+        );
+        assert_eq!(
+            queue_slot16_signal_or_freq(queue.cast(), fence as usize, 42),
+            S_OK
+        );
+        assert_eq!(fence_get_completed(fence.cast()), 42);
+        let mut freq_newer = 0u64;
+        assert_eq!(
+            queue_slot18_freq_or_desc(queue.cast(), (&raw mut freq_newer) as usize),
+            S_OK as usize
+        );
+        assert_eq!(freq_newer, 1_000_000_000);
+    }
+
+    /// Liste de commandes console : en-tête inline nul (`+0x18`/`+0x30`), `AllocateUploadMemory` (148),
+    /// `CopyBufferRegion` (15), `WriteValue32`/`WriteValue64` (71/72 dont horodatage), `Reset` (139),
+    /// liste DMA (type 6) et exports libres (`D3D12ZeroMemoryX`, `D3D10CreateBlob`, `DXGIXGetFrameStatistics`).
+    #[test]
+    fn console_command_list_inline_safety_upload_writes_dma_and_free_exports() {
+        let mut dev: *mut c_void = ptr::null_mut();
+        if D3D12CreateDevice(ptr::null_mut(), 0xC200, &IID_ID3D12DEVICE, &mut dev) != S_OK {
+            return;
+        }
+        let mut queue: *mut c_void = ptr::null_mut();
+        let q_desc = D3D12CommandQueueDesc::default();
+        assert_eq!(
+            device_create_command_queue(dev.cast(), &q_desc, &IID_ID3D12COMMANDQUEUE, &mut queue),
+            S_OK
+        );
+        let mut cl: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_list(
+                dev.cast(),
+                0,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &IID_ID3D12GRAPHICSCOMMANDLIST,
+                &mut cl
+            ),
+            S_OK
+        );
+
+        // En-tête inline console à +0x18 (write_ptr) et +0x30 (buffer_end) doivent valoir 0.
+        // SAFETY: `cl` est un `D3D12CmdListObject` avec `console_inline_pad` à +0x10..+0x570.
+        let (write_ptr, buffer_end) = unsafe {
+            let base = cl.cast::<u8>();
+            (
+                ptr::read_unaligned(base.add(0x18).cast::<u64>()),
+                ptr::read_unaligned(base.add(0x30).cast::<u64>()),
+            )
+        };
+        assert_eq!(write_ptr, 0);
+        assert_eq!(buffer_end, 0);
+
+        // Slot 148 : AllocateUploadMemory (alignement 256 octets)
+        let upload_ptr = cmdlist_allocate_upload_memory(cl.cast(), 512, 256);
+        assert!(!upload_ptr.is_null());
+        assert_eq!((upload_ptr as usize) % 256, 0);
+        // SAFETY: 512 octets alloués et mappés.
+        unsafe {
+            ptr::write_bytes(upload_ptr.cast::<u8>(), 0x5A, 512);
+            assert_eq!(*upload_ptr.cast::<u8>().add(511), 0x5A);
+        }
+
+        // Slot 15 : CopyBufferRegion + slots 71/72 : WriteValue32 / WriteValue64 (valeur + timestamp)
+        let buf_desc = D3D12ResourceDesc {
+            dimension: 1,
+            width: 256,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            ..Default::default()
+        };
+        let mut src_res: *mut c_void = ptr::null_mut();
+        let mut dst_res: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_committed_resource(
+                dev.cast(),
+                ptr::null(),
+                0,
+                &buf_desc,
+                0,
+                ptr::null(),
+                &IID_ID3D12RESOURCE,
+                &mut src_res
+            ),
+            S_OK
+        );
+        assert_eq!(
+            device_create_committed_resource(
+                dev.cast(),
+                ptr::null(),
+                0,
+                &buf_desc,
+                0,
+                ptr::null(),
+                &IID_ID3D12RESOURCE,
+                &mut dst_res
+            ),
+            S_OK
+        );
+        resource_write_bytes(src_res, 16, b"SCARLET_DMA_TEST").expect("source");
+        cmdlist_copy_buffer_region(cl.cast(), dst_res.cast(), 32, src_res.cast(), 16, 16);
+
+        let mut marker32 = 0u32;
+        let mut marker64 = 0u64;
+        let mut timestamp64 = 0u64;
+        cmdlist_write_value32(cl.cast(), (&raw mut marker32) as u64, 0xCAFE_BABE, 0, 0);
+        cmdlist_write_value64(
+            cl.cast(),
+            (&raw mut marker64) as u64,
+            0x0123_4567_89AB_CDEF,
+            0,
+            0,
+        );
+        cmdlist_write_value64(cl.cast(), (&raw mut timestamp64) as u64, 0, 0, 1);
+        assert_eq!(cmdlist_close(cl.cast()), S_OK);
+
+        let lists = [cl.cast::<D3D12CmdListObject>()];
+        queue_execute_command_lists(queue.cast(), 1, lists.as_ptr());
+
+        assert_eq!(marker32, 0xCAFE_BABE);
+        assert_eq!(marker64, 0x0123_4567_89AB_CDEF);
+        assert!(timestamp64 > 0, "horodatage GPU attendu > 0");
+        // SAFETY: `dst_res` est un `D3D12ResourceObject` valide.
+        let dst_obj = unsafe { &*dst_res.cast::<D3D12ResourceObject>() };
+        assert_eq!(&dst_obj.backing.lock()[32..48], b"SCARLET_DMA_TEST");
+
+        // Liste DMA console (type 6, IID_ID3D12CONSDMACOMMANDLIST)
+        let mut dma_cl: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_list(
+                dev.cast(),
+                0,
+                6,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &IID_ID3D12CONSDMACOMMANDLIST,
+                &mut dma_cl
+            ),
+            S_OK
+        );
+        assert_eq!(
+            d3d_known_object_name(dma_cl as usize),
+            Some("ID3D12DmaCommandList")
+        );
+
+        // Exports libres d3d12_xs.dll
+        let mut buf = [0xFFu8; 32];
+        D3D12ZeroMemoryX(buf.as_mut_ptr(), buf.len());
+        assert!(buf.iter().all(|&b| b == 0));
+
+        let mut blob: *mut c_void = ptr::null_mut();
+        assert_eq!(D3D10CreateBlob(128, &mut blob), S_OK);
+        assert_eq!(blob_get_size(blob.cast()), 128);
+        assert!(!blob_get_ptr(blob.cast()).is_null());
+
+        let mut dxgix_stats = [0xAAu8; 64];
+        assert_eq!(DXGIXGetFrameStatistics(1, dxgix_stats.as_mut_ptr()), S_OK);
+        assert!(dxgix_stats.iter().all(|&b| b == 0));
+
+        D3DFlushEntireCpuCache();
+        D3D12XboxSetProcessDebugFlags(0x3);
+        assert_eq!(D3D12XboxGetProcessDebugFlags(), 0x3);
+    }
 }
 // ==================== `IDXGIDevice` (récupéré via `ID3D12Device::QueryInterface`) ====================
 
@@ -4832,7 +7923,18 @@ extern "win64" fn dxgi_device_qi(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> HResult {
-    com_query_interface_list("IDXGIDevice", this, riid, ppv, &[IID_IDXGIDEVICE])
+    com_query_interface_list(
+        "IDXGIDevice",
+        this,
+        riid,
+        ppv,
+        &[
+            IID_IDXGIDEVICE,
+            crate::com::IID_IDXGIDEVICE1,
+            crate::com::IID_IDXGIDEVICE2,
+            crate::com::IID_IDXGIDEVICE3,
+        ],
+    )
 }
 
 /// `IDXGIDevice::GetParent(riid, ppParent)` : l'objet parent (l'adaptateur).
@@ -4908,6 +8010,7 @@ const fn build_dxgi_device_vtbl() -> DxgiDeviceVtbl {
     slots[0] = vslot(dxgi_device_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_dxgi_object_slots(&mut slots);
     slots[6] = vslot(dxgi_device_get_parent as *const c_void);
     slots[7] = vslot(dxgi_device_get_adapter as *const c_void);
     slots[10] = vslot(dxgi_device_set_gpu_thread_priority as *const c_void);
@@ -4918,6 +8021,78 @@ const fn build_dxgi_device_vtbl() -> DxgiDeviceVtbl {
 }
 
 static DXGI_DEVICE_VTBL: DxgiDeviceVtbl = build_dxgi_device_vtbl();
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DxgiAdapterDesc {
+    description: [u16; 128],
+    vendor_id: u32,
+    device_id: u32,
+    sub_sys_id: u32,
+    revision: u32,
+    dedicated_video_memory: usize,
+    dedicated_system_memory: usize,
+    shared_system_memory: usize,
+    adapter_luid: [u32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DxgiOutputDesc {
+    device_name: [u16; 32],
+    desktop_coordinates: [i32; 4],
+    attached_to_desktop: i32,
+    rotation: u32,
+    monitor: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DxgiModeDesc {
+    width: u32,
+    height: u32,
+    refresh_num: u32,
+    refresh_den: u32,
+    format: u32,
+    scanline_ordering: u32,
+    scaling: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DxgiModeDesc1 {
+    base: DxgiModeDesc,
+    stereo: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DxgiFrameStatistics {
+    present_count: u32,
+    present_refresh_count: u32,
+    sync_refresh_count: u32,
+    _pad: u32,
+    sync_qpc_time: i64,
+    sync_gpu_time: i64,
+}
+
+const _: () = {
+    assert!(size_of::<DxgiAdapterDesc>() == 304);
+    assert!(offset_of!(DxgiAdapterDesc, vendor_id) == 256);
+    assert!(offset_of!(DxgiAdapterDesc, dedicated_video_memory) == 272);
+    assert!(offset_of!(DxgiAdapterDesc, adapter_luid) == 296);
+    assert!(size_of::<DxgiOutputDesc>() == 96);
+    assert!(offset_of!(DxgiOutputDesc, desktop_coordinates) == 64);
+    assert!(offset_of!(DxgiOutputDesc, attached_to_desktop) == 80);
+    assert!(offset_of!(DxgiOutputDesc, monitor) == 88);
+    assert!(size_of::<DxgiModeDesc>() == 28);
+    assert!(size_of::<DxgiModeDesc1>() == 32);
+    assert!(size_of::<DxgiFrameStatistics>() == 32);
+    assert!(offset_of!(DxgiFrameStatistics, sync_qpc_time) == 16);
+};
+
+const STANDARD_DISPLAY_MODES: [(u32, u32); 4] =
+    [(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)];
 
 /// `IDXGIAdapter` : adaptateur minimal renvoyé par `IDXGIDevice::GetAdapter`. Le titre l'utilise
 /// pour énumérer les sorties (`EnumOutputs`) et lire la description de l'adaptateur (`GetDesc`).
@@ -4932,7 +8107,7 @@ struct DxgiAdapterObject {
 }
 
 /// `IDXGIOutput` : sortie/moniteur minimal renvoyé par `IDXGIAdapter::EnumOutputs`. Le titre y
-/// appelle `GetDisplayModeList` (slot 21 sur la console) pour détecter les fréquences supportées.
+/// appelle `GetDisplayModeList` (slot 8 PC / slot 21 console) pour détecter les fréquences supportées.
 #[repr(C)]
 struct DxgiOutputVtbl {
     slots: [VtblSlot; VT_PAD_LEN],
@@ -4951,14 +8126,19 @@ extern "win64" fn dxgi_adapter_qi(
     com_query_interface_list("IDXGIAdapter", this, riid, ppv, &[IID_IDXGIADAPTER])
 }
 
-/// `IDXGIAdapter::EnumOutputs(Output, ppOutput)` : renvoie une sortie factice (un seul moniteur).
+/// `IDXGIAdapter::EnumOutputs(Output, ppOutput)` : renvoie la sortie 0, puis `DXGI_ERROR_NOT_FOUND`.
 extern "win64" fn dxgi_adapter_enum_outputs(
     _this: *mut DxgiAdapterObject,
-    _output_idx: u32,
+    output_idx: u32,
     ppv: *mut *mut c_void,
 ) -> HResult {
     if ppv.is_null() {
         return E_POINTER;
+    }
+    if output_idx > 0 {
+        // SAFETY: `ppv` vérifié non-nul.
+        unsafe { *ppv = ptr::null_mut() };
+        return DXGI_ERROR_NOT_FOUND;
     }
     let out = Box::new(DxgiOutputObject {
         header: ComHeader::new(traced_vtbl(
@@ -4972,6 +8152,51 @@ extern "win64" fn dxgi_adapter_enum_outputs(
     S_OK
 }
 
+/// `IDXGIAdapter::GetDesc` (slot 8) : description d'adaptateur AMD / ScarletBridge cohérente.
+extern "win64" fn dxgi_adapter_get_desc(
+    _this: *mut DxgiAdapterObject,
+    desc: *mut DxgiAdapterDesc,
+) -> HResult {
+    if desc.is_null() {
+        return E_POINTER;
+    }
+    let mut name = [0u16; 128];
+    for (dst, ch) in name
+        .iter_mut()
+        .zip("ScarletBridge Radeon RX".encode_utf16())
+    {
+        *dst = ch;
+    }
+    let out = DxgiAdapterDesc {
+        description: name,
+        vendor_id: 0x1002,
+        device_id: 0x731F,
+        sub_sys_id: 0,
+        revision: 0,
+        dedicated_video_memory: 10usize * 1024 * 1024 * 1024,
+        dedicated_system_memory: 0,
+        shared_system_memory: 6usize * 1024 * 1024 * 1024,
+        adapter_luid: [1, 0],
+    };
+    // SAFETY: `desc` vérifié non-nul.
+    unsafe { ptr::write_unaligned(desc, out) };
+    sb_debug!("dxgi", "IDXGIAdapter::GetDesc -> S_OK");
+    S_OK
+}
+
+/// `IDXGIAdapter::CheckInterfaceSupport` (slot 9).
+extern "win64" fn dxgi_adapter_check_interface_support(
+    _this: *mut DxgiAdapterObject,
+    _iface_name: *const Guid,
+    out_umd_version: *mut i64,
+) -> HResult {
+    if !out_umd_version.is_null() {
+        // SAFETY: `out_umd_version` vérifié non-nul.
+        unsafe { ptr::write_unaligned(out_umd_version, 0x001E_0000_0001_0000) };
+    }
+    S_OK
+}
+
 extern "win64" fn dxgi_output_qi(
     this: *mut ComHeader,
     riid: *const Guid,
@@ -4980,51 +8205,203 @@ extern "win64" fn dxgi_output_qi(
     com_query_interface_list("IDXGIOutput", this, riid, ppv, &[IID_IDXGIOUTPUT])
 }
 
-/// `IDXGIOutput::GetDesc` (slot 7) : description minimale de la sortie.
-extern "win64" fn dxgi_output_get_desc(_this: *mut DxgiOutputObject, desc: *mut c_void) -> HResult {
+/// `IDXGIOutput::GetDesc` (slot 7) : moniteur 4K principal actif.
+extern "win64" fn dxgi_output_get_desc(
+    _this: *mut DxgiOutputObject,
+    desc: *mut DxgiOutputDesc,
+) -> HResult {
     if desc.is_null() {
         return E_POINTER;
     }
-    // DXGI_OUTPUT_DESC : DeviceName[32] + RECT + AttachedToDesktop + Rotation + Monitor.
-    // SAFETY: `desc` vérifié non-nul ; on écrit une description vide mais cohérente.
-    unsafe {
-        let d = desc.cast::<u8>();
-        ptr::write_bytes(d, 0, 96);
-        // AttachedToDesktop (offset 80) = TRUE.
-        d.add(80).cast::<i32>().write(1);
+    let mut dev_name = [0u16; 32];
+    for (dst, ch) in dev_name.iter_mut().zip(r"\\.\DISPLAY1".encode_utf16()) {
+        *dst = ch;
     }
+    let out = DxgiOutputDesc {
+        device_name: dev_name,
+        desktop_coordinates: [0, 0, 3840, 2160],
+        attached_to_desktop: 1,
+        rotation: 1, // DXGI_MODE_ROTATION_IDENTITY
+        monitor: 0x0001_0001,
+    };
+    // SAFETY: `desc` vérifié non-nul.
+    unsafe { ptr::write_unaligned(desc, out) };
     S_OK
 }
 
-/// `IDXGIOutput::GetDisplayModeList` (slot 21 sur la console) : renvoie 0 mode ; le titre bascule
-/// alors sur sa fréquence par défaut sans énumérer de modes exotiques.
+/// `IDXGIOutput::GetDisplayModeList` (slot 8 standard, `DXGI_MODE_DESC` 28 octets).
 extern "win64" fn dxgi_output_get_display_mode_list(
     _this: *mut DxgiOutputObject,
-    _format: u32,
+    format: u32,
     _flags: u32,
     out_count: *mut u32,
-    _desc: *mut c_void,
+    desc: *mut DxgiModeDesc,
+) -> HResult {
+    if out_count.is_null() {
+        return E_POINTER;
+    }
+    let fmt = if format == 0 { 28 } else { format };
+    let total = STANDARD_DISPLAY_MODES.len() as u32;
+    if desc.is_null() {
+        // SAFETY: `out_count` vérifié non-nul.
+        unsafe { ptr::write_unaligned(out_count, total) };
+        sb_debug!(
+            "dxgi",
+            "IDXGIOutput::GetDisplayModeList(fmt={fmt}) -> {total} modes (requête taille)"
+        );
+        return S_OK;
+    }
+    // SAFETY: `out_count` vérifié non-nul.
+    let cap = unsafe { ptr::read_unaligned(out_count) };
+    let n = cap.min(total) as usize;
+    for (i, &(w, h)) in STANDARD_DISPLAY_MODES.iter().take(n).enumerate() {
+        let mode = DxgiModeDesc {
+            width: w,
+            height: h,
+            refresh_num: 60_000,
+            refresh_den: 1_000,
+            format: fmt,
+            scanline_ordering: 1, // DXGI_MODE_SCANLINE_ORDER_PROGRESSIVE
+            scaling: 0,           // DXGI_MODE_SCALING_UNSPECIFIED
+        };
+        // SAFETY: `desc` non-nul et l'appelant a alloué au moins `cap` entrées.
+        unsafe { ptr::write_unaligned(desc.add(i), mode) };
+    }
+    // SAFETY: `out_count` vérifié non-nul.
+    unsafe { ptr::write_unaligned(out_count, n as u32) };
+    if cap < total {
+        DXGI_ERROR_MORE_DATA
+    } else {
+        S_OK
+    }
+}
+
+/// `IDXGIOutput::GetFrameStatistics` (slot 18).
+extern "win64" fn dxgi_output_get_frame_statistics(
+    _this: *mut DxgiOutputObject,
+    out_stats: *mut DxgiFrameStatistics,
+) -> HResult {
+    if out_stats.is_null() {
+        return E_POINTER;
+    }
+    let stats = DxgiFrameStatistics {
+        present_count: 1,
+        present_refresh_count: 1,
+        sync_refresh_count: 1,
+        _pad: 0,
+        sync_qpc_time: 1,
+        sync_gpu_time: 1,
+    };
+    // SAFETY: `out_stats` vérifié non-nul.
+    unsafe { ptr::write_unaligned(out_stats, stats) };
+    S_OK
+}
+
+/// `IDXGIOutput1::GetDisplayModeList1` (slot 19 standard, `DXGI_MODE_DESC1` 32 octets).
+extern "win64" fn dxgi_output_get_display_mode_list1(
+    _this: *mut DxgiOutputObject,
+    format: u32,
+    _flags: u32,
+    out_count: *mut u32,
+    desc: *mut DxgiModeDesc1,
+) -> HResult {
+    if out_count.is_null() {
+        return E_POINTER;
+    }
+    let fmt = if format == 0 { 28 } else { format };
+    let total = STANDARD_DISPLAY_MODES.len() as u32;
+    if desc.is_null() {
+        // SAFETY: `out_count` vérifié non-nul.
+        unsafe { ptr::write_unaligned(out_count, total) };
+        return S_OK;
+    }
+    // SAFETY: `out_count` vérifié non-nul.
+    let cap = unsafe { ptr::read_unaligned(out_count) };
+    let n = cap.min(total) as usize;
+    for (i, &(w, h)) in STANDARD_DISPLAY_MODES.iter().take(n).enumerate() {
+        let mode = DxgiModeDesc1 {
+            base: DxgiModeDesc {
+                width: w,
+                height: h,
+                refresh_num: 60_000,
+                refresh_den: 1_000,
+                format: fmt,
+                scanline_ordering: 1,
+                scaling: 0,
+            },
+            stereo: 0,
+        };
+        // SAFETY: `desc` non-nul et l'appelant a alloué au moins `cap` entrées.
+        unsafe { ptr::write_unaligned(desc.add(i), mode) };
+    }
+    // SAFETY: `out_count` vérifié non-nul.
+    unsafe { ptr::write_unaligned(out_count, n as u32) };
+    if cap < total {
+        DXGI_ERROR_MORE_DATA
+    } else {
+        S_OK
+    }
+}
+
+/// `IDXGIOutput::slot 21` (console) : renvoie 1 mode 4K@60Hz (28 octets `DXGI_MODE_DESC`,
+/// sûr pour les appelants `DXGI_MODE_DESC` 28 o comme `DXGI_MODE_DESC1` 32 o pour 1 entrée).
+extern "win64" fn dxgi_output_console_slot21(
+    _this: *mut DxgiOutputObject,
+    format: u32,
+    flags: u32,
+    out_count: *mut u32,
+    desc: *mut DxgiModeDesc,
 ) -> HResult {
     if out_count.is_null() {
         return E_POINTER;
     }
     // SAFETY: `out_count` vérifié non-nul.
-    unsafe { *out_count = 0 };
-    sb_debug!("dxgi", "IDXGIOutput::GetDisplayModeList -> 0 modes");
+    let in_count = unsafe { ptr::read_unaligned(out_count) };
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+        sb_info!(
+            "dxgi",
+            "IDXGIOutput::slot21(fmt={format}, flags={flags:#x}, in_count={in_count}, desc={desc:p}) -> 1 mode 3840x2160@60Hz"
+        );
+    }
+    let fmt = if format == 0 { 28 } else { format };
+    if desc.is_null() {
+        // SAFETY: `out_count` vérifié non-nul.
+        unsafe { ptr::write_unaligned(out_count, 1) };
+        return S_OK;
+    }
+    if in_count == 0 {
+        // SAFETY: `out_count` vérifié non-nul.
+        unsafe { ptr::write_unaligned(out_count, 1) };
+        return DXGI_ERROR_MORE_DATA;
+    }
+    let mode = DxgiModeDesc {
+        width: 3840,
+        height: 2160,
+        refresh_num: 60_000,
+        refresh_den: 1_000,
+        format: fmt,
+        scanline_ordering: 1,
+        scaling: 0,
+    };
+    // SAFETY: `desc` non-nul et `in_count >= 1`.
+    unsafe {
+        ptr::write_unaligned(desc, mode);
+        ptr::write_unaligned(out_count, 1);
+    }
     S_OK
 }
 
 const fn build_dxgi_adapter_vtbl() -> DxgiAdapterVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 10 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(dxgi_adapter_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_dxgi_object_slots(&mut slots);
+    slots[6] = vslot(noop_ok as *const c_void); // GetParent
     slots[7] = vslot(dxgi_adapter_enum_outputs as *const c_void);
+    slots[8] = vslot(dxgi_adapter_get_desc as *const c_void);
+    slots[9] = vslot(dxgi_adapter_check_interface_support as *const c_void);
     DxgiAdapterVtbl { slots }
 }
 
@@ -5032,16 +8409,17 @@ static DXGI_ADAPTER_VTBL: DxgiAdapterVtbl = build_dxgi_adapter_vtbl();
 
 const fn build_dxgi_output_vtbl() -> DxgiOutputVtbl {
     let mut slots = UNIMPL_SLOTS;
-    let mut pad = 0;
-    while pad < 22 {
-        slots[pad] = vslot(noop_ok as *const c_void);
-        pad += 1;
-    }
     slots[0] = vslot(dxgi_output_qi as *const c_void);
     slots[1] = vslot(com_add_ref as *const c_void);
     slots[2] = vslot(com_release as *const c_void);
+    fill_dxgi_object_slots(&mut slots);
+    slots[6] = vslot(noop_ok as *const c_void); // GetParent
     slots[7] = vslot(dxgi_output_get_desc as *const c_void);
-    slots[21] = vslot(dxgi_output_get_display_mode_list as *const c_void);
+    slots[8] = vslot(dxgi_output_get_display_mode_list as *const c_void);
+    slots[10] = vslot(noop_ok as *const c_void); // WaitForVBlank
+    slots[18] = vslot(dxgi_output_get_frame_statistics as *const c_void);
+    slots[19] = vslot(dxgi_output_get_display_mode_list1 as *const c_void);
+    slots[21] = vslot(dxgi_output_console_slot21 as *const c_void);
     DxgiOutputVtbl { slots }
 }
 
@@ -5930,5 +9308,200 @@ mod tests {
             assert!((out_f32[i * 4 + 2] - 10.0).abs() < 1e-3);
             assert!((out_f32[i * 4 + 3] - 5.0).abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn d3d12_object_private_data_get_device_and_resource_helpers() {
+        let mut dev_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            D3D12CreateDevice(ptr::null_mut(), 0xc200, &IID_ID3D12DEVICE, &mut dev_ptr),
+            S_OK
+        );
+        assert!(!dev_ptr.is_null());
+
+        // `GetPrivateData` sur clé absente renvoie `DXGI_ERROR_NOT_FOUND` (jamais `S_OK` silencieux).
+        let key = Guid::new(0x1122_3344, 0x5566, 0x7788, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut size = 8u32;
+        let mut out_val = 0u64;
+        assert_eq!(
+            d3d12_obj_get_private_data(dev_ptr.cast(), &key, &mut size, (&raw mut out_val).cast()),
+            DXGI_ERROR_NOT_FOUND
+        );
+
+        let payload: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        assert_eq!(
+            d3d12_obj_set_private_data(dev_ptr.cast(), &key, 8, (&raw const payload).cast()),
+            S_OK
+        );
+        let mut small = 4u32;
+        assert_eq!(
+            d3d12_obj_get_private_data(dev_ptr.cast(), &key, &mut small, (&raw mut out_val).cast()),
+            DXGI_ERROR_MORE_DATA
+        );
+        assert_eq!(small, 8);
+        assert_eq!(
+            d3d12_obj_get_private_data(dev_ptr.cast(), &key, &mut small, (&raw mut out_val).cast()),
+            S_OK
+        );
+        assert_eq!(out_val, payload);
+
+        // Effacement via `data_size = 0`.
+        assert_eq!(
+            d3d12_obj_set_private_data(dev_ptr.cast(), &key, 0, ptr::null()),
+            S_OK
+        );
+        assert_eq!(
+            d3d12_obj_get_private_data(dev_ptr.cast(), &key, &mut small, (&raw mut out_val).cast()),
+            DXGI_ERROR_NOT_FOUND
+        );
+
+        // `ID3D12CommandList::GetType` + `ID3D12DeviceChild::GetDevice` (slot 7).
+        let mut cl_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_create_command_list(
+                dev_ptr.cast(),
+                0,
+                2, // COMPUTE
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &IID_ID3D12GRAPHICSCOMMANDLIST,
+                &mut cl_ptr
+            ),
+            S_OK
+        );
+        assert_eq!(cmdlist_get_type(cl_ptr.cast()), 2);
+        let mut got_dev: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            d3d12_child_get_device(cl_ptr.cast(), &IID_ID3D12DEVICE, &mut got_dev),
+            S_OK
+        );
+        assert_eq!(got_dev, dev_ptr);
+
+        // `ID3D12Resource::WriteToSubresource` -> `ReadFromSubresource` + `GetHeapProperties`.
+        let tex_desc = D3D12ResourceDesc {
+            dimension: 3,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28,
+            sample_desc: DxgiSampleDesc {
+                count: 1,
+                quality: 0,
+            },
+            ..Default::default()
+        };
+        let res = alloc_d3d12_resource(tex_desc, false);
+        let src: Vec<u8> = (0u8..64).collect();
+        assert_eq!(
+            res_write_to_subresource(res, 0, ptr::null(), src.as_ptr(), 16, 64),
+            S_OK
+        );
+        let mut dst = vec![0u8; 64];
+        assert_eq!(
+            res_read_from_subresource(res, dst.as_mut_ptr(), 16, 64, 0, ptr::null()),
+            S_OK
+        );
+        assert_eq!(dst, src);
+
+        let mut hp = D3D12HeapProperties::default();
+        let mut flags = 99u32;
+        assert_eq!(res_get_heap_properties(res, &mut hp, &mut flags), S_OK);
+        assert_eq!(hp.heap_type, 4);
+        assert_eq!(hp.cpu_page_property, 3);
+        assert_eq!(hp.memory_pool_preference, 1);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn dxgi_adapter_and_output_expose_valid_descs_and_modes() {
+        let mut dev_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            D3D12CreateDevice(ptr::null_mut(), 0xc200, &IID_ID3D12DEVICE, &mut dev_ptr),
+            S_OK
+        );
+        let mut dxgi_dev: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            device_qi(dev_ptr.cast(), &IID_IDXGIDEVICE, &mut dxgi_dev),
+            S_OK
+        );
+        let mut adapter: *mut c_void = ptr::null_mut();
+        assert_eq!(dxgi_device_get_adapter(dxgi_dev.cast(), &mut adapter), S_OK);
+
+        let mut adesc = core::mem::MaybeUninit::<DxgiAdapterDesc>::zeroed();
+        assert_eq!(
+            dxgi_adapter_get_desc(adapter.cast(), adesc.as_mut_ptr()),
+            S_OK
+        );
+        // SAFETY: initialisé par `dxgi_adapter_get_desc`.
+        let adesc = unsafe { adesc.assume_init() };
+        assert_eq!(adesc.vendor_id, 0x1002);
+        assert!(adesc.dedicated_video_memory >= 8 * 1024 * 1024 * 1024);
+
+        let mut output: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            dxgi_adapter_enum_outputs(adapter.cast(), 0, &mut output),
+            S_OK
+        );
+        assert!(!output.is_null());
+        let mut output2: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            dxgi_adapter_enum_outputs(adapter.cast(), 1, &mut output2),
+            DXGI_ERROR_NOT_FOUND
+        );
+        assert!(output2.is_null());
+
+        let mut odesc = core::mem::MaybeUninit::<DxgiOutputDesc>::zeroed();
+        assert_eq!(
+            dxgi_output_get_desc(output.cast(), odesc.as_mut_ptr()),
+            S_OK
+        );
+        // SAFETY: initialisé par `dxgi_output_get_desc`.
+        let odesc = unsafe { odesc.assume_init() };
+        assert_eq!(odesc.desktop_coordinates, [0, 0, 3840, 2160]);
+        assert_eq!(odesc.attached_to_desktop, 1);
+
+        // `GetDisplayModeList` (slot 8) : taille puis remplissage.
+        let mut count = 0u32;
+        assert_eq!(
+            dxgi_output_get_display_mode_list(output.cast(), 28, 0, &mut count, ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(count, 4);
+        let mut modes = vec![
+            DxgiModeDesc {
+                width: 0,
+                height: 0,
+                refresh_num: 0,
+                refresh_den: 0,
+                format: 0,
+                scanline_ordering: 0,
+                scaling: 0,
+            };
+            count as usize
+        ];
+        assert_eq!(
+            dxgi_output_get_display_mode_list(output.cast(), 28, 0, &mut count, modes.as_mut_ptr()),
+            S_OK
+        );
+        assert_eq!(
+            (modes[0].width, modes[0].height, modes[0].format),
+            (3840, 2160, 28)
+        );
+
+        // Slot 21 console : 1 mode 4K@60Hz.
+        let mut c_count = 0u32;
+        assert_eq!(
+            dxgi_output_console_slot21(output.cast(), 28, 0, &mut c_count, ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(c_count, 1);
+        let mut c_mode = modes[0];
+        c_mode.width = 0;
+        assert_eq!(
+            dxgi_output_console_slot21(output.cast(), 28, 0, &mut c_count, &mut c_mode),
+            S_OK
+        );
+        assert_eq!((c_mode.width, c_mode.height), (3840, 2160));
     }
 }

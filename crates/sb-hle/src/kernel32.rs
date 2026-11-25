@@ -18,8 +18,8 @@ use sb_loader::{ImportSymbol, last_error, module_manager, set_last_error};
 
 use crate::file_io;
 use crate::process::{
-    HANDLE_PROCESS_HEAP, HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT, PSEUDO_CURRENT_PROCESS,
-    PSEUDO_CURRENT_THREAD, process_state,
+    HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT, PSEUDO_CURRENT_PROCESS, PSEUDO_CURRENT_THREAD,
+    process_heap_handle, process_state,
 };
 use crate::sync;
 
@@ -720,7 +720,7 @@ extern "win64" fn InitializeSListHead(head: *mut [u64; 2]) {
 // ---------- Mémoire & Tas ----------
 
 extern "win64" fn GetProcessHeap() -> usize {
-    HANDLE_PROCESS_HEAP
+    process_heap_handle()
 }
 
 extern "win64" fn HeapAlloc(_heap: usize, flags: u32, bytes: usize) -> *mut c_void {

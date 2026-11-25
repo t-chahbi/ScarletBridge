@@ -1078,6 +1078,49 @@ fn gdeflate_request_payload(
     Ok(out)
 }
 
+/// `DSTORAGE_REQUEST` console Xbox Series X (`dstorage_xs.h`, 72 octets).
+///
+/// Contrairement à la variante PC (104 octets, unions `Source`/`Destination` + `UncompressedSize`),
+/// la structure console est aplatie : `Options` (bit 0 = `ZlibDecompress` RFC 1950, bits 1..5 =
+/// `BcpackMode`, bit 21 = `DestinationIsPhysicalPages`, bit 22 = `SourceType`, bit 23 =
+/// `SourceIsPhysicalPages`), `Destination` (+8), `DestinationSize` (+24), `File`/`Source` (+32),
+/// `FileOffset` (+40), `SourceSize` (+48), `IntermediateSize` (+52), `CancellationTag` (+56),
+/// `Name` (+64).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DStorageRequestX {
+    pub options: u64,
+    pub destination: usize,
+    pub destination_page_offset: u16,
+    pub _pad0: [u8; 6],
+    pub destination_size: u32,
+    pub _pad1: u32,
+    pub source_or_file: usize,
+    pub file_offset: u64,
+    pub source_size: u32,
+    pub intermediate_size: u32,
+    pub cancellation_tag: u64,
+    pub name: usize,
+}
+
+impl DStorageRequestX {
+    fn zlib_decompress(&self) -> bool {
+        (self.options & 1) != 0
+    }
+    fn bcpack_mode(&self) -> u8 {
+        ((self.options >> 1) & 0xF) as u8
+    }
+    fn dest_is_physical_pages(&self) -> bool {
+        ((self.options >> 21) & 1) != 0
+    }
+    fn source_type(&self) -> u64 {
+        (self.options >> 22) & 1
+    }
+    fn source_is_physical_pages(&self) -> bool {
+        ((self.options >> 23) & 1) != 0
+    }
+}
+
 /// `DSTORAGE_REQUEST` (104 octets). Les unions source/destination sont conservées brutes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -1161,6 +1204,15 @@ const _: () = {
     assert!(offset_of!(DStorageRequest, destination) == 40);
     assert!(offset_of!(DStorageRequest, uncompressed_size) == 80);
     assert!(offset_of!(DStorageRequest, cancellation_tag) == 88);
+    assert!(size_of::<DStorageRequestX>() == 72);
+    assert!(offset_of!(DStorageRequestX, destination) == 8);
+    assert!(offset_of!(DStorageRequestX, destination_size) == 24);
+    assert!(offset_of!(DStorageRequestX, source_or_file) == 32);
+    assert!(offset_of!(DStorageRequestX, file_offset) == 40);
+    assert!(offset_of!(DStorageRequestX, source_size) == 48);
+    assert!(offset_of!(DStorageRequestX, intermediate_size) == 52);
+    assert!(offset_of!(DStorageRequestX, cancellation_tag) == 56);
+    assert!(offset_of!(DStorageRequestX, name) == 64);
     assert!(size_of::<DStorageErrorParametersRequest>() == 688);
     assert!(size_of::<DStorageErrorFirstFailure>() == 696);
     assert!(size_of::<DStorageErrorRecord>() == 704);
@@ -1182,11 +1234,16 @@ struct DsFileObject {
 }
 
 fn ds_file_from_ptr<'a>(p: usize) -> Option<&'a DsFileObject> {
-    if p == 0 {
+    if p < 0x1000 || !p.is_multiple_of(align_of::<ComHeader>()) {
         return None;
     }
-    // SAFETY: lecture du pointeur de vtable pour authentifier l'objet.
-    let vtbl = unsafe { (*(p as *const ComHeader)).vtbl };
+    let head = sb_loader::trampoline::peek_memory(p, 8);
+    if head.len() < 8 {
+        return None;
+    }
+    let vtbl = usize::from_le_bytes([
+        head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
+    ]) as *const c_void;
     if vtbl != (&raw const DS_FILE_VTBL).cast::<c_void>()
         && vtbl != (&raw const DS_FILE_X_VTBL).cast::<c_void>()
     {
@@ -1383,6 +1440,7 @@ static DS_STATUS_VTBL: DsStatusVtbl = DsStatusVtbl {
 #[derive(Debug, Clone)]
 enum DsCommand {
     Request { req: DStorageRequest, name: String },
+    RequestX { req: DStorageRequestX, name: String },
     Cancelled,
     Status { array: usize, index: u32 },
     Signal { fence: usize, value: u64 },
@@ -1398,6 +1456,7 @@ struct DsQueueState {
 
 struct DsQueueShared {
     desc: DStorageQueueDesc,
+    is_console: bool,
     state: Mutex<DsQueueState>,
     cv: Condvar,
     error: Mutex<DStorageErrorRecord>,
@@ -1496,12 +1555,10 @@ impl DsQueueShared {
             );
             return E_DSTORAGE_DECOMPRESSION_ERROR;
         }
-        // Lecture de la source.
+        // Lecture de la source (`dstorage.h` PC : `{IDStorageFile*, UINT64 Offset, UINT32 Size}`).
         let data: Vec<u8> = match req.source_type() {
             DSTORAGE_REQUEST_SOURCE_FILE => {
-                // Source fichier console : `{Offset, Size, IDStorageFile*}` (ordre des champs
-                // inversé par rapport à `dstorage.h` PC `{Source, Offset, Size}`).
-                let Some(f) = ds_file_from_ptr(req.source[2] as usize) else {
+                let Some(f) = ds_file_from_ptr(req.source[0] as usize) else {
                     sb_warn!(
                         DS_CHANNEL,
                         "poignée de fichier inconnue : source[0]={:#x}, source[1]={:#x}, source[2]={:#x}",
@@ -1514,9 +1571,9 @@ impl DsQueueShared {
                 let Some(file) = f.file.lock().clone() else {
                     return E_DSTORAGE_FILE_NOT_OPEN;
                 };
-                let size = req.source[1] as u32 as usize;
+                let size = req.source[2] as u32 as usize;
                 let mut buf = vec![0u8; size];
-                if let Err(e) = file.read_exact_at(&mut buf, req.source[0]) {
+                if let Err(e) = file.read_exact_at(&mut buf, req.source[1]) {
                     return if e.kind() == std::io::ErrorKind::UnexpectedEof {
                         E_DSTORAGE_END_OF_FILE
                     } else {
@@ -1605,6 +1662,156 @@ impl DsQueueShared {
         }
     }
 
+    /// Exécute une requête console Xbox Series X (`dstorage_xs.h`, 72 octets) avec support natif
+    /// de la décompression matérielle émulée **Zlib RFC 1950** (`ZlibDecompress = 1`) et des pages
+    /// physiques 64 Kio.
+    fn execute_request_x(&self, req: &DStorageRequestX) -> HResult {
+        const PAGE_SIZE: usize = 65536;
+        if req.source_type() != self.desc.source_type {
+            return E_DSTORAGE_INVALID_SOURCE_TYPE;
+        }
+        let src_size = req.source_size as usize;
+        let dst_size = req.destination_size as usize;
+
+        // 1. Lecture de la source (fichier ou mémoire).
+        let raw: Vec<u8> = match req.source_type() {
+            DSTORAGE_REQUEST_SOURCE_FILE => {
+                let Some(f) = ds_file_from_ptr(req.source_or_file) else {
+                    sb_warn!(
+                        DS_CHANNEL,
+                        "requête console : poignée de fichier inconnue {:#x} (off={:#x}, src_sz={}, dst_sz={})",
+                        req.source_or_file,
+                        req.file_offset,
+                        src_size,
+                        dst_size
+                    );
+                    return E_DSTORAGE_INVALID_FILE_HANDLE;
+                };
+                let Some(file) = f.file.lock().clone() else {
+                    return E_DSTORAGE_FILE_NOT_OPEN;
+                };
+                let mut buf = vec![0u8; src_size];
+                if let Err(e) = file.read_exact_at(&mut buf, req.file_offset) {
+                    return if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        E_DSTORAGE_END_OF_FILE
+                    } else {
+                        E_UNEXPECTED
+                    };
+                }
+                buf
+            }
+            _ => {
+                if src_size == 0 {
+                    Vec::new()
+                } else if req.source_or_file == 0 {
+                    return E_INVALIDARG;
+                } else if req.source_is_physical_pages() {
+                    let pages = req.source_or_file as *const usize;
+                    let mut rem = src_size;
+                    let mut off = (req.file_offset as u16) as usize;
+                    let mut p_idx = 0usize;
+                    let mut buf = Vec::with_capacity(src_size);
+                    while rem > 0 {
+                        // SAFETY: tableau de pages physiques fourni par l'invité.
+                        let base = unsafe { *pages.add(p_idx) };
+                        if base == 0 {
+                            return E_INVALIDARG;
+                        }
+                        let take = rem.min(PAGE_SIZE.saturating_sub(off));
+                        // SAFETY: page physique mappée.
+                        let slice =
+                            unsafe { std::slice::from_raw_parts((base + off) as *const u8, take) };
+                        buf.extend_from_slice(slice);
+                        rem -= take;
+                        off = 0;
+                        p_idx += 1;
+                    }
+                    buf
+                } else {
+                    // SAFETY: mémoire source valide jusqu'à complétion.
+                    unsafe { std::slice::from_raw_parts(req.source_or_file as *const u8, src_size) }
+                        .to_vec()
+                }
+            }
+        };
+
+        // 2. Décompression console (Zlib RFC 1950 / BCPack).
+        let bcpack = req.bcpack_mode();
+        let data = if req.zlib_decompress() {
+            let expected = if bcpack != 0 && req.intermediate_size > 0 {
+                req.intermediate_size as usize
+            } else {
+                dst_size
+            };
+            let mut out = Vec::new();
+            if out.try_reserve_exact(expected).is_err() {
+                return E_DSTORAGE_DECOMPRESSION_ERROR;
+            }
+            out.resize(expected, 0);
+            match crate::gdeflate::zlib_decompress(&raw, &mut out) {
+                Ok(written) => {
+                    out.truncate(written);
+                    out
+                }
+                Err(e) => {
+                    sb_warn!(
+                        DS_CHANNEL,
+                        "décompression Zlib console en échec ({} octets -> {} attendus, off={:#x}) : {e}",
+                        raw.len(),
+                        expected,
+                        req.file_offset
+                    );
+                    return E_DSTORAGE_DECOMPRESSION_ERROR;
+                }
+            }
+        } else {
+            raw
+        };
+
+        if bcpack != 0 {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                sb_warn!(
+                    DS_CHANNEL,
+                    "décompression BCPack console (mode={bcpack}) non implémentée -> E_DSTORAGE_DECOMPRESSION_ERROR"
+                );
+            }
+            return E_DSTORAGE_DECOMPRESSION_ERROR;
+        }
+
+        // 3. Écriture vers la destination (pointeur plat ou tableau de pages physiques 64 Kio).
+        if req.destination == 0 || dst_size < data.len() {
+            return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        }
+        if req.dest_is_physical_pages() {
+            let pages = req.destination as *const usize;
+            let mut pos = 0usize;
+            let mut off = usize::from(req.destination_page_offset);
+            let mut p_idx = 0usize;
+            while pos < data.len() {
+                // SAFETY: tableau de pages physiques destination fourni par l'invité.
+                let base = unsafe { *pages.add(p_idx) };
+                if base == 0 {
+                    return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+                }
+                let take = (data.len() - pos).min(PAGE_SIZE.saturating_sub(off));
+                // SAFETY: page physique mappée.
+                unsafe {
+                    ptr::copy_nonoverlapping(data.as_ptr().add(pos), (base + off) as *mut u8, take);
+                }
+                pos += take;
+                off = 0;
+                p_idx += 1;
+            }
+        } else {
+            // SAFETY: tampon destination de `dst_size >= data.len()` octets fourni par l'invité.
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr(), req.destination as *mut u8, data.len());
+            }
+        }
+        S_OK
+    }
+
     fn worker_loop(self: Arc<Self>) {
         let _ = sb_loader::init_thread_teb(0);
         sb_loader::module_manager().attach_current_thread_tls();
@@ -1627,6 +1834,18 @@ impl DsQueueShared {
                     let hr = self.execute_request(&req);
                     if hr != S_OK {
                         self.record_failure(hr, 0, Some((&req, &name)));
+                        if batch_hr == S_OK {
+                            batch_hr = hr;
+                        }
+                    }
+                }
+                DsCommand::RequestX { req, name } => {
+                    let hr = self.execute_request_x(&req);
+                    if hr != S_OK {
+                        self.record_failure(hr, 0, None);
+                        if !name.is_empty() {
+                            sb_warn!(DS_CHANNEL, "requête console '{name}' échouée : {hr:#010x}");
+                        }
                         if batch_hr == S_OK {
                             batch_hr = hr;
                         }
@@ -1683,6 +1902,7 @@ extern "win64" fn ds_queue_qi(
             IID_IDSTORAGE_QUEUE,
             IID_IDSTORAGE_QUEUE1,
             IID_IDSTORAGE_QUEUE2,
+            IID_IDSTORAGE_QUEUE_X,
         ],
     )
 }
@@ -1692,6 +1912,20 @@ extern "win64" fn ds_queue_enqueue_request(this: *mut DsQueueObject, req: *const
         let Some(q) = ds_queue(this) else { return };
         if req.is_null() {
             q.shared.record_failure(E_INVALIDARG, 0, None);
+            return;
+        }
+        if q.shared.is_console {
+            // SAFETY: `req` non-nul (structure console `DSTORAGE_REQUEST` de 72 octets).
+            let r = unsafe { ptr::read_unaligned(req.cast::<DStorageRequestX>()) };
+            let name = if r.name == 0 {
+                String::new()
+            } else {
+                // SAFETY: `Name` est une chaîne C terminée par NUL (optionnelle).
+                unsafe { std::ffi::CStr::from_ptr(r.name as *const core::ffi::c_char) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            q.shared.enqueue(DsCommand::RequestX { req: r, name });
             return;
         }
         // SAFETY: `req` non-nul (copie de 104 octets).
@@ -1765,12 +1999,14 @@ extern "win64" fn ds_queue_cancel(this: *mut DsQueueObject, mask: u64, value: u6
     ffi_guard!(DS_CHANNEL, "IDStorageQueue::CancelRequestsWithTag", (), {
         let Some(q) = ds_queue(this) else { return };
         let mut st = q.shared.state.lock();
-        let cancel = |c: &mut DsCommand| {
-            if let DsCommand::Request { req, .. } = c
-                && req.cancellation_tag & mask == value
-            {
+        let cancel = |c: &mut DsCommand| match c {
+            DsCommand::Request { req, .. } if req.cancellation_tag & mask == value => {
                 *c = DsCommand::Cancelled;
             }
+            DsCommand::RequestX { req, .. } if req.cancellation_tag & mask == value => {
+                *c = DsCommand::Cancelled;
+            }
+            _ => {}
         };
         st.pending.iter_mut().for_each(cancel);
         st.submitted.iter_mut().for_each(cancel);
@@ -1957,7 +2193,9 @@ fn validate_queue_desc(d: &DStorageQueueDesc) -> HResult {
     if !(-1..=2).contains(&d.priority) {
         return E_DSTORAGE_INVALID_QUEUE_PRIORITY;
     }
-    if d.source_type != DSTORAGE_REQUEST_SOURCE_FILE && d.source_type != DSTORAGE_REQUEST_SOURCE_MEMORY {
+    if d.source_type != DSTORAGE_REQUEST_SOURCE_FILE
+        && d.source_type != DSTORAGE_REQUEST_SOURCE_MEMORY
+    {
         return E_DSTORAGE_INVALID_SOURCE_TYPE;
     }
     S_OK
@@ -1965,9 +2203,10 @@ fn validate_queue_desc(d: &DStorageQueueDesc) -> HResult {
 
 /// Crée une file d'attente DirectStorage et l'écrit dans `out` (code commun à `CreateQueue` et
 /// `CreateQueueX`).
-fn spawn_dstorage_queue(out: *mut *mut c_void, d: DStorageQueueDesc) -> HResult {
+fn spawn_dstorage_queue(out: *mut *mut c_void, d: DStorageQueueDesc, is_console: bool) -> HResult {
     let shared = Arc::new(DsQueueShared {
         desc: d,
+        is_console,
         state: Mutex::new(DsQueueState::default()),
         cv: Condvar::new(),
         error: Mutex::new(DStorageErrorRecord::default()),
@@ -2029,7 +2268,9 @@ extern "win64" fn ds_factory_create_queue(
         ) {
             return E_NOINTERFACE;
         }
-        spawn_dstorage_queue(out, d)
+        // SAFETY: `riid` validé non-nul par `riid_matches`.
+        let is_console = unsafe { ptr::read_unaligned(riid) } == IID_IDSTORAGE_QUEUE_X;
+        spawn_dstorage_queue(out, d, is_console)
     })
 }
 
@@ -2044,22 +2285,27 @@ extern "win64" fn ds_factory_create_queue_x(
     _riid: *const Guid,
     out: *mut *mut c_void,
 ) -> HResult {
-    ffi_guard!(DS_CHANNEL, "IDStorageFactoryX::CreateQueueX", E_UNEXPECTED, {
-        write_out(out, ptr::null_mut());
-        if ds_factory(this).is_none() || desc.is_null() {
-            return E_INVALIDARG;
+    ffi_guard!(
+        DS_CHANNEL,
+        "IDStorageFactoryX::CreateQueueX",
+        E_UNEXPECTED,
+        {
+            write_out(out, ptr::null_mut());
+            if ds_factory(this).is_none() || desc.is_null() {
+                return E_INVALIDARG;
+            }
+            if out.is_null() {
+                return E_POINTER;
+            }
+            // SAFETY: `desc` non-nul (32 octets, layout console `DStorageQueueDesc`).
+            let d = unsafe { ptr::read_unaligned(desc) };
+            let valid = validate_queue_desc(&d);
+            if valid != S_OK {
+                return valid;
+            }
+            spawn_dstorage_queue(out, d, true)
         }
-        if out.is_null() {
-            return E_POINTER;
-        }
-        // SAFETY: `desc` non-nul (32 octets, layout console `DStorageQueueDesc`).
-        let d = unsafe { ptr::read_unaligned(desc) };
-        let valid = validate_queue_desc(&d);
-        if valid != S_OK {
-            return valid;
-        }
-        spawn_dstorage_queue(out, d)
-    })
+    )
 }
 
 fn resolve_guest_path(factory: &DsFactoryObject, guest: &str) -> Result<PathBuf, HResult> {
@@ -2178,7 +2424,10 @@ extern "win64" fn ds_factory_create_status_array(
             if out.is_null() {
                 return E_POINTER;
             }
-            if !riid_matches(riid, &[IID_IDSTORAGE_STATUS_ARRAY, IID_IDSTORAGE_STATUS_ARRAY_X]) {
+            if !riid_matches(
+                riid,
+                &[IID_IDSTORAGE_STATUS_ARRAY, IID_IDSTORAGE_STATUS_ARRAY_X],
+            ) {
                 return E_NOINTERFACE;
             }
             let obj = Box::new(DsStatusArrayObject {
@@ -2644,10 +2893,10 @@ mod tests {
             assert_eq!(get_info(file, &mut info), S_OK);
             assert_eq!(info.file_size_low, 4096);
             assert_eq!(info.file_attributes, 0x20);
-            // Slot 5 : première méthode non publique → E_NOTIMPL journalisé.
+            // Slot 5 : première méthode non publique → S_OK par tolérance journalisé.
             let slot5: extern "win64" fn(*mut c_void, usize, usize, usize) -> HResult =
                 core::mem::transmute(*vtbl.add(5));
-            assert_eq!(slot5(file, 0, 0, 0), sb_common::abi::E_NOTIMPL);
+            assert_eq!(slot5(file, 0, 0, 0), S_OK);
         }
         // Un IID inconnu reste refusé.
         let bogus = Guid::new(9, 9, 9, [9; 8]);
@@ -2813,7 +3062,7 @@ mod tests {
             let vtbl = *(fx as *const *const usize);
             let slot20: extern "win64" fn(*mut c_void, usize, usize, usize) -> HResult =
                 core::mem::transmute(*vtbl.add(20));
-            assert_eq!(slot20(fx, 0, 0, 0), sb_common::abi::E_NOTIMPL);
+            assert_eq!(slot20(fx, 0, 0, 0), S_OK);
             // Slot 8 : configuration (signature déduite) → S_OK ; taille nulle refusée.
             let slot8: extern "win64" fn(*mut c_void, u32, *const c_void, u32) -> HResult =
                 core::mem::transmute(*vtbl.add(8));
@@ -2998,6 +3247,77 @@ mod tests {
         ));
         assert_eq!(ds_status_get_hresult(st, 0), E_DSTORAGE_DECOMPRESSION_ERROR);
         ds_queue_close(q);
+    }
+
+    #[test]
+    fn dstorage_console_request_x_reads_and_zlib_decompresses() {
+        let (vfs, base) = temp_vfs();
+        // Flux Zlib RFC 1950 de "ScarletBridgeScarletBridgeScarletBridgeScarletBridge" (52 octets)
+        let zdata: [u8; 24] = [
+            120, 156, 11, 78, 78, 44, 202, 73, 45, 113, 42, 202, 76, 73, 79, 13, 38, 142, 3, 0, 28,
+            24, 20, 109,
+        ];
+        let mut blob = vec![0xEEu8; 64];
+        blob.extend_from_slice(&zdata);
+        std::fs::write(base.join("game/archive.bin"), &blob).expect("écriture archive");
+
+        let factory = new_factory(Some(vfs));
+        let path: Vec<u16> = "G:\\archive.bin\0".encode_utf16().collect();
+        let mut file: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            ds_factory_open_file(factory, path.as_ptr(), &IID_IDSTORAGE_FILE_X, &mut file),
+            S_OK
+        );
+
+        let desc = DStorageQueueDesc {
+            source_type: DSTORAGE_REQUEST_SOURCE_FILE,
+            capacity: DSTORAGE_MIN_QUEUE_CAPACITY,
+            priority: 0,
+            ..Default::default()
+        };
+        let mut q_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            ds_factory_create_queue_x(factory, &desc, &IID_IDSTORAGE_QUEUE_X, &mut q_ptr),
+            S_OK
+        );
+        let queue = q_ptr.cast::<DsQueueObject>();
+
+        let mut st_ptr: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            ds_factory_create_status_array(
+                factory,
+                2,
+                ptr::null(),
+                &IID_IDSTORAGE_STATUS_ARRAY_X,
+                &mut st_ptr
+            ),
+            S_OK
+        );
+        let status = st_ptr.cast::<DsStatusArrayObject>();
+
+        let expected = b"ScarletBridgeScarletBridgeScarletBridgeScarletBridge";
+        let mut dst = vec![0u8; expected.len()];
+        let req_x = DStorageRequestX {
+            options: 1, // bit 0 = ZlibDecompress, bit 22 = SourceType(0 = File)
+            destination: dst.as_mut_ptr() as usize,
+            destination_size: expected.len() as u32,
+            source_or_file: file as usize,
+            file_offset: 64,
+            source_size: zdata.len() as u32,
+            ..Default::default()
+        };
+        ds_queue_enqueue_request(queue, (&raw const req_x).cast());
+        ds_queue_enqueue_status(queue, st_ptr, 0);
+        let ev = crate::sync::create_event_handle(true, false);
+        ds_queue_enqueue_set_event(queue, ev);
+        ds_queue_submit(queue);
+        assert_eq!(crate::sync::WaitForSingleObject(ev, 2000), 0);
+        assert_eq!(ds_status_is_complete(status, 0), 1);
+        assert_eq!(ds_status_get_hresult(status, 0), S_OK);
+        assert_eq!(dst.as_slice(), expected);
+
+        ds_queue_close(queue);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

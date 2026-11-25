@@ -19,5 +19,6 @@ pub use pe_loader::{
     HleResolver, ImportSymbol, LoadedModule, LoaderError, ModuleManager, module_manager,
 };
 pub use teb::{
-    Peb, Teb, get_teb_tls_slot, init_thread_teb, last_error, set_last_error, set_teb_tls_slot,
+    Peb, Teb, get_teb_tls_slot, init_thread_teb, last_error, process_heap_handle, set_last_error,
+    set_teb_tls_slot,
 };

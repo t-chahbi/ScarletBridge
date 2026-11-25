@@ -12,9 +12,13 @@ use sb_vfs::VirtualFs;
 pub const HANDLE_STDIN: usize = 0x0000_0000_0000_1000;
 pub const HANDLE_STDOUT: usize = 0x0000_0000_0000_1001;
 pub const HANDLE_STDERR: usize = 0x0000_0000_0000_1002;
-pub const HANDLE_PROCESS_HEAP: usize = 0x0000_0001_0000_0000;
 pub const PSEUDO_CURRENT_PROCESS: usize = usize::MAX;
 pub const PSEUDO_CURRENT_THREAD: usize = usize::MAX - 1;
+
+/// Handle du tas processus principal (page mappée partagée avec `PEB.ProcessHeap`).
+pub fn process_heap_handle() -> usize {
+    sb_loader::process_heap_handle()
+}
 
 pub struct ProcessState {
     pub cmdline_wide: Vec<u16>,

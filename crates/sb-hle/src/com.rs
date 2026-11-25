@@ -458,6 +458,110 @@ const KNOWN_IIDS: &[(Guid, &str)] = &[
         ),
         "ID3D12PipelineLibrary",
     ),
+    (
+        Guid::new(
+            0xC4FE_C28F,
+            0x7966,
+            0x4E95,
+            [0x9F, 0x94, 0xF4, 0x31, 0xCB, 0x56, 0xC3, 0xB8],
+        ),
+        "ID3D12Object",
+    ),
+    (
+        Guid::new(
+            0x77AC_CE80,
+            0x638E,
+            0x4E65,
+            [0x88, 0x95, 0xC1, 0xF2, 0x33, 0x86, 0x86, 0x3E],
+        ),
+        "ID3D12Device1",
+    ),
+    (
+        Guid::new(
+            0x30BA_A41E,
+            0xB15B,
+            0x475C,
+            [0xA0, 0xBB, 0x1A, 0xF5, 0xC5, 0xB6, 0x43, 0x28],
+        ),
+        "ID3D12Device2",
+    ),
+    (
+        Guid::new(
+            0x81DA_DC15,
+            0x2BAD,
+            0x4392,
+            [0x93, 0xC5, 0x10, 0x13, 0x45, 0xC4, 0xAA, 0x98],
+        ),
+        "ID3D12Device3",
+    ),
+    (
+        Guid::new(
+            0xE865_DF17,
+            0xA9EE,
+            0x46F9,
+            [0xA4, 0x63, 0x30, 0x98, 0x31, 0x5A, 0xA2, 0xE5],
+        ),
+        "ID3D12Device4",
+    ),
+    (
+        Guid::new(
+            0x5531_03FB,
+            0x1FE7,
+            0x4557,
+            [0xBB, 0x38, 0x94, 0x6D, 0x7D, 0x0E, 0x7C, 0xA7],
+        ),
+        "ID3D12GraphicsCommandList1",
+    ),
+    (
+        Guid::new(
+            0x38C3_E585,
+            0xFF17,
+            0x412C,
+            [0x91, 0x50, 0x4F, 0xC6, 0xF9, 0xD7, 0x2A, 0x28],
+        ),
+        "ID3D12GraphicsCommandList2",
+    ),
+    (
+        Guid::new(
+            0x30BC_77B9,
+            0x8379,
+            0x4B25,
+            [0x95, 0xDE, 0xB8, 0x58, 0x8C, 0x42, 0x27, 0x5D],
+        ),
+        "ID3D12DmaCommandList",
+    ),
+    (
+        Guid::new(
+            0x4336_85FE,
+            0xE22B,
+            0x4CA0,
+            [0xA8, 0xDB, 0xB5, 0xB4, 0xF4, 0xDD, 0x0E, 0x4A],
+        ),
+        "ID3D12Fence1",
+    ),
+    (
+        Guid::new(
+            0xC36A_797C,
+            0xEC80,
+            0x4F0A,
+            [0x89, 0x85, 0xA7, 0xB2, 0x47, 0x50, 0x82, 0xD1],
+        ),
+        "ID3D12CommandSignature",
+    ),
+    (
+        Guid::new(
+            0x0D96_58AE,
+            0xED45,
+            0x469E,
+            [0xA6, 0x1D, 0x97, 0x0E, 0xC5, 0x83, 0xCA, 0xB4],
+        ),
+        "ID3D12QueryHeap",
+    ),
+    (IID_IDXGIDEVICE, "IDXGIDevice"),
+    (IID_IDXGIDEVICE1, "IDXGIDevice1"),
+    (IID_IDXGIDEVICE2, "IDXGIDevice2"),
+    (IID_IDXGIDEVICE3, "IDXGIDevice3"),
+    (IID_IDXGIADAPTER, "IDXGIAdapter"),
     (IID_IUNKNOWN, "IUnknown"),
 ];
 

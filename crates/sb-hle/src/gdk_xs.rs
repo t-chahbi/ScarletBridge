@@ -67,6 +67,8 @@ pub fn xmem_exports() -> HashMap<&'static str, usize> {
     reg!("XMemVirtualAlloc", XMemVirtualAlloc);
     reg!("XMemGetWorkingSetStatistics", XMemGetWorkingSetStatistics);
     reg!("XMemIsToolsMemAvailable", XMemIsToolsMemAvailable);
+    reg!("XMemGetWriteWatch", XMemGetWriteWatch);
+    reg!("XMemResetWriteWatch", XMemResetWriteWatch);
     m
 }
 
@@ -1140,17 +1142,18 @@ const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_ADDRESS: u32 = 487;
 
-/// Sortie (déduite) de `XMemGetWorkingSetStatistics` : seuls deux compteurs 64 bits sont écrits.
+/// Sortie de `XMemGetWorkingSetStatistics(kind, stats)` (ABI mesurée FSR / Xbox Series) :
+/// `+0` = budget mémoire total titre (RAM physique hôte ou repli 12 GiB), `+8` = working set courant.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct XMemWorkingSetStatistics {
+    pub title_memory_limit_bytes: u64,
     pub current_working_set_bytes: u64,
-    pub peak_working_set_bytes: u64,
 }
 
 const _: () = {
     assert!(size_of::<XMemWorkingSetStatistics>() == 16);
-    assert!(core::mem::offset_of!(XMemWorkingSetStatistics, peak_working_set_bytes) == 8);
+    assert!(core::mem::offset_of!(XMemWorkingSetStatistics, current_working_set_bytes) == 8);
 };
 
 struct PhysBacking {
@@ -1596,22 +1599,21 @@ extern "win64" fn XMemVirtualAlloc(
     })
 }
 
-/// `XMemTransferMemory(direction, size)` : déplace du budget mémoire entre partitions console.
-/// ScarletBridge n'émule qu'une partition au budget non borné : le transfert est validé
-/// (taille non nulle) et comptabilisé, sans effet sur l'espace d'adressage.
+/// `BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE direction, SIZE_T size)` : renvoie `TRUE` (1) en
+/// cas de succès, `FALSE` (0) si `size == 0` (ABI GDK : les appelants testent `if (!XMemTransferMemory(...))`).
 static XMEM_TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
-extern "win64" fn XMemTransferMemory(direction: u32, size: usize) -> HResult {
-    ffi_guard!(CHANNEL, "XMemTransferMemory", E_INVALIDARG, {
+extern "win64" fn XMemTransferMemory(direction: u32, size: usize) -> WinBool {
+    ffi_guard!(CHANNEL, "XMemTransferMemory", WIN_FALSE, {
         if size == 0 {
-            return E_INVALIDARG;
+            return xmem_fail(ERROR_INVALID_PARAMETER, WIN_FALSE);
         }
         XMEM_TRANSFERRED.fetch_add(size, Ordering::AcqRel);
         sb_info!(
             "xmem",
-            "XMemTransferMemory(direction={direction}, size={size}) -> S_OK (partition unique, budget non borné)"
+            "XMemTransferMemory(direction={direction}, size={size}) -> TRUE (partition unique, budget non borné)"
         );
-        S_OK
+        WIN_TRUE
     })
 }
 
@@ -1627,30 +1629,81 @@ fn proc_status_kib(field: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn host_total_phys_bytes() -> u64 {
+    let fallback = 12u64 * 1024 * 1024 * 1024;
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .map(|kib| kib.saturating_mul(1024))
+        .filter(|&b| b > 0)
+        .unwrap_or(fallback)
+}
+
+/// `BOOL XMemGetWorkingSetStatistics(UINT32 kind, XMEM_WORKING_SET_STATISTICS* out)` :
+/// renvoie `TRUE` (1) si rempli, `FALSE` (0) sinon (un retour `0` signale « pas de données »).
 extern "win64" fn XMemGetWorkingSetStatistics(
     kind: u32,
     out: *mut XMemWorkingSetStatistics,
-) -> HResult {
-    ffi_guard!(CHANNEL, "XMemGetWorkingSetStatistics", E_POINTER, {
+) -> WinBool {
+    ffi_guard!(CHANNEL, "XMemGetWorkingSetStatistics", WIN_FALSE, {
         if out.is_null() {
-            return E_POINTER;
+            return xmem_fail(ERROR_INVALID_PARAMETER, WIN_FALSE);
         }
         let stats = XMemWorkingSetStatistics {
+            title_memory_limit_bytes: host_total_phys_bytes(),
             current_working_set_bytes: proc_status_kib("VmRSS:") * 1024,
-            peak_working_set_bytes: proc_status_kib("VmHWM:") * 1024,
         };
         // SAFETY: `out` vérifié non-nul.
         unsafe { ptr::write_unaligned(out, stats) };
         sb_trace!(
             "xmem",
-            "XMemGetWorkingSetStatistics(kind={kind:#x}) -> {stats:?}"
+            "XMemGetWorkingSetStatistics(kind={kind:#x}) -> TRUE ({stats:?})"
         );
-        S_OK
+        WIN_TRUE
     })
 }
 
 extern "win64" fn XMemIsToolsMemAvailable() -> WinBool {
     WIN_FALSE
+}
+
+/// `UINT XMemGetWriteWatch(DWORD flags, void* base, SIZE_T size, void** addrs, ULONG_PTR* count, ULONG* gran)`.
+/// Renvoie `0` en cas de succès (`UINT::MAX` en cas d'erreur), avec 0 page sale et granularité 4 KiB.
+extern "win64" fn XMemGetWriteWatch(
+    _flags: u32,
+    base_address: *mut c_void,
+    region_size: usize,
+    _addresses: *mut *mut c_void,
+    count: *mut usize,
+    granularity: *mut u32,
+) -> u32 {
+    ffi_guard!(CHANNEL, "XMemGetWriteWatch", u32::MAX, {
+        if base_address.is_null() || region_size == 0 || count.is_null() {
+            return xmem_fail(ERROR_INVALID_PARAMETER, u32::MAX);
+        }
+        // SAFETY: `count` vérifié non-nul.
+        unsafe { ptr::write_unaligned(count, 0) };
+        if !granularity.is_null() {
+            // SAFETY: `granularity` vérifié non-nul.
+            unsafe { ptr::write_unaligned(granularity, 4096) };
+        }
+        0
+    })
+}
+
+/// `UINT XMemResetWriteWatch(void* base, SIZE_T size)` : renvoie `0` en cas de succès.
+extern "win64" fn XMemResetWriteWatch(base_address: *mut c_void, region_size: usize) -> u32 {
+    ffi_guard!(CHANNEL, "XMemResetWriteWatch", u32::MAX, {
+        if base_address.is_null() || region_size == 0 {
+            return xmem_fail(ERROR_INVALID_PARAMETER, u32::MAX);
+        }
+        0
+    })
 }
 
 // ---------- XboxBvhBuilder.dll : classe C++ `XboxBvhBuilder` (thiscall, rcx = this) ----------
@@ -1967,16 +2020,33 @@ mod xmem_bvh_tests {
     #[test]
     fn stats_tools_and_transfer() {
         let mut s = XMemWorkingSetStatistics::default();
-        assert_eq!(XMemGetWorkingSetStatistics(0x2000_000a, &mut s), S_OK);
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut s), WIN_TRUE);
+        assert!(s.title_memory_limit_bytes >= 1024 * 1024 * 1024);
         assert!(s.current_working_set_bytes > 0);
-        assert!(s.peak_working_set_bytes >= s.current_working_set_bytes / 2);
         assert_eq!(
             XMemGetWorkingSetStatistics(0x2000_0001, ptr::null_mut()),
-            E_POINTER
+            WIN_FALSE
         );
         assert_eq!(XMemIsToolsMemAvailable(), WIN_FALSE);
-        assert_eq!(XMemTransferMemory(1, 16 << 20), S_OK);
-        assert_eq!(XMemTransferMemory(1, 0), E_INVALIDARG);
+        assert_eq!(XMemTransferMemory(1, 16 << 20), WIN_TRUE);
+        assert_eq!(XMemTransferMemory(1, 0), WIN_FALSE);
+        let mut dummy = 0u64;
+        let mut count = 4usize;
+        let mut gran = 0u32;
+        assert_eq!(
+            XMemGetWriteWatch(
+                0,
+                (&raw mut dummy).cast(),
+                4096,
+                ptr::null_mut(),
+                &mut count,
+                &mut gran
+            ),
+            0
+        );
+        assert_eq!(count, 0);
+        assert_eq!(gran, 4096);
+        assert_eq!(XMemResetWriteWatch((&raw mut dummy).cast(), 4096), 0);
         let ex = xmem_exports();
         for n in [
             "XMemAllocatePhysicalPages",
@@ -1987,6 +2057,8 @@ mod xmem_bvh_tests {
             "XMemVirtualAlloc",
             "XMemGetWorkingSetStatistics",
             "XMemIsToolsMemAvailable",
+            "XMemGetWriteWatch",
+            "XMemResetWriteWatch",
         ] {
             assert!(ex.contains_key(n), "{n}");
         }

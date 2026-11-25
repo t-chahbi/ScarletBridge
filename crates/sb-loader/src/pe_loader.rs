@@ -1183,7 +1183,10 @@ const DEBUG_ASSERTION_PATCHES: &[(usize, u8, u8)] = &[
 fn apply_debug_assertion_patches(base: usize, image_size: usize) {
     for &(rva, expected, replacement) in DEBUG_ASSERTION_PATCHES {
         if rva >= image_size {
-            sb_warn!("loader", "patch d'assertion ignoré : rva {rva:#x} hors image");
+            sb_warn!(
+                "loader",
+                "patch d'assertion ignoré : rva {rva:#x} hors image"
+            );
             continue;
         }
         let slot = (base + rva) as *mut u8;

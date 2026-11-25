@@ -88,6 +88,24 @@ unsafe impl Sync for GlobalPeb {}
 
 static PEB: OnceLock<Mutex<GlobalPeb>> = OnceLock::new();
 
+#[repr(C, align(4096))]
+struct ProcessHeapPage([u8; 4096]);
+
+static PROCESS_HEAP_HANDLE: OnceLock<usize> = OnceLock::new();
+
+/// Handle du tas processus principal (`PEB.ProcessHeap` / `GetProcessHeap()`).
+///
+/// Sur Windows x64, `GetProcessHeap()` retourne un pointeur vers une structure `_HEAP`
+/// mappée en mémoire ; une sentinelle non mappée (ex. `0x1_0000_0000`) provoque un `SIGSEGV`
+/// dès qu'un runtime ou un outil de diagnostic lit `*GetProcessHeap()`. On adosse donc ce
+/// handle à une vraie page 4 Kio mappée et mise à zéro, valable toute la durée du processus.
+pub fn process_heap_handle() -> usize {
+    *PROCESS_HEAP_HANDLE.get_or_init(|| {
+        let page = Box::new(ProcessHeapPage([0u8; 4096]));
+        Box::into_raw(page) as usize
+    })
+}
+
 fn global_peb_ptr() -> *mut Peb {
     let lock = PEB.get_or_init(|| {
         let peb = Box::new(Peb {
@@ -101,7 +119,7 @@ fn global_peb_ptr() -> *mut Peb {
             ldr: 0,
             process_parameters: 0,
             sub_system_data: 0,
-            process_heap: 0x0000_0001_0000_0000,
+            process_heap: process_heap_handle(),
             _reserved: [0u8; 0x118 - 0x38],
             os_major_version: 10,
             os_minor_version: 0,
@@ -312,5 +330,15 @@ mod tests {
         }
         assert_eq!(gs_err, 126);
         assert_eq!(last_error(), 126);
+
+        // `PEB.ProcessHeap` doit pointer vers la même page réelle mappée que `process_heap_handle()`.
+        let heap = process_heap_handle();
+        assert_ne!(heap, 0);
+        assert_ne!(heap, 0x0000_0001_0000_0000);
+        // SAFETY: `gs_peb` pointe vers le `Peb` global et `heap` vers une page 4 Kio mappée.
+        unsafe {
+            assert_eq!((*(gs_peb as *const Peb)).process_heap, heap);
+            assert_eq!(*(heap as *const u64), 0);
+        }
     }
 }

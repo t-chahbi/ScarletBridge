@@ -138,10 +138,22 @@ pub struct Locimp {
     pub name: Yarn<u8>,
 }
 
-/// `std::locale` : unique membre `_Locimp* _Ptr`.
+/// `std::locale` (MSVC STL x64 `<xlocale>`) : hérite de deux bases vides (`_Locbase<int>` et
+/// `_Crt_new_delete`, sans `__declspec(empty_bases)`) → 8 octets de préfixe puis `_Locimp* _Ptr`
+/// à l'offset +8 (`sizeof(std::locale) == 16`).
 #[repr(C)]
 pub struct Locale {
+    pub _empty_bases_pad: usize,
     pub ptr: *mut Locimp,
+}
+
+impl Locale {
+    pub const fn new(ptr: *mut Locimp) -> Self {
+        Self {
+            _empty_bases_pad: 0,
+            ptr,
+        }
+    }
 }
 
 /// `std::_Lockit` : `int _Locktype`.
@@ -305,7 +317,8 @@ const _: () = assert!(offset_of!(Locimp, facetcount) == 0x18);
 const _: () = assert!(offset_of!(Locimp, catmask) == 0x20);
 const _: () = assert!(offset_of!(Locimp, xparent) == 0x24);
 const _: () = assert!(offset_of!(Locimp, name) == 0x28);
-const _: () = assert!(size_of::<Locale>() == 8);
+const _: () = assert!(size_of::<Locale>() == 16);
+const _: () = assert!(offset_of!(Locale, ptr) == 8);
 const _: () = assert!(size_of::<Lockit>() == 4);
 const _: () = assert!(size_of::<Locinfo>() == 0x68);
 const _: () = assert!(offset_of!(Locinfo, days) == 0x08);

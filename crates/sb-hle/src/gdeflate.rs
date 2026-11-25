@@ -644,6 +644,259 @@ fn decode_range(p: &Parsed<'_>, first: usize, out: &mut [u8]) -> Result<(), GDef
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Décompresseur standard RFC 1950 (Zlib) / RFC 1951 (DEFLATE) pour DirectStorage Xbox Series X
+// ---------------------------------------------------------------------------------------------
+
+const RFC1951_LEN_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+];
+const RFC1951_LEN_EXTRA: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+
+struct BitReader<'a> {
+    input: &'a [u8],
+    pos: usize,
+    buf: u64,
+    bits: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            pos: 0,
+            buf: 0,
+            bits: 0,
+        }
+    }
+
+    #[inline]
+    fn fill(&mut self) {
+        while self.bits <= 56 && self.pos < self.input.len() {
+            self.buf |= u64::from(self.input[self.pos]) << self.bits;
+            self.pos += 1;
+            self.bits += 8;
+        }
+    }
+
+    #[inline]
+    fn read_bits(&mut self, n: u32) -> Result<u32, GDeflateError> {
+        if n == 0 {
+            return Ok(0);
+        }
+        self.fill();
+        if self.bits < n {
+            return Err(GDeflateError::Truncated);
+        }
+        let v = (self.buf & ((1u64 << n) - 1)) as u32;
+        self.buf >>= n;
+        self.bits -= n;
+        Ok(v)
+    }
+
+    #[inline]
+    fn decode_huff(&mut self, table: &Huffman) -> Result<u16, GDeflateError> {
+        self.fill();
+        let (sym, len) = table
+            .decode(self.buf as u32)
+            .ok_or(GDeflateError::InvalidSymbol)?;
+        if self.bits < len {
+            return Err(GDeflateError::Truncated);
+        }
+        self.buf >>= len;
+        self.bits -= len;
+        Ok(sym)
+    }
+
+    fn align_byte(&mut self) {
+        let drop = self.bits & 7;
+        self.buf >>= drop;
+        self.bits -= drop;
+    }
+
+    fn read_aligned_u16(&mut self) -> Result<u16, GDeflateError> {
+        self.align_byte();
+        let lo = self.read_bits(8)? as u16;
+        let hi = self.read_bits(8)? as u16;
+        Ok(lo | (hi << 8))
+    }
+
+    fn read_aligned_bytes(&mut self, out: &mut [u8]) -> Result<(), GDeflateError> {
+        self.align_byte();
+        let mut i = 0;
+        while i < out.len() && self.bits >= 8 {
+            out[i] = (self.buf & 0xFF) as u8;
+            self.buf >>= 8;
+            self.bits -= 8;
+            i += 1;
+        }
+        let rem = out.len() - i;
+        if rem > 0 {
+            let src = self
+                .input
+                .get(self.pos..self.pos + rem)
+                .ok_or(GDeflateError::Truncated)?;
+            out[i..].copy_from_slice(src);
+            self.pos += rem;
+        }
+        Ok(())
+    }
+}
+
+fn decode_rfc1951_dynamic(r: &mut BitReader<'_>) -> Result<(Huffman, Huffman), GDeflateError> {
+    let nlit = r.read_bits(5)? as usize + 257;
+    let ndist = r.read_bits(5)? as usize + 1;
+    let nclen = r.read_bits(4)? as usize + 4;
+    if nlit > 286 || ndist > 30 {
+        return Err(GDeflateError::InvalidHuffmanCode);
+    }
+    let mut clens = [0u8; 19];
+    for &idx in PRECODE_ORDER.iter().take(nclen) {
+        clens[idx] = r.read_bits(3)? as u8;
+    }
+    let pre = Huffman::build(&clens)?;
+    let total = nlit + ndist;
+    let mut lens = [0u8; 286 + 32];
+    let mut i = 0usize;
+    while i < total {
+        let sym = r.decode_huff(&pre)?;
+        match sym {
+            0..=15 => {
+                lens[i] = sym as u8;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(GDeflateError::InvalidHuffmanCode);
+                }
+                let rep = r.read_bits(2)? as usize + 3;
+                let prev = lens[i - 1];
+                if i + rep > total {
+                    return Err(GDeflateError::InvalidHuffmanCode);
+                }
+                lens[i..i + rep].fill(prev);
+                i += rep;
+            }
+            17 => {
+                let rep = r.read_bits(3)? as usize + 3;
+                if i + rep > total {
+                    return Err(GDeflateError::InvalidHuffmanCode);
+                }
+                lens[i..i + rep].fill(0);
+                i += rep;
+            }
+            18 => {
+                let rep = r.read_bits(7)? as usize + 11;
+                if i + rep > total {
+                    return Err(GDeflateError::InvalidHuffmanCode);
+                }
+                lens[i..i + rep].fill(0);
+                i += rep;
+            }
+            _ => return Err(GDeflateError::InvalidHuffmanCode),
+        }
+    }
+    let lit = Huffman::build(&lens[..nlit])?;
+    let dist = Huffman::build(&lens[nlit..total])?;
+    Ok((lit, dist))
+}
+
+/// Décompresse un flux DEFLATE brut (RFC 1951) dans `dst` et renvoie le nombre d'octets produits.
+pub fn inflate_raw(src: &[u8], dst: &mut [u8]) -> Result<usize, GDeflateError> {
+    let mut r = BitReader::new(src);
+    let mut out_pos = 0usize;
+    loop {
+        let bfinal = r.read_bits(1)?;
+        let btype = r.read_bits(2)?;
+        match btype {
+            0 => {
+                let len = usize::from(r.read_aligned_u16()?);
+                let nlen = r.read_aligned_u16()?;
+                if (len as u16) ^ nlen != 0xFFFF {
+                    return Err(GDeflateError::BadHeader);
+                }
+                if out_pos + len > dst.len() {
+                    return Err(GDeflateError::OutputOverrun);
+                }
+                r.read_aligned_bytes(&mut dst[out_pos..out_pos + len])?;
+                out_pos += len;
+            }
+            1 | 2 => {
+                let (lit, dist) = if btype == 1 {
+                    static_codes()?
+                } else {
+                    decode_rfc1951_dynamic(&mut r)?
+                };
+                loop {
+                    let sym = r.decode_huff(&lit)?;
+                    if sym < 256 {
+                        if out_pos >= dst.len() {
+                            return Err(GDeflateError::OutputOverrun);
+                        }
+                        dst[out_pos] = sym as u8;
+                        out_pos += 1;
+                    } else if sym == 256 {
+                        break;
+                    } else {
+                        let lidx = usize::from(sym - 257);
+                        if lidx >= RFC1951_LEN_BASE.len() {
+                            return Err(GDeflateError::InvalidSymbol);
+                        }
+                        let extra_l = u32::from(RFC1951_LEN_EXTRA[lidx]);
+                        let length =
+                            usize::from(RFC1951_LEN_BASE[lidx]) + r.read_bits(extra_l)? as usize;
+                        let dsym = usize::from(r.decode_huff(&dist)?);
+                        if dsym >= 30 {
+                            return Err(GDeflateError::InvalidSymbol);
+                        }
+                        let extra_d = u32::from(DIST_EXTRA[dsym]);
+                        let distance =
+                            usize::from(DIST_BASE[dsym]) + r.read_bits(extra_d)? as usize;
+                        if distance == 0 || distance > out_pos {
+                            return Err(GDeflateError::DistanceTooFar);
+                        }
+                        if out_pos + length > dst.len() {
+                            return Err(GDeflateError::OutputOverrun);
+                        }
+                        for _ in 0..length {
+                            dst[out_pos] = dst[out_pos - distance];
+                            out_pos += 1;
+                        }
+                    }
+                }
+            }
+            _ => return Err(GDeflateError::InvalidBlockType),
+        }
+        if bfinal != 0 {
+            break;
+        }
+    }
+    Ok(out_pos)
+}
+
+/// Décompresse un flux **Zlib (RFC 1950)** (DirectStorage console `ZlibDecompress = 1`) ou un flux
+/// DEFLATE brut (RFC 1951) en repli si aucun en-tête Zlib valide n'est présent.
+pub fn zlib_decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, GDeflateError> {
+    if src.len() >= 2 {
+        let cmf = src[0];
+        let flg = src[1];
+        let cm = cmf & 0x0F;
+        let cinfo = cmf >> 4;
+        let hdr = (u16::from(cmf) << 8) | u16::from(flg);
+        if cm == 8 && cinfo <= 7 && hdr % 31 == 0 {
+            let start = if flg & 0x20 != 0 { 6 } else { 2 };
+            if start > src.len() {
+                return Err(GDeflateError::Truncated);
+            }
+            return inflate_raw(&src[start..], dst);
+        }
+    }
+    inflate_raw(src, dst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,5 +1152,43 @@ mod tests {
         m.extend(std::iter::repeat_n(0u8, 64));
         let mut out = vec![0u8; TILE_SIZE];
         assert!(gdeflate_decompress(&m, &mut out).is_err());
+    }
+
+    #[test]
+    fn zlib_decompress_rfc1950_stored_fixed_and_dynamic() {
+        // 1. Bloc stocké RFC 1950 (0x78 0x01 + BFINAL=1 BTYPE=00 + LEN=5 NLEN=0xFFFA + "hello")
+        let stored = [
+            0x78u8, 0x01, 0x01, 0x05, 0x00, 0xFA, 0xFF, b'h', b'e', b'l', b'l', b'o',
+        ];
+        let mut out = [0u8; 16];
+        assert_eq!(zlib_decompress(&stored, &mut out), Ok(5));
+        assert_eq!(&out[..5], b"hello");
+
+        // 2. Flux RFC 1950 compressé en Huffman fixe (BTYPE=1) : "ScarletBridge" x 4
+        let fixed = [
+            120u8, 156, 11, 78, 78, 44, 202, 73, 45, 113, 42, 202, 76, 73, 79, 13, 38, 142, 3, 0,
+            28, 24, 20, 109,
+        ];
+        let expected = b"ScarletBridgeScarletBridgeScarletBridgeScarletBridge";
+        let mut out2 = vec![0u8; expected.len()];
+        assert_eq!(zlib_decompress(&fixed, &mut out2), Ok(expected.len()));
+        assert_eq!(out2.as_slice(), expected);
+
+        // 3. Flux RFC 1950 compressé en Huffman dynamique (BTYPE=2, 300 octets)
+        let dynamic = [
+            120u8, 218, 61, 206, 135, 13, 192, 48, 12, 3, 193, 217, 228, 222, 163, 253, 167, 137,
+            45, 18, 250, 1, 14, 47, 34, 225, 22, 95, 201, 202, 168, 148, 82, 111, 237, 213, 173,
+            129, 230, 156, 235, 182, 95, 199, 250, 144, 170, 138, 128, 131, 71, 48, 65, 51, 14, 30,
+            193, 14, 205, 56, 120, 4, 15, 52, 227, 224, 17, 140, 252, 43, 238, 17, 108, 252, 155,
+            238, 17, 220, 252, 83, 247, 8, 6, 254, 101, 247, 8, 86, 254, 13, 247, 8, 174, 31, 124,
+            3, 84, 119,
+        ];
+        let mut expected_dyn = Vec::with_capacity(300);
+        for i in 0..60usize {
+            expected_dyn.extend(std::iter::repeat_n(65u8 + (i % 16) as u8, 3 + (i % 5)));
+        }
+        let mut out3 = vec![0u8; expected_dyn.len()];
+        assert_eq!(zlib_decompress(&dynamic, &mut out3), Ok(expected_dyn.len()));
+        assert_eq!(out3, expected_dyn);
     }
 }

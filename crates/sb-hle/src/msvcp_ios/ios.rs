@@ -254,9 +254,7 @@ extern "win64" fn ios_base_getloc(this: *const IosBase, ret: *mut Locale) -> *mu
         unsafe {
             let ploc = (*this).ploc;
             if ploc.is_null() {
-                ret.write(Locale {
-                    ptr: locale_init_imp(true),
-                });
+                ret.write(Locale::new(locale_init_imp(true)));
             } else {
                 locale_copy_into(ret, ploc);
             }
