@@ -5,14 +5,56 @@
 
 use crate::dxbc_to_spirv::{ShaderTranslateError, TranslatedShader, translate_dxbc_to_spirv};
 use crate::dxil::{is_dxil_container, translate_dxil_to_spirv};
+use crate::rdna2_native::{NativeShader, NativeStage, is_native_container};
 
-/// Aiguillage DXBC (SM4/SM5, chunk `SHDR`/`SHEX`) / DXIL (SM6.x, chunk `DXIL`/`ILDB`) d'après les
-/// chunks du conteneur : traduit le shader en SPIR-V 1.3 pour Vulkan. `stage` est le stage attendu
-/// par le pipeline (vérifié pour DXIL).
+fn translate_native_container(
+    bytes: &[u8],
+    stage: ShaderStage,
+) -> Result<TranslatedShader, ShaderTranslateError> {
+    let shader = NativeShader::parse(bytes)
+        .map_err(|e| ShaderTranslateError::InvalidNative(e.to_string()))?;
+    let found = match shader.meta.stage {
+        NativeStage::Vertex => ShaderStage::Vertex,
+        NativeStage::Pixel => ShaderStage::Pixel,
+        NativeStage::Compute => ShaderStage::Compute,
+    };
+    if found != stage {
+        return Err(ShaderTranslateError::InvalidNative(format!(
+            "étage {found:?} fourni, {stage:?} attendu"
+        )));
+    }
+    let t = shader
+        .translate()
+        .map_err(|e| ShaderTranslateError::InvalidNative(e.to_string()))?;
+    Ok(TranslatedShader {
+        stage: found,
+        spirv: t.spirv,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        used_cbuffers: Vec::new(),
+        used_textures: Vec::new(),
+        used_samplers: Vec::new(),
+        used_storage_buffers: Vec::new(),
+        used_srv_buffers: Vec::new(),
+        thread_group_size: shader.meta.local_size,
+        descriptor_heap: false,
+    })
+}
+
+/// Aiguillage DXBC (SM4/SM5, chunk `SHDR`/`SHEX`) / DXIL (SM6.x, chunk `DXIL`/`ILDB`) /
+/// `Rdna2Native` (conteneur `SBR2`, magie propre à ScarletBridge) : traduit le shader en SPIR-V 1.3
+/// pour Vulkan. `stage` est le stage attendu par le pipeline (vérifié pour DXIL et `SBR2`).
+///
+/// Pour `SBR2`, seul le SPIR-V est renvoyé ici : le modèle de liaison (user data, descripteurs)
+/// est exposé par [`crate::rdna2_native::NativeShader::translate`] et consommé par les pipelines
+/// natifs du renderer (`create_native_*_pipeline`), pas par le layout DXBC unifié.
 pub fn translate_shader(
     bytes: &[u8],
     stage: ShaderStage,
 ) -> Result<TranslatedShader, ShaderTranslateError> {
+    if is_native_container(bytes) {
+        return translate_native_container(bytes, stage);
+    }
     if is_dxil_container(bytes) {
         translate_dxil_to_spirv(bytes, stage)
     } else {
@@ -24,6 +66,8 @@ pub fn translate_shader(
 pub enum ShaderFormat {
     Dxbc,
     Dxil,
+    /// Code RDNA 2 brut dans un conteneur `SBR2` (voir [`crate::rdna2_native`]).
+    Rdna2Native,
     Unknown,
 }
 
@@ -53,6 +97,22 @@ pub struct ShaderContainer {
 impl ShaderContainer {
     /// Parse l'en-tête d'un conteneur DXBC/DXIL (`b"DXBC"`).
     pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if is_native_container(bytes) {
+            let s = NativeShader::parse(bytes).ok()?;
+            return Some(Self {
+                format: ShaderFormat::Rdna2Native,
+                stage: match s.meta.stage {
+                    NativeStage::Vertex => ShaderStage::Vertex,
+                    NativeStage::Pixel => ShaderStage::Pixel,
+                    NativeStage::Compute => ShaderStage::Compute,
+                },
+                major_version: 1,
+                minor_version: 0,
+                total_size: bytes.len(),
+                chunks: Vec::new(),
+                bytecode_len: s.code.len() * 4,
+            });
+        }
         if bytes.len() < 32 || &bytes[0..4] != b"DXBC" {
             return None;
         }
@@ -177,5 +237,20 @@ mod tests {
         assert_eq!(parsed.format, ShaderFormat::Dxbc);
         assert_eq!(parsed.stage, ShaderStage::Vertex);
         assert_eq!((parsed.major_version, parsed.minor_version), (5, 0));
+    }
+
+    #[test]
+    fn rdna2_native_container_is_detected_and_translated() {
+        let blob = crate::rdna2_native::samples::cs_affine().to_bytes();
+        let c = ShaderContainer::parse(&blob).expect("SBR2 valide");
+        assert_eq!(c.format, ShaderFormat::Rdna2Native);
+        assert_eq!(c.stage, ShaderStage::Compute);
+        let t = translate_shader(&blob, ShaderStage::Compute).expect("traduction");
+        assert_eq!(t.spirv[0], 0x0723_0203);
+        assert_eq!(t.thread_group_size, [64, 1, 1]);
+        // Mauvais étage attendu : refus explicite, pas de repli DXBC.
+        assert!(translate_shader(&blob, ShaderStage::Pixel).is_err());
+        // DXBC et DXIL restent aiguillés comme avant.
+        assert!(translate_shader(b"DXBC", ShaderStage::Pixel).is_err());
     }
 }

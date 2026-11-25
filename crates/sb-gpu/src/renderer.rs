@@ -25,6 +25,13 @@ use crate::dxbc_to_spirv::{
 use crate::shader::{ShaderStage, translate_shader};
 use crate::vulkan::{GpuContext, GpuError};
 
+mod native;
+pub use native::{
+    NativeBinding, NativeDispatchCmd, NativeDrawCmd, NativeImage, NativeSamplerDesc,
+    NativeStageState, native_format_texel_bytes,
+};
+use native::{NativePipelines, NativeTemp};
+
 const CBUFFER_BYTE_SIZE: u64 = (CBUFFER_VEC4_COUNT as u64) * 16; // 4096 octets (256 × vec4)
 /// Taille d'un Storage Buffer / UAV (`u0..u3`) : 256 KiB (16 384 `vec4`).
 pub const SSBO_BYTE_SIZE: u64 = 256 * 1024;
@@ -298,6 +305,8 @@ pub enum RenderCommand {
         vertex_offset: i32,
         first_instance: u32,
     },
+    /// `Draw` avec un pipeline natif RDNA 2 : ressources et user data portés par la commande.
+    NativeDraw(Box<NativeDrawCmd>),
 }
 
 /// Renderer Vulkan 3D + Compute complet : cible couleur + depth buffer, descriptors CB/Texture/Sampler/SSBO,
@@ -328,6 +337,12 @@ pub struct VulkanRenderer {
     bound_textures: [usize; MAX_TEXTURE_SLOTS as usize],
     pipelines: Vec<Option<GraphicsPipeline>>,
     compute_pipelines: Vec<Option<ComputePipeline>>,
+    /// Pipelines graphiques natifs RDNA 2 (clé = identifiant dans `pipelines`).
+    native_gfx: NativePipelines,
+    /// Pipelines compute natifs RDNA 2 (clé = identifiant dans `compute_pipelines`).
+    native_cs: NativePipelines,
+    native_images: Vec<Option<NativeImage>>,
+    native_pool: Option<vk::DescriptorPool>,
     // Optionnel : présentation directe vers un swapchain Wayland/SDL3.
     surface_loader: Option<ash::khr::surface::Instance>,
     swapchain_loader: Option<ash::khr::swapchain::Device>,
@@ -523,6 +538,10 @@ impl VulkanRenderer {
             bound_textures: [0; MAX_TEXTURE_SLOTS as usize],
             pipelines: Vec::new(),
             compute_pipelines: Vec::new(),
+            native_gfx: NativePipelines::new(),
+            native_cs: NativePipelines::new(),
+            native_images: Vec::new(),
+            native_pool: None,
             surface_loader: None,
             swapchain_loader: None,
             surface: None,
@@ -1110,6 +1129,55 @@ impl VulkanRenderer {
             .vertex_binding_descriptions(&bindings)
             .vertex_attribute_descriptions(&attrs);
 
+        let set_layouts = [self.descriptor_set_layout];
+        let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        // SAFETY: création du `VkPipelineLayout` (Set 0 CB+Tex+Sampler+SSBO) et du `VkPipeline` graphique.
+        let layout = unsafe { dev.create_pipeline_layout(&layout_info, None) }
+            .map_err(|e| format!("vkCreatePipelineLayout: {e}"))?;
+
+        let pipeline_res = self.create_gfx_pipeline_raw(&stages, &vertex_input, layout, cfg);
+
+        unsafe {
+            dev.destroy_shader_module(vs_module, None);
+            dev.destroy_shader_module(ps_module, None);
+        }
+
+        let pipeline = match pipeline_res {
+            Ok(p) => p,
+            Err(err) => {
+                unsafe { dev.destroy_pipeline_layout(layout, None) };
+                return Err(err);
+            }
+        };
+
+        let id = self.pipelines.len();
+        self.pipelines.push(Some(GraphicsPipeline {
+            gpu: Arc::clone(&self.gpu),
+            layout,
+            pipeline,
+        }));
+        sb_info!(
+            "renderer",
+            "VkPipeline graphique #{id} compilé nativement sur '{}' (blend={}, cull={:?}, stride={stride}o)",
+            self.gpu.caps.device_name,
+            cfg.blend_enable,
+            cfg.cull_mode
+        );
+        self.save_pipeline_cache();
+        Ok(id)
+    }
+
+    /// Crée un `VkPipeline` graphique (états raster / depth / blend de `cfg`, viewport et scissor
+    /// dynamiques, `render_pass` du renderer) à partir d'étages, d'un état d'entrée de sommets et
+    /// d'un layout déjà construits. Partagé par les pipelines DXBC/DXIL et RDNA 2 natifs.
+    pub(crate) fn create_gfx_pipeline_raw(
+        &self,
+        stages: &[vk::PipelineShaderStageCreateInfo],
+        vertex_input: &vk::PipelineVertexInputStateCreateInfo,
+        layout: vk::PipelineLayout,
+        cfg: &GraphicsPipelineConfig,
+    ) -> Result<vk::Pipeline, String> {
+        let dev = &self.gpu.device;
         let input_assembly =
             vk::PipelineInputAssemblyStateCreateInfo::default().topology(cfg.topology);
 
@@ -1157,15 +1225,9 @@ impl VulkanRenderer {
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        let set_layouts = [self.descriptor_set_layout];
-        let layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
-        // SAFETY: création du `VkPipelineLayout` (Set 0 CB+Tex+Sampler+SSBO) et du `VkPipeline` graphique.
-        let layout = unsafe { dev.create_pipeline_layout(&layout_info, None) }
-            .map_err(|e| format!("vkCreatePipelineLayout: {e}"))?;
-
         let gp_info = [vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
+            .stages(stages)
+            .vertex_input_state(vertex_input)
             .input_assembly_state(&input_assembly)
             .viewport_state(&viewport_state)
             .rasterization_state(&rasterizer)
@@ -1176,38 +1238,11 @@ impl VulkanRenderer {
             .layout(layout)
             .render_pass(self.render_pass)
             .subpass(0)];
-
-        let pipeline_res =
-            unsafe { dev.create_graphics_pipelines(self.pipeline_cache, &gp_info, None) };
-
-        unsafe {
-            dev.destroy_shader_module(vs_module, None);
-            dev.destroy_shader_module(ps_module, None);
+        // SAFETY: tous les états référencés vivent jusqu'à la fin de l'appel.
+        match unsafe { dev.create_graphics_pipelines(self.pipeline_cache, &gp_info, None) } {
+            Ok(list) => Ok(list[0]),
+            Err((_, err)) => Err(format!("vkCreateGraphicsPipelines: {err}")),
         }
-
-        let pipeline = match pipeline_res {
-            Ok(list) => list[0],
-            Err((_, err)) => {
-                unsafe { dev.destroy_pipeline_layout(layout, None) };
-                return Err(format!("vkCreateGraphicsPipelines: {err}"));
-            }
-        };
-
-        let id = self.pipelines.len();
-        self.pipelines.push(Some(GraphicsPipeline {
-            gpu: Arc::clone(&self.gpu),
-            layout,
-            pipeline,
-        }));
-        sb_info!(
-            "renderer",
-            "VkPipeline graphique #{id} compilé nativement sur '{}' (blend={}, cull={:?}, stride={stride}o)",
-            self.gpu.caps.device_name,
-            cfg.blend_enable,
-            cfg.cull_mode
-        );
-        self.save_pipeline_cache();
-        Ok(id)
     }
 
     /// Sauvegarde le `VkPipelineCache` sur disque de façon atomique (anti-stutter au lancement suivant).
@@ -1381,6 +1416,7 @@ impl VulkanRenderer {
                         | RenderCommand::ClearDepth { .. }
                         | RenderCommand::Draw { .. }
                         | RenderCommand::DrawIndexed { .. }
+                        | RenderCommand::NativeDraw(_)
                 )
             });
             if has_render_work {
@@ -1449,7 +1485,9 @@ impl VulkanRenderer {
                     gfx_start = i + 1;
                     saw_draw = false;
                 }
-                RenderCommand::Draw { .. } | RenderCommand::DrawIndexed { .. } => {
+                RenderCommand::Draw { .. }
+                | RenderCommand::DrawIndexed { .. }
+                | RenderCommand::NativeDraw(_) => {
                     saw_draw = true;
                 }
                 RenderCommand::UpdateConstantBuffer { .. } | RenderCommand::BindTexture { .. }
@@ -1534,6 +1572,10 @@ impl VulkanRenderer {
             self.write_all_descriptors();
         }
 
+        // Sets de descripteurs des `NativeDraw` (ressources résolues par le HLE).
+        let mut native_temp = NativeTemp::default();
+        let native_sets = self.native_prepare_draws(commands, &mut native_temp);
+
         let dev = &self.gpu.device;
         // SAFETY: enregistrement et soumission synchrone du CommandBuffer Vulkan.
         unsafe {
@@ -1601,14 +1643,17 @@ impl VulkanRenderer {
                 && let Some(Some(gp)) = self.pipelines.get(pid)
             {
                 dev.cmd_bind_pipeline(self.cmd_buf, vk::PipelineBindPoint::GRAPHICS, gp.pipeline);
-                dev.cmd_bind_descriptor_sets(
-                    self.cmd_buf,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    gp.layout,
-                    0,
-                    &[self.descriptor_set],
-                    &[],
-                );
+                // Un pipeline natif a son propre layout : le set est lié par `NativeDraw`.
+                if !self.native_gfx.contains_key(&pid) {
+                    dev.cmd_bind_descriptor_sets(
+                        self.cmd_buf,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        gp.layout,
+                        0,
+                        &[self.descriptor_set],
+                        &[],
+                    );
+                }
             }
 
             let mut draw_count = 0u32;
@@ -1656,14 +1701,63 @@ impl VulkanRenderer {
                                 vk::PipelineBindPoint::GRAPHICS,
                                 gp.pipeline,
                             );
+                            if !self.native_gfx.contains_key(&pipeline_id) {
+                                dev.cmd_bind_descriptor_sets(
+                                    self.cmd_buf,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    gp.layout,
+                                    0,
+                                    &[self.descriptor_set],
+                                    &[],
+                                );
+                            }
+                        }
+                    }
+                    RenderCommand::NativeDraw(ref nd) => {
+                        if let (Some(set), Some(Some(gp))) =
+                            (native_sets[i], self.pipelines.get(nd.pipeline_id))
+                        {
+                            dev.cmd_bind_pipeline(
+                                self.cmd_buf,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                gp.pipeline,
+                            );
                             dev.cmd_bind_descriptor_sets(
                                 self.cmd_buf,
                                 vk::PipelineBindPoint::GRAPHICS,
                                 gp.layout,
                                 0,
-                                &[self.descriptor_set],
+                                &[set],
                                 &[],
                             );
+                            dev.cmd_draw(
+                                self.cmd_buf,
+                                nd.vertex_count,
+                                nd.instance_count.max(1),
+                                nd.first_vertex,
+                                nd.first_instance,
+                            );
+                            draw_count += 1;
+                            // Le pipeline actif suivant (hors natif) doit être relié.
+                            if let Some(pid) = *active_pipeline
+                                && pid != nd.pipeline_id
+                                && !self.native_gfx.contains_key(&pid)
+                                && let Some(Some(other)) = self.pipelines.get(pid)
+                            {
+                                dev.cmd_bind_pipeline(
+                                    self.cmd_buf,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    other.pipeline,
+                                );
+                                dev.cmd_bind_descriptor_sets(
+                                    self.cmd_buf,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    other.layout,
+                                    0,
+                                    &[self.descriptor_set],
+                                    &[],
+                                );
+                            }
                         }
                     }
                     RenderCommand::SetVertexBuffer { .. } => {
@@ -1724,6 +1818,7 @@ impl VulkanRenderer {
                 dev.destroy_buffer(buf, None);
                 dev.free_memory(mem, None);
             }
+            self.native_release(native_temp);
 
             sb_debug!(
                 "renderer",
@@ -1945,6 +2040,11 @@ impl VulkanRenderer {
 
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
+        // SAFETY: attente d'inactivité avant de détruire les objets natifs.
+        unsafe {
+            let _ = self.gpu.device.device_wait_idle();
+        }
+        self.native_teardown();
         let dev = &self.gpu.device;
         // SAFETY: destruction ordonnée de toutes les ressources Vulkan.
         unsafe {

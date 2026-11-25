@@ -9,6 +9,8 @@ All technical architecture notes, ABI references, and contributor guides live he
 | [ROADMAP.md](../ROADMAP.md) | Completed milestones (Phases 1–4) and open engineering tracks (Phases 5–6) |
 | [LLM.md](../LLM.md) | Full technical architecture blueprint & phase design notes (French) |
 | [AGENTS.md](../AGENTS.md) | Strict engineering & ABI invariants for human and AI contributors |
+| [rdna2.md](rdna2.md) | AMD RDNA 2 ISA decoder and RDNA 2 → SPIR-V translator: coverage, assumptions, validation (French) |
+| [rdna2_pipeline.md](rdna2_pipeline.md) | Native RDNA 2 programs (`SBR2` container) run by the bridge: user-SGPR/V#/T#/S# binding model, limits (French) |
 | [abi/xmem.md](abi/xmem.md) | `xmem.dll` Xbox unified memory ABI notes (`XMemAlloc`, attributes, 64 KiB alignment) |
 | [SECURITY.md](../SECURITY.md) | VFS sandbox invariants, offline-by-default guarantees, and vulnerability reporting |
 | [CHANGELOG.md](../CHANGELOG.md) | Release and feature history |

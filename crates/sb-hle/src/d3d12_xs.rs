@@ -33,7 +33,20 @@ use sb_gpu::{
 use crate::com::{
     ComHeader, Guid, VtblSlot, com_add_ref, com_query_interface_list, com_release, vslot,
 };
+use crate::frame_pacer::FramePacer;
+use crate::gfx10_descriptors::{
+    self, BufferDesc, ImageDesc, ImageType, OobSelect, apply_d3d12_component_mapping,
+    dxgi_to_gfx10_format,
+};
+use crate::root_signature::{
+    DescriptorRange as RsDescriptorRange, ParsedRootSignature, RootParam as RsRootParam,
+    RootParamKind, StaticSampler as RsStaticSampler, clear_xbox_root_sig_flags, parse_rts0,
+    serialize_rts0_dxbc,
+};
 use crate::sync;
+
+#[path = "d3d12_native.rs"]
+mod native;
 
 const CHANNEL: &str = "d3d12_xs";
 
@@ -164,6 +177,104 @@ pub const IID_ID3D12DEVICE4: Guid = Guid::new(
     0xA9EE,
     0x46F9,
     [0xA4, 0x63, 0x30, 0x98, 0x31, 0x5A, 0xA2, 0xE5],
+);
+/// `ID3D12Device5`..`ID3D12Device10` (`d3d12.h`, vérifiés sur headers SDK/vkd3d).
+pub const IID_ID3D12DEVICE5: Guid = Guid::new(
+    0x8B4F_173B,
+    0x2FEA,
+    0x4B80,
+    [0x8F, 0x58, 0x43, 0x07, 0x19, 0x1A, 0xB9, 0x5D],
+);
+pub const IID_ID3D12DEVICE6: Guid = Guid::new(
+    0xC70B_221B,
+    0x40E4,
+    0x4A17,
+    [0x89, 0xAF, 0x02, 0x5A, 0x07, 0x27, 0xA6, 0xDC],
+);
+pub const IID_ID3D12DEVICE7: Guid = Guid::new(
+    0x5C01_4B53,
+    0x68A1,
+    0x4B9B,
+    [0x8B, 0xD1, 0xDD, 0x60, 0x46, 0xB9, 0x35, 0x8B],
+);
+pub const IID_ID3D12DEVICE8: Guid = Guid::new(
+    0x9218_E6BB,
+    0xF944,
+    0x4F7E,
+    [0xA7, 0x5C, 0xB1, 0xB2, 0xC7, 0xB7, 0x01, 0xF3],
+);
+pub const IID_ID3D12DEVICE9: Guid = Guid::new(
+    0x4C80_E962,
+    0xF032,
+    0x4F60,
+    [0xBC, 0x9E, 0xEB, 0xC2, 0xCF, 0xA1, 0xD8, 0x3C],
+);
+pub const IID_ID3D12DEVICE10: Guid = Guid::new(
+    0x517F_8718,
+    0xAA66,
+    0x49F9,
+    [0xB0, 0x2B, 0xA7, 0xAB, 0x89, 0xC0, 0x60, 0x31],
+);
+/// `ID3D12DeviceChild`, `ID3D12Pageable`, `ID3D12CommandList`, `ID3D12GraphicsCommandList3..7`.
+pub const IID_ID3D12DEVICECHILD: Guid = Guid::new(
+    0x905D_B94B,
+    0xA00C,
+    0x4140,
+    [0x9D, 0xF5, 0x2B, 0x64, 0xCA, 0x9E, 0xA3, 0x57],
+);
+pub const IID_ID3D12PAGEABLE: Guid = Guid::new(
+    0x63EE_58FB,
+    0x1268,
+    0x4835,
+    [0x86, 0xDA, 0xF0, 0x08, 0xCE, 0x62, 0xF0, 0xD6],
+);
+pub const IID_ID3D12COMMANDLIST: Guid = Guid::new(
+    0x7116_D91C,
+    0xE7E4,
+    0x47CE,
+    [0xB8, 0xC6, 0xEC, 0x81, 0x68, 0xF4, 0x37, 0xE5],
+);
+pub const IID_ID3D12GRAPHICSCOMMANDLIST3: Guid = Guid::new(
+    0x6FDA_83A7,
+    0xB84C,
+    0x4E38,
+    [0x9A, 0xC8, 0xC7, 0xBD, 0x22, 0x01, 0x6B, 0x3D],
+);
+pub const IID_ID3D12GRAPHICSCOMMANDLIST4: Guid = Guid::new(
+    0x8754_318E,
+    0xD3A9,
+    0x4541,
+    [0x98, 0xCF, 0x64, 0x5B, 0x50, 0xDC, 0x48, 0x74],
+);
+pub const IID_ID3D12GRAPHICSCOMMANDLIST5: Guid = Guid::new(
+    0x5505_0859,
+    0x4024,
+    0x474C,
+    [0x87, 0xF5, 0x64, 0x72, 0xEA, 0xEE, 0x44, 0xEA],
+);
+pub const IID_ID3D12GRAPHICSCOMMANDLIST6: Guid = Guid::new(
+    0xC382_7890,
+    0xE548,
+    0x4CFA,
+    [0x96, 0xCF, 0x56, 0x89, 0xA9, 0x37, 0x0F, 0x80],
+);
+pub const IID_ID3D12GRAPHICSCOMMANDLIST7: Guid = Guid::new(
+    0xDD17_1223,
+    0x8B61,
+    0x4769,
+    [0x90, 0xE3, 0x16, 0x0C, 0xCD, 0xE4, 0xE2, 0xC1],
+);
+pub const IID_ID3D12ROOTSIGNATUREDESERIALIZER: Guid = Guid::new(
+    0x34AB_647B,
+    0x3CC8,
+    0x46AC,
+    [0x84, 0x1B, 0xC0, 0x96, 0x56, 0x45, 0xC0, 0x46],
+);
+pub const IID_ID3D12VERSIONEDROOTSIGNATUREDESERIALIZER: Guid = Guid::new(
+    0x7F91_CE67,
+    0x090C,
+    0x4BB7,
+    [0xB7, 0x8E, 0xED, 0x8F, 0xF2, 0xE3, 0x1D, 0xA0],
 );
 /// `ID3D12CommandSignature` (`d3d12.h`).
 pub const IID_ID3D12COMMANDSIGNATURE: Guid = Guid::new(
@@ -750,6 +861,8 @@ struct SharedD3D12State {
     sdl_window: Mutex<Option<Sdl3Window>>,
     // Table des descripteurs SRV/CBV indexée par handle CPU/GPU D3D12.
     descriptors: Mutex<HashMap<usize, DescriptorBinding>>,
+    /// Images créées par le bridge pour les T# du chemin natif RDNA 2.
+    native_images: native::ImageCache,
     // Cadencement d'images console (`SetFrameIntervalX` / `WaitFrameEventX` / `PresentX`).
     frame_interval_us: AtomicU32,
     next_frame_token: AtomicU64,
@@ -768,6 +881,7 @@ impl SharedD3D12State {
             renderer: Mutex::new(renderer),
             sdl_window: Mutex::new(None),
             descriptors: Mutex::new(HashMap::new()),
+            native_images: Mutex::new(HashMap::new()),
             frame_interval_us: AtomicU32::new(16_667),
             // 0 est réservé (`D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL`) : commence à 1.
             next_frame_token: AtomicU64::new(1),
@@ -1465,6 +1579,8 @@ struct D3D12RootSigObject {
     header: ComHeader,
     /// Table `root_param_idx -> shader_register` décodée depuis `D3D12SerializeRootSignature`.
     param_registers: Vec<u32>,
+    /// Disposition des paramètres racine (nature, user-SGPR) pour le chemin natif RDNA 2.
+    layout: Option<Arc<native::RootSigLayout>>,
 }
 
 extern "win64" fn rootsig_qi(
@@ -1572,6 +1688,59 @@ static D3D12_QUERY_HEAP_VTBL: D3D12QueryHeapVtbl = build_query_heap_vtbl();
 // --- ID3D12RootSignatureDeserializer / ID3D12VersionedRootSignatureDeserializer ---
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct D3D12DescriptorRangeAbi {
+    range_type: u32,
+    num_descriptors: u32,
+    base_shader_register: u32,
+    register_space: u32,
+    offset_in_table: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct D3D12DescriptorRange1Abi {
+    range_type: u32,
+    num_descriptors: u32,
+    base_shader_register: u32,
+    register_space: u32,
+    flags: u32,
+    offset_in_table: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct D3D12StaticSamplerDescAbi {
+    filter: u32,
+    address_u: u32,
+    address_v: u32,
+    address_w: u32,
+    mip_lod_bias: f32,
+    max_anisotropy: u32,
+    comparison_func: u32,
+    border_color: u32,
+    min_lod: f32,
+    max_lod: f32,
+    shader_register: u32,
+    register_space: u32,
+    shader_visibility: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct D3D12StaticSamplerDesc1Abi {
+    base: D3D12StaticSamplerDescAbi,
+    flags: u32,
+}
+
+const _: () = {
+    assert!(size_of::<D3D12DescriptorRangeAbi>() == 20);
+    assert!(size_of::<D3D12DescriptorRange1Abi>() == 24);
+    assert!(size_of::<D3D12StaticSamplerDescAbi>() == 52);
+    assert!(size_of::<D3D12StaticSamplerDesc1Abi>() == 56);
+};
+
+#[repr(C)]
 struct D3D12RootSigDeserVtbl {
     slots: [VtblSlot; 5],
 }
@@ -1580,6 +1749,186 @@ struct D3D12RootSigDeserVtbl {
 struct D3D12RootSigDeserObject {
     header: ComHeader,
     desc: D3D12VersionedRootSignatureDesc,
+    // Tampons propriétaires pointés par `desc` (gardés vivants avec l'objet COM).
+    _owned_params: Vec<D3D12RootParameter>,
+    _owned_ranges_v10: Vec<Vec<D3D12DescriptorRangeAbi>>,
+    _owned_ranges_v11: Vec<Vec<D3D12DescriptorRange1Abi>>,
+    _owned_samplers_v10: Vec<D3D12StaticSamplerDescAbi>,
+    _owned_samplers_v12: Vec<D3D12StaticSamplerDesc1Abi>,
+}
+
+impl D3D12RootSigDeserObject {
+    fn from_parsed(parsed: &ParsedRootSignature) -> Box<Self> {
+        let use_v11 = parsed.version >= 2;
+        let use_v12_samplers = parsed.version >= 3;
+        let mut owned_ranges_v10 = Vec::new();
+        let mut owned_ranges_v11 = Vec::new();
+        let mut owned_params = Vec::with_capacity(parsed.params.len());
+
+        for p in &parsed.params {
+            match p.kind {
+                RootParamKind::Table => {
+                    let ranges_ptr = if use_v11 {
+                        let v: Vec<D3D12DescriptorRange1Abi> = p
+                            .ranges
+                            .iter()
+                            .map(|r| D3D12DescriptorRange1Abi {
+                                range_type: r.range_type,
+                                num_descriptors: r.num_descriptors,
+                                base_shader_register: r.base_shader_register,
+                                register_space: r.register_space,
+                                flags: r.flags,
+                                offset_in_table: r.offset_in_table,
+                            })
+                            .collect();
+                        let ptr_val = if v.is_empty() { 0 } else { v.as_ptr() as u64 };
+                        owned_ranges_v11.push(v);
+                        ptr_val
+                    } else {
+                        let v: Vec<D3D12DescriptorRangeAbi> = p
+                            .ranges
+                            .iter()
+                            .map(|r| D3D12DescriptorRangeAbi {
+                                range_type: r.range_type,
+                                num_descriptors: r.num_descriptors,
+                                base_shader_register: r.base_shader_register,
+                                register_space: r.register_space,
+                                offset_in_table: r.offset_in_table,
+                            })
+                            .collect();
+                        let ptr_val = if v.is_empty() { 0 } else { v.as_ptr() as u64 };
+                        owned_ranges_v10.push(v);
+                        ptr_val
+                    };
+                    owned_params.push(D3D12RootParameter {
+                        parameter_type: 0,
+                        _pad0: 0,
+                        data0: p.ranges.len() as u32,
+                        data1: 0,
+                        data2: ranges_ptr,
+                        shader_visibility: p.visibility,
+                        _pad1: 0,
+                    });
+                }
+                RootParamKind::Constants => {
+                    owned_params.push(D3D12RootParameter {
+                        parameter_type: 1,
+                        _pad0: 0,
+                        data0: p.shader_register,
+                        data1: p.register_space,
+                        data2: u64::from(p.num_values),
+                        shader_visibility: p.visibility,
+                        _pad1: 0,
+                    });
+                }
+                RootParamKind::Cbv | RootParamKind::Srv | RootParamKind::Uav => {
+                    let pt = match p.kind {
+                        RootParamKind::Cbv => 2,
+                        RootParamKind::Srv => 3,
+                        _ => 4,
+                    };
+                    owned_params.push(D3D12RootParameter {
+                        parameter_type: pt,
+                        _pad0: 0,
+                        data0: p.shader_register,
+                        data1: p.register_space,
+                        data2: if use_v11 {
+                            u64::from(p.descriptor_flags)
+                        } else {
+                            0
+                        },
+                        shader_visibility: p.visibility,
+                        _pad1: 0,
+                    });
+                }
+            }
+        }
+
+        let mut owned_samplers_v10 = Vec::new();
+        let mut owned_samplers_v12 = Vec::new();
+        let samplers_ptr: *const c_void = if use_v12_samplers {
+            owned_samplers_v12 = parsed
+                .static_samplers
+                .iter()
+                .map(|s| D3D12StaticSamplerDesc1Abi {
+                    base: D3D12StaticSamplerDescAbi {
+                        filter: s.filter,
+                        address_u: s.address_u,
+                        address_v: s.address_v,
+                        address_w: s.address_w,
+                        mip_lod_bias: s.mip_lod_bias,
+                        max_anisotropy: s.max_anisotropy,
+                        comparison_func: s.comparison_func,
+                        border_color: s.border_color,
+                        min_lod: s.min_lod,
+                        max_lod: s.max_lod,
+                        shader_register: s.shader_register,
+                        register_space: s.register_space,
+                        shader_visibility: s.visibility,
+                    },
+                    flags: s.flags,
+                })
+                .collect();
+            if owned_samplers_v12.is_empty() {
+                ptr::null()
+            } else {
+                owned_samplers_v12.as_ptr().cast()
+            }
+        } else {
+            owned_samplers_v10 = parsed
+                .static_samplers
+                .iter()
+                .map(|s| D3D12StaticSamplerDescAbi {
+                    filter: s.filter,
+                    address_u: s.address_u,
+                    address_v: s.address_v,
+                    address_w: s.address_w,
+                    mip_lod_bias: s.mip_lod_bias,
+                    max_anisotropy: s.max_anisotropy,
+                    comparison_func: s.comparison_func,
+                    border_color: s.border_color,
+                    min_lod: s.min_lod,
+                    max_lod: s.max_lod,
+                    shader_register: s.shader_register,
+                    register_space: s.register_space,
+                    shader_visibility: s.visibility,
+                })
+                .collect();
+            if owned_samplers_v10.is_empty() {
+                ptr::null()
+            } else {
+                owned_samplers_v10.as_ptr().cast()
+            }
+        };
+
+        let params_ptr = if owned_params.is_empty() {
+            ptr::null()
+        } else {
+            owned_params.as_ptr()
+        };
+        Box::new(Self {
+            header: ComHeader::new((&raw const D3D12_ROOTSIG_DESER_VTBL).cast()),
+            desc: D3D12VersionedRootSignatureDesc {
+                version: parsed.version.clamp(1, 3),
+                _pad0: 0,
+                desc: D3D12RootSignatureDesc {
+                    num_parameters: owned_params.len() as u32,
+                    _pad0: 0,
+                    parameters: params_ptr,
+                    num_static_samplers: parsed.static_samplers.len() as u32,
+                    _pad1: 0,
+                    static_samplers: samplers_ptr,
+                    flags: parsed.flags,
+                    _pad2: 0,
+                },
+            },
+            _owned_params: owned_params,
+            _owned_ranges_v10: owned_ranges_v10,
+            _owned_ranges_v11: owned_ranges_v11,
+            _owned_samplers_v10: owned_samplers_v10,
+            _owned_samplers_v12: owned_samplers_v12,
+        })
+    }
 }
 
 extern "win64" fn rootsig_deser_qi(
@@ -1587,7 +1936,16 @@ extern "win64" fn rootsig_deser_qi(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> HResult {
-    com_query_interface_list("ID3D12RootSignatureDeserializer", this, riid, ppv, &[])
+    com_query_interface_list(
+        "ID3D12RootSignatureDeserializer",
+        this,
+        riid,
+        ppv,
+        &[
+            IID_ID3D12ROOTSIGNATUREDESERIALIZER,
+            IID_ID3D12VERSIONEDROOTSIGNATUREDESERIALIZER,
+        ],
+    )
 }
 
 extern "win64" fn rootsig_deser_get_desc(
@@ -1636,6 +1994,8 @@ struct D3D12PsoObject {
     header: ComHeader,
     pipeline_id: usize,
     is_compute: bool,
+    /// Métadonnées des shaders `SBR2` (chemin natif RDNA 2) ; `None` pour DXBC/DXIL.
+    native: Option<Arc<native::NativePso>>,
 }
 
 extern "win64" fn pso_qi(
@@ -2219,6 +2579,8 @@ struct D3D12CmdAllocVtbl {
 #[repr(C)]
 struct D3D12CmdAllocObject {
     header: ComHeader,
+    oom_callback: AtomicUsize,
+    oom_context: AtomicUsize,
 }
 
 extern "win64" fn alloc_qi(
@@ -2231,8 +2593,36 @@ extern "win64" fn alloc_qi(
         this,
         riid,
         ppv,
-        &[IID_ID3D12COMMANDALLOCATOR],
+        &[
+            IID_ID3D12COMMANDALLOCATOR,
+            IID_ID3D12PAGEABLE,
+            IID_ID3D12DEVICECHILD,
+            IID_ID3D12OBJECT,
+        ],
     )
+}
+
+/// Slot 9 console sur `ID3D12CommandAllocator` : enregistrement d'un callback d'allocation /
+/// out-of-memory console `(this, pCallback, pContext, flags)`.
+extern "win64" fn alloc_slot9_set_callback(
+    this: *mut D3D12CmdAllocObject,
+    callback: usize,
+    context: usize,
+    flags: usize,
+) -> HResult {
+    ffi_guard!(CHANNEL, "ID3D12CommandAllocator::slot9", E_UNEXPECTED, {
+        if !this.is_null() {
+            // SAFETY: `this` vérifié non-nul.
+            let a = unsafe { &*this };
+            a.oom_callback.store(callback, Ordering::Release);
+            a.oom_context.store(context, Ordering::Release);
+        }
+        sb_debug!(
+            CHANNEL,
+            "ID3D12CommandAllocator::slot9(cb={callback:#x}, ctx={context:#x}, flags={flags:#x}) -> S_OK"
+        );
+        S_OK
+    })
 }
 
 const fn build_alloc_vtbl() -> D3D12CmdAllocVtbl {
@@ -2242,6 +2632,7 @@ const fn build_alloc_vtbl() -> D3D12CmdAllocVtbl {
     slots[2] = vslot(com_release as *const c_void);
     fill_d3d12_child_slots(&mut slots);
     slots[8] = vslot(noop_ok as *const c_void); // Reset
+    slots[9] = vslot(alloc_slot9_set_callback as *const c_void); // Callback console
     D3D12CmdAllocVtbl { slots }
 }
 
@@ -2289,6 +2680,20 @@ enum RecordedOp {
         handle: usize,
         slot: u32,
     },
+    /// `DrawInstanced` avec un PSO natif RDNA 2 (user-SGPR capturés à l'enregistrement).
+    NativeDraw {
+        pso: Arc<native::NativePso>,
+        pipeline_id: usize,
+        user_data: Vec<u32>,
+        counts: (u32, u32, u32, u32),
+    },
+    /// `Dispatch` avec un PSO natif RDNA 2.
+    NativeDispatch {
+        pso: Arc<native::NativePso>,
+        pipeline_id: usize,
+        user_data: Vec<u32>,
+        groups: (u32, u32, u32),
+    },
     WriteValue32 {
         address: u64,
         value: u32,
@@ -2316,6 +2721,8 @@ struct D3D12CmdListObject {
     closed: Mutex<bool>,
     graphics_root_regs: Mutex<Vec<u32>>,
     compute_root_regs: Mutex<Vec<u32>>,
+    /// Arguments racine / PSO courants pour le chemin natif RDNA 2.
+    native: Mutex<native::NativeListState>,
     /// Arènes d'upload allouées via `AllocateUploadMemory` (slot 148).
     upload_arenas: Mutex<Vec<Vec<u8>>>,
     /// Type de liste de commandes (`D3D12_COMMAND_LIST_TYPE` : 0=DIRECT, 2=COMPUTE, 3=COPY, 6=DMA).
@@ -2328,6 +2735,30 @@ const _: () = {
 };
 
 impl D3D12CmdListObject {
+    /// `Draw` d'un PSO natif : capture les user-SGPR courants (arguments racine graphiques).
+    fn native_draw_op(&self, counts: (u32, u32, u32, u32)) -> Option<RecordedOp> {
+        let n = self.native.lock();
+        let (pipeline_id, pso) = n.gfx_pso.clone()?;
+        Some(RecordedOp::NativeDraw {
+            pso,
+            pipeline_id,
+            user_data: n.gfx.user_data(),
+            counts,
+        })
+    }
+
+    /// `Dispatch` d'un PSO natif : capture les user-SGPR courants (arguments racine compute).
+    fn native_dispatch_op(&self, groups: (u32, u32, u32)) -> Option<RecordedOp> {
+        let n = self.native.lock();
+        let (pipeline_id, pso) = n.cs_pso.clone()?;
+        Some(RecordedOp::NativeDispatch {
+            pso,
+            pipeline_id,
+            user_data: n.cs.user_data(),
+            groups,
+        })
+    }
+
     fn resolve_gfx_slot(&self, root_param_idx: u32) -> u32 {
         let regs = self.graphics_root_regs.lock();
         regs.get(root_param_idx as usize)
@@ -2368,7 +2799,14 @@ extern "win64" fn cmdlist_qi(
             IID_ID3D12GRAPHICSCOMMANDLIST,
             IID_ID3D12GRAPHICSCOMMANDLIST1,
             IID_ID3D12GRAPHICSCOMMANDLIST2,
+            IID_ID3D12GRAPHICSCOMMANDLIST3,
+            IID_ID3D12GRAPHICSCOMMANDLIST4,
+            IID_ID3D12GRAPHICSCOMMANDLIST5,
+            IID_ID3D12GRAPHICSCOMMANDLIST6,
+            IID_ID3D12GRAPHICSCOMMANDLIST7,
+            IID_ID3D12COMMANDLIST,
             IID_ID3D12CONSDMACOMMANDLIST,
+            IID_ID3D12DEVICECHILD,
             IID_ID3D12OBJECT,
         ],
     )
@@ -2398,9 +2836,13 @@ extern "win64" fn cmdlist_reset(
     ops.clear();
     cl.graphics_root_regs.lock().clear();
     cl.compute_root_regs.lock().clear();
+    *cl.native.lock() = native::NativeListState::default();
     if d3d_known_object_name(initial_state as usize) == Some("ID3D12PipelineState") {
         // SAFETY: `initial_state` validé comme `D3D12PsoObject` du bridge.
         let pso = unsafe { &*initial_state };
+        cl.native
+            .lock()
+            .note_pso(pso.pipeline_id, pso.is_compute, &pso.native);
         let rc = if pso.is_compute {
             RenderCommand::SetComputePipeline {
                 pipeline_id: pso.pipeline_id,
@@ -2428,6 +2870,15 @@ extern "win64" fn cmdlist_draw_instanced(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    if let Some(op) = cl.native_draw_op((
+        vertex_count,
+        instance_count.max(1),
+        start_vertex,
+        start_instance,
+    )) {
+        cl.ops.lock().push(op);
+        return;
+    }
     cl.ops.lock().push(RecordedOp::Render(RenderCommand::Draw {
         vertex_count,
         instance_count: instance_count.max(1),
@@ -2449,6 +2900,13 @@ extern "win64" fn cmdlist_draw_indexed_instanced(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    if cl.native.lock().gfx_pso.is_some() {
+        sb_warn!(
+            CHANNEL,
+            "DrawIndexedInstanced ignoré : non supporté avec un pipeline natif RDNA 2 (le VS lit ses sommets par V#)"
+        );
+        return;
+    }
     cl.ops
         .lock()
         .push(RecordedOp::Render(RenderCommand::DrawIndexed {
@@ -2471,6 +2929,14 @@ extern "win64" fn cmdlist_dispatch(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    if let Some(op) = cl.native_dispatch_op((
+        thread_group_x.max(1),
+        thread_group_y.max(1),
+        thread_group_z.max(1),
+    )) {
+        cl.ops.lock().push(op);
+        return;
+    }
     cl.ops.lock().push(RecordedOp::ComputeDispatch {
         x: thread_group_x.max(1),
         y: thread_group_y.max(1),
@@ -2797,6 +3263,9 @@ extern "win64" fn cmdlist_set_pipeline_state(
     // SAFETY: `this` non-nul et `pso` validé comme `ID3D12PipelineState` du bridge.
     let cl = unsafe { &*this };
     let p = unsafe { &*pso };
+    cl.native
+        .lock()
+        .note_pso(p.pipeline_id, p.is_compute, &p.native);
     let rc = if p.is_compute {
         RenderCommand::SetComputePipeline {
             pipeline_id: p.pipeline_id,
@@ -2820,6 +3289,7 @@ extern "win64" fn cmdlist_set_compute_root_sig(
     let cl = unsafe { &*this };
     let rs = unsafe { &*root_sig };
     *cl.compute_root_regs.lock() = rs.param_registers.clone();
+    cl.native.lock().cs.set_signature(rs.layout.clone());
 }
 
 extern "win64" fn cmdlist_set_graphics_root_sig(
@@ -2833,6 +3303,7 @@ extern "win64" fn cmdlist_set_graphics_root_sig(
     let cl = unsafe { &*this };
     let rs = unsafe { &*root_sig };
     *cl.graphics_root_regs.lock() = rs.param_registers.clone();
+    cl.native.lock().gfx.set_signature(rs.layout.clone());
 }
 
 extern "win64" fn cmdlist_set_compute_root_desc_table(
@@ -2845,6 +3316,10 @@ extern "win64" fn cmdlist_set_compute_root_desc_table(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    cl.native
+        .lock()
+        .cs
+        .set_table(root_param_idx, base_gpu_handle);
     let slot = cl.resolve_table_slot(true, root_param_idx);
     cl.ops.lock().push(RecordedOp::BindDescriptorTable {
         handle: base_gpu_handle as usize,
@@ -2862,6 +3337,10 @@ extern "win64" fn cmdlist_set_graphics_root_desc_table(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    cl.native
+        .lock()
+        .gfx
+        .set_table(root_param_idx, base_gpu_handle);
     let slot = cl.resolve_table_slot(false, root_param_idx);
     cl.ops.lock().push(RecordedOp::BindDescriptorTable {
         handle: base_gpu_handle as usize,
@@ -2874,7 +3353,7 @@ extern "win64" fn cmdlist_set_compute_root_32bit_constants(
     root_param_idx: u32,
     num_32bit_values: u32,
     src_data: *const u32,
-    _dest_offset: u32,
+    dest_offset: u32,
 ) {
     if this.is_null() || src_data.is_null() || num_32bit_values == 0 || num_32bit_values > 256 {
         return;
@@ -2886,6 +3365,16 @@ extern "win64" fn cmdlist_set_compute_root_32bit_constants(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    let words: Vec<u32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    cl.native
+        .lock()
+        .cs
+        .set_constants(root_param_idx, dest_offset, &words);
     let slot = cl.resolve_compute_slot(root_param_idx);
     cl.ops
         .lock()
@@ -2900,7 +3389,7 @@ extern "win64" fn cmdlist_set_graphics_root_32bit_constants(
     root_param_idx: u32,
     num_32bit_values: u32,
     src_data: *const u32,
-    _dest_offset: u32,
+    dest_offset: u32,
 ) {
     if this.is_null() || src_data.is_null() || num_32bit_values == 0 || num_32bit_values > 256 {
         return;
@@ -2912,6 +3401,16 @@ extern "win64" fn cmdlist_set_graphics_root_32bit_constants(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    let words: Vec<u32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    cl.native
+        .lock()
+        .gfx
+        .set_constants(root_param_idx, dest_offset, &words);
     let slot = cl.resolve_gfx_slot(root_param_idx);
     cl.ops
         .lock()
@@ -2931,6 +3430,7 @@ extern "win64" fn cmdlist_set_compute_root_cbv(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    cl.native.lock().cs.set_va(root_param_idx, buffer_location);
     let slot = cl.resolve_compute_slot(root_param_idx);
     cl.ops.lock().push(RecordedOp::BindRootCbv {
         slot,
@@ -2948,6 +3448,7 @@ extern "win64" fn cmdlist_set_graphics_root_cbv(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    cl.native.lock().gfx.set_va(root_param_idx, buffer_location);
     let slot = cl.resolve_gfx_slot(root_param_idx);
     cl.ops.lock().push(RecordedOp::BindRootCbv {
         slot,
@@ -2965,11 +3466,64 @@ extern "win64" fn cmdlist_set_compute_root_storage(
     }
     // SAFETY: `this` valide.
     let cl = unsafe { &*this };
+    cl.native.lock().cs.set_va(root_param_idx, buffer_location);
     let slot = cl.resolve_compute_slot(root_param_idx);
     cl.ops.lock().push(RecordedOp::BindComputeStorage {
         slot,
         addr: buffer_location,
     });
+}
+
+/// `SetComputeRoot32BitConstant(RootParameterIndex, SrcData, DestOffsetIn32BitValues)` (slot 33,
+/// vtable PC publique) : alimente uniquement les user-SGPR du chemin natif RDNA 2.
+extern "win64" fn cmdlist_set_compute_root_32bit_constant(
+    this: *mut D3D12CmdListObject,
+    root_param_idx: u32,
+    src_data: u32,
+    dest_offset: u32,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` valide.
+    let cl = unsafe { &*this };
+    cl.native
+        .lock()
+        .cs
+        .set_constants(root_param_idx, dest_offset, &[src_data]);
+}
+
+/// `SetGraphicsRoot32BitConstant` (slot 34, vtable PC publique).
+extern "win64" fn cmdlist_set_graphics_root_32bit_constant(
+    this: *mut D3D12CmdListObject,
+    root_param_idx: u32,
+    src_data: u32,
+    dest_offset: u32,
+) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` valide.
+    let cl = unsafe { &*this };
+    cl.native
+        .lock()
+        .gfx
+        .set_constants(root_param_idx, dest_offset, &[src_data]);
+}
+
+/// `SetGraphicsRootShaderResourceView` / `SetGraphicsRootUnorderedAccessView` (slots 40 et 42,
+/// vtable PC publique) : alimentent uniquement les user-SGPR du chemin natif RDNA 2.
+extern "win64" fn cmdlist_set_graphics_root_srv_uav(
+    this: *mut D3D12CmdListObject,
+    root_param_idx: u32,
+    buffer_location: u64,
+) {
+    if this.is_null() || buffer_location == 0 {
+        return;
+    }
+    // SAFETY: `this` valide.
+    let cl = unsafe { &*this };
+    cl.native.lock().gfx.set_va(root_param_idx, buffer_location);
 }
 
 extern "win64" fn cmdlist_ia_set_index_buffer(
@@ -3244,12 +3798,16 @@ const fn build_cmdlist_vtbl() -> D3D12CmdListVtbl {
     slots[30] = vslot(cmdlist_set_graphics_root_sig as *const c_void);
     slots[31] = vslot(cmdlist_set_compute_root_desc_table as *const c_void);
     slots[32] = vslot(cmdlist_set_graphics_root_desc_table as *const c_void);
+    slots[33] = vslot(cmdlist_set_compute_root_32bit_constant as *const c_void);
+    slots[34] = vslot(cmdlist_set_graphics_root_32bit_constant as *const c_void);
     slots[35] = vslot(cmdlist_set_compute_root_32bit_constants as *const c_void);
     slots[36] = vslot(cmdlist_set_graphics_root_32bit_constants as *const c_void);
     slots[37] = vslot(cmdlist_set_compute_root_cbv as *const c_void);
     slots[38] = vslot(cmdlist_set_graphics_root_cbv as *const c_void);
     slots[39] = vslot(cmdlist_set_compute_root_storage as *const c_void);
+    slots[40] = vslot(cmdlist_set_graphics_root_srv_uav as *const c_void);
     slots[41] = vslot(cmdlist_set_compute_root_storage as *const c_void);
+    slots[42] = vslot(cmdlist_set_graphics_root_srv_uav as *const c_void);
     slots[43] = vslot(cmdlist_ia_set_index_buffer as *const c_void);
     slots[44] = vslot(cmdlist_ia_set_vertex_buffers as *const c_void);
     slots[47] = vslot(cmdlist_clear_dsv as *const c_void);
@@ -3679,6 +4237,43 @@ extern "win64" fn queue_execute_command_lists(
                             Err(err) => sb_warn!(CHANNEL, "readback_rgba échoué: {err}"),
                         }
                     }
+                    RecordedOp::NativeDraw {
+                        pso,
+                        pipeline_id,
+                        user_data,
+                        counts,
+                    } => {
+                        let (vs, ps) = {
+                            let mut ctx = native::ResolveCtx {
+                                renderer: &mut renderer,
+                                pending: &mut render_cmds,
+                                descs: &descs,
+                                images: &q.shared.native_images,
+                            };
+                            let vs = native::resolve_stage(&mut ctx, &pso.stages[0], user_data);
+                            let ps = native::resolve_stage(&mut ctx, &pso.stages[1], user_data);
+                            (vs, ps)
+                        };
+                        render_cmds.push(native::draw_cmd(*pipeline_id, *counts, vs, ps));
+                    }
+                    RecordedOp::NativeDispatch {
+                        pso,
+                        pipeline_id,
+                        user_data,
+                        groups,
+                    } => {
+                        flush_render(&mut renderer, &mut render_cmds);
+                        let cs = {
+                            let mut ctx = native::ResolveCtx {
+                                renderer: &mut renderer,
+                                pending: &mut render_cmds,
+                                descs: &descs,
+                                images: &q.shared.native_images,
+                            };
+                            native::resolve_stage(&mut ctx, &pso.stages[0], user_data)
+                        };
+                        native::run_dispatch(&mut renderer, *pipeline_id, *groups, cs);
+                    }
                     RecordedOp::BindDescriptorTable { handle, slot } => {
                         if let Some(&binding) = descs.get(handle) {
                             match binding {
@@ -4001,6 +4596,12 @@ extern "win64" fn device_qi(
             IID_ID3D12DEVICE2,
             IID_ID3D12DEVICE3,
             IID_ID3D12DEVICE4,
+            IID_ID3D12DEVICE5,
+            IID_ID3D12DEVICE6,
+            IID_ID3D12DEVICE7,
+            IID_ID3D12DEVICE8,
+            IID_ID3D12DEVICE9,
+            IID_ID3D12DEVICE10,
             IID_ID3D12OBJECT,
         ],
     )
@@ -4228,6 +4829,11 @@ extern "win64" fn device_create_graphics_pso(
             unsafe { std::slice::from_raw_parts(d.ps.shader_bytecode, d.ps.bytecode_length) };
 
         let cfg = build_graphics_pipeline_config(d);
+        if sb_gpu::rdna2_native::is_native_container(vs_bytes)
+            || sb_gpu::rdna2_native::is_native_container(ps_bytes)
+        {
+            return native::create_native_graphics_pso(dev, vs_bytes, ps_bytes, &cfg, out_pso);
+        }
         let mut renderer = dev.shared.renderer.lock();
         match renderer.create_pipeline_from_dxbc_with_config(vs_bytes, ps_bytes, &cfg) {
             Ok(pipeline_id) => {
@@ -4238,6 +4844,7 @@ extern "win64" fn device_create_graphics_pso(
                     )),
                     pipeline_id,
                     is_compute: false,
+                    native: None,
                 });
                 // SAFETY: `out_pso` vérifié non-nul.
                 unsafe {
@@ -4278,6 +4885,9 @@ extern "win64" fn device_create_compute_pso(
         let cs_bytes =
             unsafe { std::slice::from_raw_parts(d.cs.shader_bytecode, d.cs.bytecode_length) };
 
+        if sb_gpu::rdna2_native::is_native_container(cs_bytes) {
+            return native::create_native_compute_pso(dev, cs_bytes, out_pso);
+        }
         let mut renderer = dev.shared.renderer.lock();
         match renderer.create_compute_pipeline_from_dxbc(cs_bytes) {
             Ok(pipeline_id) => {
@@ -4288,6 +4898,7 @@ extern "win64" fn device_create_compute_pso(
                     )),
                     pipeline_id,
                     is_compute: true,
+                    native: None,
                 });
                 // SAFETY: `out_pso` vérifié non-nul.
                 unsafe {
@@ -4456,9 +5067,17 @@ extern "win64" fn device_create_command_list(
         closed: Mutex::new(false),
         graphics_root_regs: Mutex::new(Vec::new()),
         compute_root_regs: Mutex::new(Vec::new()),
+        native: Mutex::new(native::NativeListState::default()),
         upload_arenas: Mutex::new(Vec::new()),
         list_type,
     });
+    if d3d_known_object_name(initial_state as usize) == Some("ID3D12PipelineState") {
+        // SAFETY: `initial_state` validé comme `D3D12PsoObject` du bridge.
+        let pso = unsafe { &*initial_state };
+        cl.native
+            .lock()
+            .note_pso(pso.pipeline_id, pso.is_compute, &pso.native);
+    }
     // SAFETY: `out_list` vérifié non-nul.
     unsafe {
         *out_list = Box::into_raw(cl).cast();
@@ -4761,6 +5380,7 @@ extern "win64" fn device_create_root_signature(
         return E_POINTER;
     }
     let mut param_registers = Vec::new();
+    let mut layout = None;
     if !blob.is_null() && blob_len >= 8 {
         // SAFETY: `blob[..blob_len]` est le blob retourné par `D3D12SerializeRootSignature`.
         let bytes = unsafe { std::slice::from_raw_parts(blob.cast::<u8>(), blob_len) };
@@ -4777,6 +5397,29 @@ extern "win64" fn device_create_root_signature(
                     ]));
                 }
             }
+            // Extension : `count` paires (type, num_values) après les registres.
+            let ext = 8 + count * 4;
+            let rd = |o: usize| {
+                bytes
+                    .get(o..o + 4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            };
+            let params: Option<Vec<_>> = (0..count)
+                .map(|i| {
+                    let kind = native::RootSigLayout::kind_from_d3d12(rd(ext + i * 8)?)?;
+                    Some((kind, rd(ext + i * 8 + 4)?))
+                })
+                .collect();
+            if let Some(p) = params {
+                layout = native::RootSigLayout::from_params(p).map(Arc::new);
+            }
+        } else if &bytes[0..4] == b"DXBC"
+            && let Ok(sig) = crate::root_signature::parse_rts0(bytes)
+        {
+            layout = native::RootSigLayout::from_params(
+                sig.params.iter().map(|p| (p.kind, p.num_values)).collect(),
+            )
+            .map(Arc::new);
         }
     }
     let rs = Box::new(D3D12RootSigObject {
@@ -4785,6 +5428,7 @@ extern "win64" fn device_create_root_signature(
             "ID3D12RootSignature",
         )),
         param_registers,
+        layout,
     });
     // SAFETY: `out_rs` vérifié non-nul.
     unsafe {
@@ -5899,6 +6543,7 @@ extern "win64" fn device_create_derived_pso(
             )),
             pipeline_id,
             is_compute,
+            native: None,
         });
         // SAFETY: `out_pso` vérifié non-nul.
         unsafe { *out_pso = Box::into_raw(pso).cast() };
@@ -5967,6 +6612,7 @@ fn create_console_pso_multi_arg(
         )),
         pipeline_id: 0,
         is_compute,
+        native: None,
     });
     let raw = Box::into_raw(pso).cast::<c_void>();
     // SAFETY: `out_addr` est vérifié mappé (`peek_memory`) et suit `REFIID` (ou `a4` par défaut).
@@ -6443,6 +7089,18 @@ pub(crate) extern "win64" fn D3D12SerializeRootSignature(
                 for p in params {
                     let shader_reg = if p.parameter_type == 0 { 0 } else { p.data0 };
                     data.extend_from_slice(&shader_reg.to_le_bytes());
+                }
+                // Extension (lue par `CreateRootSignature`) : nature et nombre de dwords de chaque
+                // paramètre, pour le compactage user-SGPR du chemin natif RDNA 2. Les lecteurs
+                // anciens ne lisent que les `n` registres ci-dessus.
+                for p in params {
+                    let num_values = if p.parameter_type == 1 {
+                        (p.data2 & 0xFFFF_FFFF) as u32
+                    } else {
+                        0
+                    };
+                    data.extend_from_slice(&p.parameter_type.to_le_bytes());
+                    data.extend_from_slice(&num_values.to_le_bytes());
                 }
             } else {
                 data.extend_from_slice(&0u32.to_le_bytes());

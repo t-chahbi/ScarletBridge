@@ -22,6 +22,7 @@ members = [
     "tests/harness/eh-test",
     "tests/harness/aaa-pipeline-bench",
     "tests/harness/api-conformance",
+    "tests/harness/rdna2-native",
 ]
 
 [workspace.package]

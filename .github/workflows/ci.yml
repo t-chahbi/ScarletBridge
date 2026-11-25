@@ -70,6 +70,7 @@ jobs:
             -p sb-harness-d3d12-triangle \
             -p sb-harness-d3d12-cube \
             -p sb-harness-aaa-pipeline-bench \
+            -p sb-harness-rdna2-native \
             -- -D warnings
       - name: Build native launcher & cross-compile PE32+ binaries
         run: |
@@ -85,7 +86,8 @@ jobs:
             -p sb-harness-mt-io-stress \
             -p sb-harness-d3d12-triangle \
             -p sb-harness-d3d12-cube \
-            -p sb-harness-aaa-pipeline-bench
+            -p sb-harness-aaa-pipeline-bench \
+            -p sb-harness-rdna2-native
       - name: Execute PE32+ x86-64 harnesses natively (Zero Wine)
         env:
           SB_HEADLESS: "1"
@@ -97,3 +99,4 @@ jobs:
           ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/d3d12_triangle.exe
           ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/d3d12_cube.exe
           ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/aaa_pipeline_bench.exe
+          ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/rdna2_native.exe

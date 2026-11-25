@@ -94,6 +94,7 @@ mise exec -- cargo clippy --target x86_64-pc-windows-gnu \
   -p sb-harness-dll-probe -p sb-harness-seriesx-smoke \
   -p sb-harness-mt-io-stress -p sb-harness-d3d12-triangle \
   -p sb-harness-d3d12-cube -p sb-harness-aaa-pipeline-bench \
+  -p sb-harness-rdna2-native \
   -- -D warnings
 
 # 4. Full Workspace Unit & Live GPU Tests
@@ -104,7 +105,8 @@ mise exec -- cargo build -p sb-launcher
 mise exec -- cargo build --target x86_64-pc-windows-gnu \
   -p sb-dll-xmem -p sb-harness-dll-probe -p sb-harness-seriesx-smoke \
   -p sb-harness-mt-io-stress -p sb-harness-d3d12-triangle \
-  -p sb-harness-d3d12-cube -p sb-harness-aaa-pipeline-bench
+  -p sb-harness-d3d12-cube -p sb-harness-aaa-pipeline-bench \
+  -p sb-harness-rdna2-native
 
 SB_HEADLESS=1 ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/dll_probe.exe -- xmem.dll --self-test-xmem
 SB_HEADLESS=1 ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/seriesx_smoke.exe
@@ -112,6 +114,7 @@ SB_HEADLESS=1 ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debu
 SB_HEADLESS=1 ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/d3d12_triangle.exe
 SB_HEADLESS=1 ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/d3d12_cube.exe
 SB_HEADLESS=1 ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/aaa_pipeline_bench.exe
+SB_HEADLESS=1 ./target/debug/scarletbridge run target/x86_64-pc-windows-gnu/debug/rdna2_native.exe
 ```
 
 ---

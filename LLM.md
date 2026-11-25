@@ -133,4 +133,25 @@ ScarletBridge/
 - Tuilage : sous-ressource 0 / mip 0 seule (pas de mip tail, tableaux, XOR de tuile, ni 3D) ; une allocation plus petite que la surface tuilée retombe sur la copie linéaire.
 - RTV/DSV : on écrit le T# de la sous-ressource, pas les registres matériels `CB_COLORn` / `DB_Z_INFO`. T# : adresse = base de la ressource (`>> 8`, tronquée à 256 octets, pas de décalage de sous-ressource ni de plan) ; compteur UAV, `PlaneSlice`, vues de BVH ignorés.
 - Dispositions de descripteurs de vues = `d3d12.h` public ; les variantes console éventuelles ne sont pas devinées (descripteur illisible ou dimension inconnue : rien n'est écrit).
-- Les mots écrits ne sont pas encore lus par le chemin de rendu (les liaisons GPU utilisent toujours la table interne). `gfx10_descriptors` / `frame_pacer` / `root_signature` : seuls les descripteurs et le tuilage sont branchés ici.
+- Les mots écrits sont lus **uniquement par le chemin natif RDNA 2** (§8) ; les pipelines DXBC/DXIL utilisent toujours la table interne `descriptors`. `frame_pacer` n'est pas branché ici ; `root_signature` sert au compactage user-SGPR du chemin natif.
+
+---
+
+## 8. Programmes GPU natifs RDNA 2 (`ShaderFormat::Rdna2Native`)
+
+Voir `docs/rdna2_pipeline.md` (modèle de liaison) et `docs/rdna2.md` (traducteur).
+
+**Branché et vérifié de bout en bout** (RX 5700 XT / RADV, `scarletbridge run tests/harness/rdna2-native`) :
+- Conteneur `SBR2` v1 propre au projet (`sb-gpu::rdna2_native`) : étage, vague, user-SGPR/VGPR d'entrée, table de
+  descripteurs (V#/T#/S# en table, dans les SGPR ou par pointeur racine), code RDNA 2 brut ; `translate_shader`
+  l'aiguille sans toucher DXBC/DXIL.
+- `VulkanRenderer::create_native_{graphics,compute}_pipeline` (layout dérivé des liaisons utilisées, user data en
+  SSBO), `RenderCommand::NativeDraw`, `dispatch_native`, `create_native_image` / `update_native_image`.
+- `d3d12_xs` : `CreateGraphicsPipelineState` / `CreateComputePipelineState` détectent `SBR2` ; arguments racine
+  (`SetXRootDescriptorTable`, `…32BitConstant[s]`, `…ConstantBufferView`, `…ShaderResourceView/UnorderedAccessView`)
+  compactés en 32 user-SGPR (`pack_user_sgprs`) ; au `ExecuteCommandLists`, V#/T#/S# **lus dans les mots matériels**
+  des handles, résolus vers tampons / images (cache adresse+format+dimensions+hachage) / échantillonneurs.
+
+**Limites** : T# 2D mip 0 et formats RGBA8/RGBA16F/RGBA32F/RG16F/R32 seulement ; pas d'images de stockage, de MRT
+ni de `DrawIndexed` natif ; V# par copie entrante (sortante pour les dispatch) ; signature racine ≤ 32 user-SGPR ;
+mêmes user-SGPR pour tous les étages ; pas de validation Khronos exécutée.

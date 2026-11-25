@@ -42,7 +42,7 @@ ScarletBridge is built **specifically for Linux** and written **100% in Rust (Ed
 
 ## Project status
 
-**Early active development — core runtime & 3D/Compute Vulkan pipeline work end-to-end on real hardware.** The workspace has **320+ unit tests** (`cargo test --workspace`, all passing, `clippy` and `rustfmt` clean) plus **8** cross-compiled PE32+ x86-64 harnesses under `tests/harness/` (including `api_conformance`, which exercises the CRT, Win32, Winsock, `bcrypt` and `rpcrt4` APIs through a real PE import table); developed and tested natively on Linux (AMD Radeon RX 5700 XT / Mesa RADV Vulkan 1.4) with zero Wine.
+**Early active development — core runtime & 3D/Compute Vulkan pipeline work end-to-end on real hardware.** The workspace has **320+ unit tests** (`cargo test --workspace`, all passing, `clippy` and `rustfmt` clean) plus **9** cross-compiled PE32+ x86-64 harnesses under `tests/harness/` (including `api_conformance`, which exercises the CRT, Win32, Winsock, `bcrypt` and `rpcrt4` APIs through a real PE import table); developed and tested natively on Linux (AMD Radeon RX 5700 XT / Mesa RADV Vulkan 1.4) with zero Wine.
 
 | What | Status |
 |---|---|
@@ -51,6 +51,7 @@ ScarletBridge is built **specifically for Linux** and written **100% in Rust (Ed
 | Shaders: DXBC SM4/SM5 → SPIR-V 1.3 (VS, PS, CS) | ✅ **60/60** real Microsoft `fxc` shaders (OpenLara Xbox) translated **without skipped opcodes** and validated by `spirv-val --target-env vulkan1.3` (measured by `cargo test -p sb-gpu --test dxbc_corpus -- --nocapture`). Structured control flow (`if/else`, `loop`, `switch`, `break/continue`, `ret/retc`, `discard`, `call/label`), integer/bit ops, all `sample*`/`gather4*`/`ld*`/`resinfo`/`lod` variants, typed/raw/structured UAVs, groupshared, atomics and barriers. ⚠️ Geometry/Hull/Domain stages, doubles, `msad`, `samplepos`, `swapc`, append/consume buffers and SM5.1 descriptor arrays fail cleanly with a typed error |
 | Shaders: DXIL SM 6.0–6.6 (`LLVM 3.7` bitcode) | ⚠️ VS/PS/CS translated to SPIR-V 1.3 (full bitcode/metadata reader, structured control flow, ~140 `dx.op.*`, wave ops, 16/64-bit, `ResourceDescriptorHeap[]`); 37/37 corpus shaders validated with `spirv-val`, 5 GPU-checked on RDNA 1. GS/HS/DS, mesh/amplification, ray tracing, dynamic resource arrays and the SM6.6 heap *binding* in the renderer are not supported yet (typed errors) |
 | Vulkan 1.4 3D + Compute renderer (`sb-gpu`) | ✅ Works — checked on AMD RADV: RGBA8 + D32F, 256-thread Compute Dispatch, hardware **BC1–BC7** & HDR textures, custom vertex layouts, alpha blending, culling, wireframe, scissor rects, instancing, disk-backed `VkPipelineCache`, SDL3/Wayland swapchain |
+| Native AMD RDNA 2 programs (`SBR2` container → `d3d12_xs` PSO) | ⚠️ Vertical slice works on RDNA 1 hardware (RX 5700 XT): a hand-written VS+PS draws a textured triangle and a CS computes a buffer, with V#/T#/S# read from the descriptor-heap words and root constants/CBV/tables mapped to user-SGPRs, verified pixel by pixel by the `rdna2_native` PE32+ harness. Container is ours (versioned), no game format is assumed. ⚠️ 2D mip-0 textures in a few formats only, no storage images / MRT / indexed draws, buffers copied in/out, not run on RDNA 2 silicon nor under the Khronos validation layers; the RDNA 2 → SPIR-V translator itself covers 1023/1338 opcodes (see `docs/rdna2.md`) |
 | Xbox D3D12 (`d3d12_xs.dll`) & `dxgi.dll` → Vulkan | ✅ Core pipeline works — Graphics & Compute PSOs, `CreateHeap` + `CreatePlacedResource` memory aliasing, `CheckFeatureSupport`, `D3D12SerializeRootSignature`, `Dispatch`, `DrawIndexedInstanced`, `CopyTextureRegion`, `CopyResource` GPU→CPU readback. ⚠️ Single RT0 only (MRT, ExecuteIndirect & DXR not yet wired) |
 | Unified memory (`xmem.dll`) & AMD RDNA 2 tiling | ✅ Works — 64 KiB aligned `VK_EXT_external_memory_host` CPU/GPU memory + 2D tile/detile (`xg_tiling`) |
 | Direct3D 11 & WinRT/UWP (`d3d11.rs`, `winrt_objects.rs`) | ⚠️ In progress — OpenLara Xbox boots natively, initializes D3D11→Vulkan + XAudio2 + 6 WinRT classes, and writes `S:\perlin3_128.raw`; D3D11 `CreateInputLayout` & `CreateTexture2D(pInitialData)` still needed for full 3D frames |
@@ -134,7 +135,8 @@ mise exec -- cargo build --target x86_64-pc-windows-gnu \
   -p sb-harness-mt-io-stress \
   -p sb-harness-d3d12-triangle \
   -p sb-harness-d3d12-cube \
-  -p sb-harness-aaa-pipeline-bench
+  -p sb-harness-aaa-pipeline-bench \
+  -p sb-harness-rdna2-native
 
 # 2. Run the AAA GPU + Compute benchmark (omit --headless to open a live Wayland/SDL3 window)
 SB_LOG=info ./target/debug/scarletbridge run --headless --dump-frame tmp/aaa_bench.ppm \

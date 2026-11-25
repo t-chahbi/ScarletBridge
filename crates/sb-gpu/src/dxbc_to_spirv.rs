@@ -58,6 +58,9 @@ pub enum ShaderTranslateError {
     /// Bitcode / conteneur DXIL malformé.
     #[error("DXIL invalide : {0}")]
     InvalidDxil(String),
+    /// Conteneur `SBR2` (Rdna2Native) invalide ou programme RDNA 2 non traduisible.
+    #[error("shader Rdna2Native : {0}")]
+    InvalidNative(String),
 }
 
 mod alu;

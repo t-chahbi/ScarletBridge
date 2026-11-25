@@ -365,6 +365,10 @@ name = "sb-harness-mt-io-stress"
 version = "0.1.0"
 
 [[package]]
+name = "sb-harness-rdna2-native"
+version = "0.1.0"
+
+[[package]]
 name = "sb-harness-seriesx-smoke"
 version = "0.1.0"
 

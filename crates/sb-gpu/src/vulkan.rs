@@ -37,6 +37,13 @@ pub struct GpuCapabilities {
     pub has_fill_mode_non_solid: bool,
     pub has_ray_tracing: bool,
     pub validation_enabled: bool,
+    /// `subgroupSizeControl` activé : permet d'imposer la taille de vague d'un shader de calcul
+    /// (programmes RDNA 2 natifs qui dépendent de la taille de vague).
+    pub has_subgroup_size_control: bool,
+    pub min_subgroup_size: u32,
+    pub max_subgroup_size: u32,
+    /// Étages pour lesquels `requiredSubgroupSize` est autorisé.
+    pub required_subgroup_size_stages: vk::ShaderStageFlags,
 }
 
 pub struct GpuContext {
@@ -183,16 +190,57 @@ impl GpuContext {
             .queue_family_index(graphics_queue_family)
             .queue_priorities(&priorities)];
 
+        // Fonctionnalités optionnelles utiles aux programmes RDNA 2 natifs (activées seulement
+        // si le GPU les expose) : accès hors bornes sûrs, Int64/Float64/Int16, lecture/écriture
+        // d'images sans format, gather étendu, MinLod.
+        let on = |b: vk::Bool32| b == vk::TRUE;
         let enabled_features = vk::PhysicalDeviceFeatures::default()
             .texture_compression_bc(has_bc_compression)
             .fill_mode_non_solid(has_fill_mode_non_solid)
             .independent_blend(supported_features.independent_blend == vk::TRUE)
-            .sampler_anisotropy(supported_features.sampler_anisotropy == vk::TRUE);
+            .sampler_anisotropy(supported_features.sampler_anisotropy == vk::TRUE)
+            .robust_buffer_access(on(supported_features.robust_buffer_access))
+            .shader_int64(on(supported_features.shader_int64))
+            .shader_float64(on(supported_features.shader_float64))
+            .shader_int16(on(supported_features.shader_int16))
+            .shader_storage_image_read_without_format(on(
+                supported_features.shader_storage_image_read_without_format
+            ))
+            .shader_storage_image_write_without_format(on(
+                supported_features.shader_storage_image_write_without_format
+            ))
+            .shader_image_gather_extended(on(supported_features.shader_image_gather_extended))
+            .shader_resource_min_lod(on(supported_features.shader_resource_min_lod))
+            .shader_storage_image_extended_formats(on(
+                supported_features.shader_storage_image_extended_formats
+            ));
 
-        let dev_create_info = vk::DeviceCreateInfo::default()
+        // `subgroupSizeControl` (Vulkan 1.3) : tailles de vague imposables.
+        let api13 = vk::api_version_major(props.api_version) > 1
+            || vk::api_version_minor(props.api_version) >= 3;
+        let mut sgs_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        let mut sgs_feat = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
+        let mut has_subgroup_size_control = false;
+        if api13 {
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sgs_props);
+            // SAFETY: structures valides sur la pile, chaînées pour l'appel.
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut p2) };
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut sgs_feat);
+            // SAFETY: idem.
+            unsafe { instance.get_physical_device_features2(physical_device, &mut f2) };
+            has_subgroup_size_control =
+                sgs_feat.subgroup_size_control == vk::TRUE && sgs_props.max_subgroup_size > 0;
+        }
+        let mut sgs_enable = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+            .subgroup_size_control(has_subgroup_size_control);
+
+        let mut dev_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create)
             .enabled_extension_names(&enabled_dev_exts)
             .enabled_features(&enabled_features);
+        if has_subgroup_size_control {
+            dev_create_info = dev_create_info.push_next(&mut sgs_enable);
+        }
 
         // SAFETY: création du périphérique logique Vulkan.
         let device = unsafe { instance.create_device(physical_device, &dev_create_info, None) }?;
@@ -230,6 +278,10 @@ impl GpuContext {
             has_fill_mode_non_solid,
             has_ray_tracing,
             validation_enabled,
+            has_subgroup_size_control,
+            min_subgroup_size: sgs_props.min_subgroup_size,
+            max_subgroup_size: sgs_props.max_subgroup_size,
+            required_subgroup_size_stages: sgs_props.required_subgroup_size_stages,
         };
 
         sb_info!(

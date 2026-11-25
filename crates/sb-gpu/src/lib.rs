@@ -4,6 +4,7 @@
 pub mod dxbc_to_spirv;
 pub mod dxil;
 pub mod rdna2;
+pub mod rdna2_native;
 pub mod renderer;
 pub mod sdl3;
 pub mod shader;
@@ -21,6 +22,7 @@ pub use dxil::{
     DxilError, DxilParseError, DxilProgramInfo, build_sample_dxil_sm60_container,
     is_dxil_container, parse_dxil_container, translate_dxil_to_spirv,
 };
+pub use rdna2_native::{NativeError, NativeShader, NativeShaderMeta, NativeStage};
 pub use renderer::{
     GraphicsPipelineConfig, RenderCommand, SSBO_BYTE_SIZE, VertexAttrConfig, VertexPosColor,
     VertexPosUvColor, VulkanRenderer, dxgi_format_byte_size, dxgi_format_to_vk,

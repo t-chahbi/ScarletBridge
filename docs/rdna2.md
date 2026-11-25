@@ -215,6 +215,11 @@ configuré → `TranslateError::Unresolved` ; jamais de devinette silencieuse.
 * Non exécuté sur GPU : `ps_kill` (`v_cmpx` + `OpKill`, validé seulement par `spirv-val`),
   tbuffer/idxen, `s_buffer_load` (validés par `spirv-val` + tests de structure).
 
+## 6bis. Exécution via le bridge
+
+Les programmes RDNA 2 sont exécutables de bout en bout par `scarletbridge run` (conteneur `SBR2`, liaison
+des V#/T#/S# lus en mémoire) : voir `docs/rdna2_pipeline.md` et le harnais `tests/harness/rdna2-native`.
+
 ## 7. Tests et outils
 
 ```
