@@ -4660,6 +4660,8 @@ extern "win64" fn device_create_command_allocator(
             (&raw const D3D12_CMD_ALLOC_VTBL).cast(),
             "ID3D12CommandAllocator",
         )),
+        oom_callback: AtomicUsize::new(0),
+        oom_context: AtomicUsize::new(0),
     });
     // SAFETY: `out_alloc` vérifié non-nul.
     unsafe {
@@ -7501,6 +7503,11 @@ pub(crate) extern "win64" fn D3D12CreateRootSignatureDeserializer(
                         _pad2: 0,
                     },
                 },
+                _owned_params: Vec::new(),
+                _owned_ranges_v10: Vec::new(),
+                _owned_ranges_v11: Vec::new(),
+                _owned_samplers_v10: Vec::new(),
+                _owned_samplers_v12: Vec::new(),
             });
             // SAFETY: `out_deserializer` vérifié non-nul.
             unsafe { *out_deserializer = Box::into_raw(obj).cast() };
